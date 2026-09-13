@@ -1,19 +1,22 @@
-"""Run ID generation, collision-safe directory layout, and private naming.
+"""Run ID, directory layout, private naming, and `run.json` v1 serialization.
 
-Covers exactly the M08-01 slice of the runtime store (System Design SS15.1,
-SS15.2, SS15.6; ADR-008; ADR-009): the UTC-plus-random run ID format, the
-`<runtime_root>/runs/<run-id>` layout created via exclusive `mkdir` with
-bounded collision retry, the canonical role/cycle/attempt attempt-log
-filename, and the exclusive, non-truncating, anti-symlink primitive used to
-open a fresh artifact file. `run.json` schema and content (M08-02), atomic
-persistence and fault handling (M08-03), and the attempt-log sink itself
-(M08-04) are later milestones and stay out of this module for now; the
-runtime root's own ignore/ownership preflight is `M10`'s bootstrap, not this
-one, so it is assumed already valid here.
+Covers the M08-01 and M08-02 slices of the runtime store (System Design
+SS15.1, SS15.2, SS15.3, SS15.6; ADR-008; ADR-009): the UTC-plus-random run ID
+format, the `<runtime_root>/runs/<run-id>` layout created via exclusive
+`mkdir` with bounded collision retry, the canonical role/cycle/attempt
+attempt-log filename, the exclusive, non-truncating, anti-symlink primitive
+used to open a fresh artifact file, and the deterministic UTF-8 encoding of a
+`RunRecord` into `run.json` v1 bytes. The schema itself -- every group and
+canonical field System Design SS15.3 lists -- is `domain.RunRecord` and
+`domain.to_primitive()` (M02); atomic replace and failure semantics (M08-03)
+and the attempt-log sink itself (M08-04) are later milestones and stay out of
+this module for now, as does the runtime root's own ignore/ownership
+preflight, which is `M10`'s bootstrap and is assumed already valid here.
 """
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import secrets
@@ -22,7 +25,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Final
 
-from opencode_tools.domain import AgentRole
+from opencode_tools.domain import AgentRole, RunRecord, to_primitive
 from opencode_tools.errors import LoggingError
 from opencode_tools.ports import Clock
 
@@ -260,6 +263,29 @@ def open_private_exclusive(path: Path) -> int:
         ) from None
 
 
+def serialize_run_record(record: RunRecord) -> bytes:
+    """Serialize `record` into canonical `run.json` v1 bytes.
+
+    The schema -- every group System Design SS15.3 lists (input, config,
+    environment, timing, state, git, timeline, attempts, errors,
+    persistence, result) and their canonical minimum fields -- is already
+    fully represented by `RunRecord` and `to_primitive()`; this only fixes
+    the on-disk *text*: UTF-8, `NaN`/`Infinity` forbidden, the field order
+    `to_primitive()` already produces (dataclass declaration order, dict
+    insertion order -- never re-sorted, so serializing the same `record`
+    twice is byte-identical), and exactly one trailing newline. This never
+    touches the filesystem; atomic replace and failure semantics belong to
+    `M08-03`.
+    """
+
+    if type(record) is not RunRecord:
+        raise TypeError("record must be RunRecord")
+
+    primitive = to_primitive(record)
+    text = json.dumps(primitive, allow_nan=False, ensure_ascii=False) + "\n"
+    return text.encode("utf-8")
+
+
 __all__ = (
     "DIRECTORY_MODE",
     "FILE_MODE",
@@ -270,4 +296,5 @@ __all__ = (
     "format_run_id",
     "generate_run_id",
     "open_private_exclusive",
+    "serialize_run_record",
 )
