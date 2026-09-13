@@ -1,0 +1,4 @@
+Investigated the issue and confirmed the failing scenario in the retry policy.
+Constraints: keep provider_attempt monotonic and never retry a non-PROVIDER_ERROR outcome.
+ISSUE_REF_JSON: {"schema_version": 1, "host": "github.com", "owner": "octocat", "repository": "hello-world", "number": 42, "url": "https://github.com/octocat/hello-world/issues/42", "title": "Fix retry policy"}
+AGENT_STATUS: READY
