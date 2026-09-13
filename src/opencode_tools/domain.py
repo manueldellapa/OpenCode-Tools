@@ -1129,6 +1129,15 @@ class RunRecord:
             "expected_exit_code",
             minimum=0,
         )
+        if self.final_status is FinalStatus.APPROVED:
+            if self.git_safety_status is not GitSafetyStatus.SAFE:
+                raise ValueError("APPROVED requires a SAFE git_safety_status")
+            if self.persistence_status is not PersistenceStatus.OK:
+                raise ValueError("APPROVED requires persistence_status OK")
+            if self.expected_exit_code != 0:
+                raise ValueError("APPROVED requires expected_exit_code 0")
+        elif self.final_status is FinalStatus.FAILED and self.expected_exit_code == 0:
+            raise ValueError("FAILED must not use expected_exit_code 0")
         _require_bool(self.changes_preserved, "changes_preserved")
         _require_optional_bool(
             self.termination_confirmed,
@@ -1170,6 +1179,15 @@ class IssueResult:
             PersistenceStatus,
             "persistence_status",
         )
+        if self.final_status is FinalStatus.APPROVED:
+            if self.git_safety_status is not GitSafetyStatus.SAFE:
+                raise ValueError("APPROVED requires a SAFE git_safety_status")
+            if self.persistence_status is not PersistenceStatus.OK:
+                raise ValueError("APPROVED requires persistence_status OK")
+            if self.expected_exit_code != 0:
+                raise ValueError("APPROVED requires expected_exit_code 0")
+        elif self.expected_exit_code == 0:
+            raise ValueError("FAILED must not use expected_exit_code 0")
         _require_bool(self.changes_preserved, "changes_preserved")
         _require_optional_bool(
             self.termination_confirmed,

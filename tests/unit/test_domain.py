@@ -1062,6 +1062,45 @@ def test_partial_run_preserves_explicit_nullable_dimensions() -> None:
         assert primitive[nullable_field] is None
 
 
+def test_final_status_approval_requires_a_green_git_and_persistence_gate() -> None:
+    approved_run = RunRecord(
+        schema_version=1,
+        run_id="run-gate",
+        artifact_path=ARTIFACT_PATH,
+        workspace=_workspace(),
+        target=_target(),
+        issue_number=4,
+        config={},
+        environment={},
+        started_at=NOW,
+        current_phase=PipelinePhase.FINISHED,
+        persistence_status=PersistenceStatus.OK,
+        final_status=FinalStatus.APPROVED,
+        git_safety_status=GitSafetyStatus.SAFE,
+        expected_exit_code=0,
+    )
+
+    with pytest.raises(ValueError, match="APPROVED requires a SAFE git_safety_status"):
+        replace(approved_run, git_safety_status=GitSafetyStatus.UNSAFE)
+    with pytest.raises(ValueError, match="APPROVED requires persistence_status OK"):
+        replace(approved_run, persistence_status=PersistenceStatus.FAILED)
+    with pytest.raises(ValueError, match="APPROVED requires expected_exit_code 0"):
+        replace(approved_run, expected_exit_code=20)
+    with pytest.raises(ValueError, match="FAILED must not use expected_exit_code 0"):
+        replace(approved_run, final_status=FinalStatus.FAILED, expected_exit_code=0)
+
+    approved_issue = _issue_result()
+
+    with pytest.raises(ValueError, match="APPROVED requires a SAFE git_safety_status"):
+        replace(approved_issue, git_safety_status=GitSafetyStatus.UNSAFE)
+    with pytest.raises(ValueError, match="APPROVED requires persistence_status OK"):
+        replace(approved_issue, persistence_status=PersistenceStatus.FAILED)
+    with pytest.raises(ValueError, match="APPROVED requires expected_exit_code 0"):
+        replace(approved_issue, expected_exit_code=20)
+    with pytest.raises(ValueError, match="FAILED must not use expected_exit_code 0"):
+        replace(approved_issue, final_status=FinalStatus.FAILED, expected_exit_code=0)
+
+
 def test_error_records_cannot_report_success() -> None:
     with pytest.raises(ValueError, match="must describe an error"):
         ErrorRecord(
