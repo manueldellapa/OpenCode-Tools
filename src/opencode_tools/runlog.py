@@ -1,23 +1,25 @@
-"""Run ID, directory layout, private naming, `run.json` v1 serialization, and
-its atomic, fail-closed persistence.
+"""Run ID, directory layout, private naming, `run.json` v1 serialization, its
+atomic persistence, and the append-only attempt-log sink.
 
-Covers the M08-01 through M08-03 slices of the runtime store (System Design
-SS15.1-SS15.4, SS15.6; ADR-008; ADR-009): the UTC-plus-random run ID format,
-the `<runtime_root>/runs/<run-id>` layout created via exclusive `mkdir` with
+Covers the full M08 runtime store (System Design SS15.1-SS15.6; ADR-008;
+ADR-009): the UTC-plus-random run ID format, the
+`<runtime_root>/runs/<run-id>` layout created via exclusive `mkdir` with
 bounded collision retry, the canonical role/cycle/attempt attempt-log
 filename, the exclusive, non-truncating, anti-symlink primitive used to open
 a fresh artifact file, the deterministic UTF-8 encoding of a `RunRecord`
-into `run.json` v1 bytes, and replacing `run.json` with that encoding via an
-exclusive same-directory temp file, `flush`/`fsync`, and `os.replace()`. The
-schema itself -- every group and canonical field System Design SS15.3 lists
--- is `domain.RunRecord` and `domain.to_primitive()` (M02). The attempt-log
-sink itself (M08-04) is a later milestone and stays out of this module for
-now, as does the runtime root's own ignore/ownership preflight, which is
-`M10`'s bootstrap and is assumed already valid here.
+into `run.json` v1 bytes, replacing `run.json` with that encoding via an
+exclusive same-directory temp file plus `flush`/`fsync`/`os.replace()`, and
+`AttemptLogFileSink`, a private, line-framed `AttemptLogSink` (`ports.py`,
+M02) that `ProcessRunner` (`process.py`, M05) can drain into completely
+unmodified. The schema itself -- every group and canonical field System
+Design SS15.3 lists -- is `domain.RunRecord` and `domain.to_primitive()`
+(M02). The runtime root's own ignore/ownership preflight is `M10`'s
+bootstrap and is assumed already valid here.
 """
 
 from __future__ import annotations
 
+import base64
 import json
 import os
 import re
@@ -25,11 +27,11 @@ import secrets
 import stat
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Final
+from typing import IO, Final
 
-from opencode_tools.domain import AgentRole, RunRecord, to_primitive
+from opencode_tools.domain import AgentRole, RunOutcome, RunRecord, to_primitive
 from opencode_tools.errors import LoggingError
-from opencode_tools.ports import Clock
+from opencode_tools.ports import Clock, LogChannel
 
 DIRECTORY_MODE: Final = 0o700
 FILE_MODE: Final = 0o600
@@ -378,10 +380,127 @@ def persist_run_record(record: RunRecord) -> None:
     _fsync_directory_best_effort(run_directory)
 
 
+def _format_timestamp(value: datetime) -> str:
+    if not isinstance(value, datetime):
+        raise TypeError("timestamp must be a datetime")
+    if value.utcoffset() != timedelta(0):
+        raise ValueError("timestamp must be timezone-aware UTC")
+    return value.strftime("%Y-%m-%dT%H:%M:%S.%f") + "Z"
+
+
+class AttemptLogFileSink:
+    """A private, append-only, line-framed `AttemptLogSink` (SS15.5).
+
+    Each line is one JSON record -- `timestamp` (RFC 3339 UTC), `channel`
+    (`stdout`, `stderr`, or `runner`), and `payload_base64` -- so every byte
+    sequence a child prints, valid UTF-8 or not, is represented losslessly.
+    `write()` flushes after every record (bounded per-chunk cost, never an
+    `fsync`) and, on any O/S-level fault, lets a plain `OSError` propagate
+    unwrapped: `ProcessRunner` (`process.py`, M05) already catches exactly
+    that from `AttemptLogSink.write()` to fault the sink and bound-terminate
+    the child, so this sink needs no changes there to work with it. `close()`
+    fsyncs once and raises `LoggingError` if that fails.
+
+    `write_header`/`write_footer` are this class's own addition beyond the
+    `AttemptLogSink` protocol -- `ProcessRunner` never calls them, only
+    `path`/`write`/`close` -- so a future caller (the M12 logical invocation
+    engine) wraps one `ProcessRunner.run()` between them to record the
+    sanitized command/cwd and the final outcome/duration as ordinary
+    `"runner"`-channel records in the same file. Nothing here ever feeds
+    back into the state machine: the log is diagnostic only (SS15.5).
+
+    `run_directory` and `filename` are separate because `.path` must stay
+    relative (`ProcessResult.log_path`/`RunRecord` never persist an absolute
+    filesystem path here, matching `process.py`'s own `Path("architect-
+    provider-attempt-1.log")` convention) while opening the file still needs
+    an absolute path; `filename` is exactly what `attempt_log_filename()`
+    (M08-01) produces.
+    """
+
+    def __init__(self, run_directory: Path, filename: str, clock: Clock) -> None:
+        if not isinstance(run_directory, Path) or not run_directory.is_absolute():
+            raise ValueError("run_directory must be an absolute Path")
+        if not isinstance(filename, str) or not filename:
+            raise ValueError("filename must be a non-empty string")
+
+        file_descriptor = open_private_exclusive(run_directory / filename)
+        self._path = Path(filename)
+        self._clock = clock
+        self._stream: IO[bytes] = os.fdopen(file_descriptor, "wb")
+        self._closed = False
+
+    @property
+    def path(self) -> Path:
+        """Return the sink's own relative path (System Design SS15.3:
+        `ProcessResult.log_path` is always relative, never absolute)."""
+
+        return self._path
+
+    def write(self, channel: LogChannel, payload: bytes, timestamp: datetime) -> None:
+        """Append one record; raises `OSError` (never `LoggingError`) on a
+        write fault, per the `AttemptLogSink` protocol."""
+
+        if not isinstance(payload, bytes):
+            raise TypeError("payload must be bytes")
+        line = (
+            json.dumps(
+                {
+                    "timestamp": _format_timestamp(timestamp),
+                    "channel": channel,
+                    "payload_base64": base64.b64encode(payload).decode("ascii"),
+                }
+            )
+            + "\n"
+        )
+        self._stream.write(line.encode("utf-8"))
+        self._stream.flush()
+
+    def write_header(self, *, command: tuple[str, ...], cwd: Path) -> None:
+        """Append a `"runner"`-channel header: sanitized command and cwd."""
+
+        self._write_runner_event(
+            "header",
+            {"command": list(command), "cwd": str(cwd)},
+        )
+
+    def write_footer(self, *, outcome: RunOutcome, duration_ns: int) -> None:
+        """Append a `"runner"`-channel footer: final outcome and duration."""
+
+        if type(outcome) is not RunOutcome:
+            raise TypeError("outcome must be RunOutcome")
+        self._write_runner_event(
+            "footer",
+            {"outcome": outcome.value, "duration_ns": duration_ns},
+        )
+
+    def _write_runner_event(self, event: str, fields: dict[str, object]) -> None:
+        payload = json.dumps({"event": event, **fields}).encode("utf-8")
+        self.write("runner", payload, self._clock.now())
+
+    def close(self) -> None:
+        """Flush, `fsync`, and close; idempotent for an already-closed sink."""
+
+        if self._closed:
+            return
+        try:
+            self._stream.flush()
+            os.fsync(self._stream.fileno())
+        except OSError as error:
+            raise LoggingError(
+                "runlog.attempt_log_close_failed",
+                f"failed to fsync attempt log: {self._path}",
+                technical_detail=type(error).__name__,
+            ) from None
+        finally:
+            self._stream.close()
+            self._closed = True
+
+
 __all__ = (
     "DIRECTORY_MODE",
     "FILE_MODE",
     "RUN_ID_PATTERN",
+    "AttemptLogFileSink",
     "allocate_run_directory",
     "attempt_log_filename",
     "create_run_directory",

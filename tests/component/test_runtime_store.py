@@ -1,42 +1,53 @@
-"""Component tests for the M08-01/M08-03 runtime store against a real
-filesystem.
+"""Component tests for the full M08 runtime store against a real filesystem.
 
 Exercises `create_run_directory`, `allocate_run_directory`,
-`open_private_exclusive`, and `persist_run_record` with real `tmp_path`
-directories: exclusive `mkdir` collisions, bounded regeneration, POSIX
-`0700`/`0600` mode enforcement, anti-symlink rejection, and atomic
-serialize/open/write/replace with fault injection at every step proving the
-last valid `run.json` is never touched and only the failing temp file is
-ever cleaned up (System Design SS15.2, SS15.4, SS15.6; ADR-008; ADR-009;
-AC-021, AC-033, AC-034). `run.json` schema/content itself is
-`tests/unit/test_run_schema.py`; the attempt-log sink (M08-04) is a later
-milestone and is not exercised here.
+`open_private_exclusive`, `persist_run_record`, and `AttemptLogFileSink`
+with real `tmp_path` directories: exclusive `mkdir` collisions, bounded
+regeneration, POSIX `0700`/`0600` mode enforcement, anti-symlink rejection,
+atomic serialize/open/write/replace with fault injection at every step, and
+the append-only attempt log -- multiple distinct logs, lossless non-UTF-8
+payloads, a real `ProcessRunner` (M05) draining genuinely concurrent
+stdout/stderr through it unmodified, and a sink fault reaching
+`RunOutcome.LOGGING_ERROR` with the child still active (System Design
+SS15.2, SS15.4-SS15.6; ADR-008; ADR-009; AC-021, AC-033, AC-034). `run.json`
+schema/content itself is `tests/unit/test_run_schema.py`.
 """
 
 from __future__ import annotations
 
+import base64
+import json
 import os
 import secrets
 import stat
+import sys
+import time
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 import pytest
 
 import opencode_tools.runlog as runlog_module
 from opencode_tools.domain import (
+    AgentRole,
     PersistenceStatus,
     PipelinePhase,
+    ProcessSpec,
+    RunOutcome,
     RunRecord,
     TargetRepository,
     Workspace,
 )
 from opencode_tools.errors import LoggingError
+from opencode_tools.process import SubprocessRunner
 from opencode_tools.runlog import (
     DIRECTORY_MODE,
     FILE_MODE,
+    AttemptLogFileSink,
     allocate_run_directory,
+    attempt_log_filename,
     create_run_directory,
     open_private_exclusive,
     persist_run_record,
@@ -46,6 +57,22 @@ from opencode_tools.runlog import (
 NOW = datetime(2026, 9, 11, 14, 23, 45, 123456, tzinfo=UTC)
 RUN_ID = "20260911T142345.123456Z-a1b2c3d4e5f6"
 WORKSPACE_ROOT = Path("/workspaces/opencode-tools")
+HELPER = Path(__file__).resolve().parent / "helpers" / "echo_process.py"
+
+
+class RealClock:
+    """A `Clock` that reads genuine wall/monotonic time.
+
+    `AttemptLogFileSink`'s header/footer timestamps and the real
+    `SubprocessRunner` integration tests need actual elapsed time, not a
+    fixed fake, to prove the sink works against a genuinely running child.
+    """
+
+    def now(self) -> datetime:
+        return datetime.now(UTC)
+
+    def monotonic_ns(self) -> int:
+        return time.monotonic_ns()
 
 
 class FakeClock:
@@ -394,3 +421,235 @@ def test_persist_run_record_tolerates_a_directory_fsync_failure(
 
     assert document_path.read_bytes() == serialize_run_record(record)
     assert call_count == 2
+
+
+def _read_records(path: Path) -> list[dict[str, Any]]:
+    return [json.loads(line) for line in path.read_bytes().decode("utf-8").splitlines()]
+
+
+def test_attempt_log_file_sink_creates_a_private_regular_file(tmp_path: Path) -> None:
+    filename = "architect-provider-attempt-1.log"
+
+    sink = AttemptLogFileSink(tmp_path, filename, RealClock())
+    sink.close()
+
+    assert sink.path == Path(filename)
+    assert (tmp_path / filename).is_file()
+    assert _mode(tmp_path / filename) == FILE_MODE
+
+
+def test_attempt_log_file_sink_refuses_to_reuse_an_existing_path(
+    tmp_path: Path,
+) -> None:
+    filename = "coder-cycle-1-provider-attempt-1.log"
+    (tmp_path / filename).write_text("pre-existing", encoding="utf-8")
+
+    with pytest.raises(LoggingError) as excinfo:
+        AttemptLogFileSink(tmp_path, filename, RealClock())
+
+    assert excinfo.value.code == "runlog.artifact_file_collision"
+    assert (tmp_path / filename).read_text(encoding="utf-8") == "pre-existing"
+
+
+def test_attempt_log_file_sink_writes_one_json_record_per_line(tmp_path: Path) -> None:
+    filename = "reviewer-cycle-1-provider-attempt-1.log"
+    sink = AttemptLogFileSink(tmp_path, filename, RealClock())
+
+    sink.write("stdout", b"hello", datetime(2026, 9, 11, 14, 23, 45, tzinfo=UTC))
+    sink.write("stderr", b"warning", datetime(2026, 9, 11, 14, 23, 46, tzinfo=UTC))
+    sink.close()
+
+    records = _read_records(tmp_path / filename)
+    assert len(records) == 2
+    assert records[0]["channel"] == "stdout"
+    assert records[0]["timestamp"] == "2026-09-11T14:23:45.000000Z"
+    assert base64.b64decode(records[0]["payload_base64"]) == b"hello"
+    assert records[1]["channel"] == "stderr"
+    assert base64.b64decode(records[1]["payload_base64"]) == b"warning"
+
+
+def test_attempt_log_file_sink_represents_non_utf8_bytes_losslessly(
+    tmp_path: Path,
+) -> None:
+    filename = "coder-cycle-1-provider-attempt-1.log"
+    garbage = b"\xff\xfe\x00invalid-utf8\x80\xc3\x28"
+    sink = AttemptLogFileSink(tmp_path, filename, RealClock())
+
+    sink.write("stdout", garbage, datetime(2026, 9, 11, 14, 23, 45, tzinfo=UTC))
+    sink.close()
+
+    records = _read_records(tmp_path / filename)
+    assert base64.b64decode(records[0]["payload_base64"]) == garbage
+
+
+def test_attempt_log_file_sink_header_and_footer_are_runner_channel_records(
+    tmp_path: Path,
+) -> None:
+    filename = "architect-provider-attempt-1.log"
+    sink = AttemptLogFileSink(tmp_path, filename, RealClock())
+
+    sink.write_header(command=("/usr/bin/git", "status"), cwd=tmp_path)
+    sink.write("stdout", b"output", RealClock().now())
+    sink.write_footer(outcome=RunOutcome.SUCCEEDED, duration_ns=42)
+    sink.close()
+
+    records = _read_records(tmp_path / filename)
+    assert [record["channel"] for record in records] == ["runner", "stdout", "runner"]
+
+    header = json.loads(base64.b64decode(records[0]["payload_base64"]))
+    assert header == {
+        "event": "header",
+        "command": ["/usr/bin/git", "status"],
+        "cwd": str(tmp_path),
+    }
+
+    footer = json.loads(base64.b64decode(records[2]["payload_base64"]))
+    assert footer == {"event": "footer", "outcome": "SUCCEEDED", "duration_ns": 42}
+
+
+def test_attempt_log_file_sink_write_footer_rejects_a_non_run_outcome(
+    tmp_path: Path,
+) -> None:
+    filename = "architect-provider-attempt-1.log"
+    sink = AttemptLogFileSink(tmp_path, filename, RealClock())
+    try:
+        with pytest.raises(TypeError, match="outcome must be RunOutcome"):
+            sink.write_footer(outcome="SUCCEEDED", duration_ns=1)  # type: ignore[arg-type]
+    finally:
+        sink.close()
+
+
+def test_attempt_log_file_sink_write_raises_a_plain_os_error_on_a_fault(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    filename = "coder-cycle-1-provider-attempt-1.log"
+    sink = AttemptLogFileSink(tmp_path, filename, RealClock())
+
+    def _raise(payload: bytes) -> int:
+        raise OSError("simulated disk-full write failure")
+
+    monkeypatch.setattr(sink._stream, "write", _raise)
+
+    with pytest.raises(OSError, match="simulated disk-full"):
+        sink.write("stdout", b"data", RealClock().now())
+
+
+def test_attempt_log_file_sink_close_raises_on_an_fsync_fault_but_keeps_flushed_data(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    filename = "reviewer-cycle-1-provider-attempt-1.log"
+    sink = AttemptLogFileSink(tmp_path, filename, RealClock())
+    sink.write("stdout", b"flushed-before-fsync-fault", RealClock().now())
+
+    def _raise_fsync(file_descriptor: int) -> None:
+        raise OSError("no space")
+
+    monkeypatch.setattr(os, "fsync", _raise_fsync)
+
+    with pytest.raises(LoggingError) as excinfo:
+        sink.close()
+
+    assert excinfo.value.code == "runlog.attempt_log_close_failed"
+    assert (
+        base64.b64decode(_read_records(tmp_path / filename)[0]["payload_base64"])
+        == b"flushed-before-fsync-fault"
+    )
+
+    sink.close()  # idempotent even after a failed close
+
+
+def test_attempt_log_file_sink_produces_distinct_files_per_attempt(
+    tmp_path: Path,
+) -> None:
+    run_directory = create_run_directory(tmp_path, RUN_ID)
+    first_name = attempt_log_filename(AgentRole.CODER, 1, 1)
+    second_name = attempt_log_filename(AgentRole.CODER, 1, 2)
+
+    first_sink = AttemptLogFileSink(run_directory, first_name, RealClock())
+    second_sink = AttemptLogFileSink(run_directory, second_name, RealClock())
+    first_sink.write("stdout", b"attempt-1", RealClock().now())
+    second_sink.write("stdout", b"attempt-2", RealClock().now())
+    first_sink.close()
+    second_sink.close()
+
+    assert first_name != second_name
+    assert (run_directory / first_name).is_file()
+    assert (run_directory / second_name).is_file()
+    first_records = _read_records(run_directory / first_name)
+    second_records = _read_records(run_directory / second_name)
+    assert base64.b64decode(first_records[0]["payload_base64"]) == b"attempt-1"
+    assert base64.b64decode(second_records[0]["payload_base64"]) == b"attempt-2"
+
+
+def test_attempt_log_file_sink_integrates_with_a_real_concurrent_process_runner(
+    tmp_path: Path,
+) -> None:
+    run_directory = create_run_directory(tmp_path, RUN_ID)
+    filename = "coder-cycle-1-provider-attempt-1.log"
+    sink = AttemptLogFileSink(run_directory, filename, RealClock())
+    payload_size = 300_000  # well past the OS pipe buffer: forces real chunking
+    spec = ProcessSpec(
+        argv=(sys.executable, str(HELPER), "--large", str(payload_size)),
+        cwd=tmp_path,
+        stdin=None,
+        timeout_seconds=30,
+        termination_grace_seconds=5,
+    )
+    runner = SubprocessRunner(RealClock())
+
+    result = runner.run(spec, sink=sink)
+    sink.close()
+
+    assert result.outcome == RunOutcome.SUCCEEDED
+    assert result.log_path == Path(filename)
+    records = _read_records(run_directory / filename)
+    assert any(record["channel"] == "stdout" for record in records)
+    assert any(record["channel"] == "stderr" for record in records)
+    assert len(records) > 2  # proves genuine multi-chunk concurrent draining
+
+    stdout_bytes = b"".join(
+        base64.b64decode(record["payload_base64"])
+        for record in records
+        if record["channel"] == "stdout"
+    )
+    stderr_bytes = b"".join(
+        base64.b64decode(record["payload_base64"])
+        for record in records
+        if record["channel"] == "stderr"
+    )
+    assert stdout_bytes == b"x" * payload_size
+    assert stderr_bytes == b"x" * payload_size
+
+
+def test_attempt_log_file_sink_fault_reaches_logging_error_with_an_active_child(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    run_directory = create_run_directory(tmp_path, RUN_ID)
+    filename = "coder-cycle-1-provider-attempt-1.log"
+    sink = AttemptLogFileSink(run_directory, filename, RealClock())
+
+    real_write = sink.write
+    calls = 0
+
+    def _flaky_write(channel: Any, payload: bytes, timestamp: datetime) -> None:
+        nonlocal calls
+        calls += 1
+        if calls > 2:
+            raise OSError("simulated disk-full write failure")
+        real_write(channel, payload, timestamp)
+
+    monkeypatch.setattr(sink, "write", _flaky_write)
+
+    spec = ProcessSpec(
+        argv=(sys.executable, str(HELPER), "--large", "300000"),
+        cwd=tmp_path,
+        stdin=None,
+        timeout_seconds=30,
+        termination_grace_seconds=5,
+    )
+    runner = SubprocessRunner(RealClock())
+
+    result = runner.run(spec, sink=sink)
+
+    assert result.outcome == RunOutcome.LOGGING_ERROR
+    assert result.termination_confirmed is True
