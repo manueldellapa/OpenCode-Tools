@@ -28,18 +28,34 @@ def _empty_digest() -> str:
     return hashlib.sha256(b"").hexdigest()
 
 
-def test_build_process_result_maps_a_zero_return_code_to_succeeded() -> None:
-    result = build_process_result(
+def _build(
+    *,
+    return_code: int | None,
+    termination_confirmed: bool = True,
+    stdout_byte_count: int = 0,
+    stdout_sha256: str | None = None,
+    stderr_byte_count: int = 0,
+    stderr_sha256: str | None = None,
+    duration_ns: int = 1_000_000,
+) -> ProcessResult:
+    return build_process_result(
         command=COMMAND,
         cwd=CWD,
         started_at=STARTED_AT,
         finished_at=FINISHED_AT,
-        duration_ns=1_000_000,
-        return_code=0,
-        stdout=b"",
-        stderr=b"",
+        duration_ns=duration_ns,
+        return_code=return_code,
+        termination_confirmed=termination_confirmed,
+        stdout_byte_count=stdout_byte_count,
+        stdout_sha256=stdout_sha256 or _empty_digest(),
+        stderr_byte_count=stderr_byte_count,
+        stderr_sha256=stderr_sha256 or _empty_digest(),
         log_path=LOG_PATH,
     )
+
+
+def test_build_process_result_maps_a_zero_return_code_to_succeeded() -> None:
+    result = _build(return_code=0)
 
     assert isinstance(result, ProcessResult)
     assert result.outcome is RunOutcome.SUCCEEDED
@@ -49,17 +65,7 @@ def test_build_process_result_maps_a_zero_return_code_to_succeeded() -> None:
 
 
 def test_build_process_result_maps_a_nonzero_return_code_to_process_error() -> None:
-    result = build_process_result(
-        command=COMMAND,
-        cwd=CWD,
-        started_at=STARTED_AT,
-        finished_at=FINISHED_AT,
-        duration_ns=1_000_000,
-        return_code=17,
-        stdout=b"",
-        stderr=b"boom\n",
-        log_path=LOG_PATH,
-    )
+    result = _build(return_code=17, stderr_sha256=hashlib.sha256(b"boom\n").hexdigest())
 
     assert result.outcome is RunOutcome.PROCESS_ERROR
     assert result.return_code == 17
@@ -69,79 +75,61 @@ def test_build_process_result_maps_a_none_return_code_to_process_error() -> None
     """A `None` return code (a spawn that never produced a child) is a
     `PROCESS_ERROR`, never a retryable provider outcome (AC-015)."""
 
-    result = build_process_result(
-        command=COMMAND,
-        cwd=CWD,
-        started_at=STARTED_AT,
-        finished_at=FINISHED_AT,
-        duration_ns=1_000_000,
-        return_code=None,
-        stdout=b"",
-        stderr=b"",
-        log_path=LOG_PATH,
-    )
+    result = _build(return_code=None)
 
     assert result.return_code is None
     assert result.outcome is RunOutcome.PROCESS_ERROR
     assert result.termination_confirmed is True
 
 
-def test_build_process_result_computes_byte_count_and_sha256_per_stream() -> None:
-    stdout = b"hello stdout\n"
-    stderr = b"hello stderr\n"
+def test_build_process_result_preserves_a_false_termination_confirmed() -> None:
+    """A reader thread still stuck on a lingering descendant after the join
+    bound elapses (System Design SS10.2) must surface as an unconfirmed,
+    not a confirmed, termination -- this function must not silently upgrade
+    it to `True`."""
 
-    result = build_process_result(
-        command=COMMAND,
-        cwd=CWD,
-        started_at=STARTED_AT,
-        finished_at=FINISHED_AT,
-        duration_ns=1_000_000,
+    result = _build(return_code=0, termination_confirmed=False)
+
+    assert result.termination_confirmed is False
+
+
+def test_build_process_result_preserves_precomputed_byte_count_and_sha256() -> None:
+    stdout_digest = hashlib.sha256(b"hello stdout\n").hexdigest()
+    stderr_digest = hashlib.sha256(b"hello stderr\n").hexdigest()
+
+    result = _build(
         return_code=0,
-        stdout=stdout,
-        stderr=stderr,
-        log_path=LOG_PATH,
+        stdout_byte_count=13,
+        stdout_sha256=stdout_digest,
+        stderr_byte_count=13,
+        stderr_sha256=stderr_digest,
     )
 
-    assert result.stdout_byte_count == len(stdout)
-    assert result.stdout_sha256 == hashlib.sha256(stdout).hexdigest()
-    assert result.stderr_byte_count == len(stderr)
-    assert result.stderr_sha256 == hashlib.sha256(stderr).hexdigest()
+    assert result.stdout_byte_count == 13
+    assert result.stdout_sha256 == stdout_digest
+    assert result.stderr_byte_count == 13
+    assert result.stderr_sha256 == stderr_digest
 
 
-def test_build_process_result_digests_empty_streams_as_the_empty_sha256() -> None:
-    result = build_process_result(
-        command=COMMAND,
-        cwd=CWD,
-        started_at=STARTED_AT,
-        finished_at=FINISHED_AT,
-        duration_ns=1_000_000,
-        return_code=0,
-        stdout=b"",
-        stderr=b"",
-        log_path=LOG_PATH,
+def test_build_process_result_does_not_compute_digests_itself() -> None:
+    """This function assembles a result from already-computed facts; it
+    must never hash or count bytes on its own (that happens incrementally
+    in `_StreamReader`, System Design SS10.1), so a mismatched digest passed
+    in is preserved verbatim rather than silently corrected."""
+
+    result = _build(
+        return_code=0, stdout_byte_count=999, stdout_sha256="not-a-real-digest"
     )
 
-    assert result.stdout_byte_count == 0
-    assert result.stdout_sha256 == _empty_digest()
-    assert result.stderr_byte_count == 0
-    assert result.stderr_sha256 == _empty_digest()
+    assert result.stdout_byte_count == 999
+    assert result.stdout_sha256 == "not-a-real-digest"
 
 
 def test_build_process_result_uses_clock_supplied_timestamps_and_duration() -> None:
     """Timing comes entirely from the caller's clock facts, never from
     `datetime.now()` or `time.monotonic()` called inside this function."""
 
-    result = build_process_result(
-        command=COMMAND,
-        cwd=CWD,
-        started_at=STARTED_AT,
-        finished_at=FINISHED_AT,
-        duration_ns=42,
-        return_code=0,
-        stdout=b"",
-        stderr=b"",
-        log_path=LOG_PATH,
-    )
+    result = _build(return_code=0, duration_ns=42)
 
     assert result.started_at == STARTED_AT
     assert result.finished_at == FINISHED_AT
@@ -149,33 +137,13 @@ def test_build_process_result_uses_clock_supplied_timestamps_and_duration() -> N
 
 
 def test_build_process_result_echoes_the_sinks_log_path() -> None:
-    result = build_process_result(
-        command=COMMAND,
-        cwd=CWD,
-        started_at=STARTED_AT,
-        finished_at=FINISHED_AT,
-        duration_ns=1,
-        return_code=0,
-        stdout=b"",
-        stderr=b"",
-        log_path=LOG_PATH,
-    )
+    result = _build(return_code=0)
 
     assert result.log_path == LOG_PATH
 
 
 def test_build_process_result_preserves_the_sanitized_command_tuple() -> None:
-    result = build_process_result(
-        command=COMMAND,
-        cwd=CWD,
-        started_at=STARTED_AT,
-        finished_at=FINISHED_AT,
-        duration_ns=1,
-        return_code=0,
-        stdout=b"",
-        stderr=b"",
-        log_path=LOG_PATH,
-    )
+    result = _build(return_code=0)
 
     assert result.command == COMMAND
     assert result.cwd == CWD

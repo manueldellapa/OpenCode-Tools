@@ -3,11 +3,12 @@
 These tests spawn `tests/component/helpers/echo_process.py` through the real
 Python interpreter (`sys.executable`), never a fixture or mock, to prove the
 POSIX spawn boundary itself: no shell, no `os.chdir()`, stdin delivered
-out-of-band from argv/environment, cwd honored per child, and a technically
-faithful `ProcessResult` for both the success and the process-error paths
-(AC-014 partial, AC-015). Timeout/termination-escalation and concurrent
-bounded draining are later milestones (M05-02/M05-03) and are not exercised
-here.
+out-of-band from argv/environment, cwd honored per child, concurrent bounded
+draining of large simultaneous stdout/stderr without deadlock, bounded
+reader-thread joins when a descendant lingers, and a technically faithful
+`ProcessResult` for both the success and the process-error paths (AC-014
+partial, AC-015). Deadline-based timeout and process-group termination are a
+later milestone (M05-03) and are not exercised here.
 """
 
 from __future__ import annotations
@@ -16,6 +17,7 @@ import dataclasses
 import hashlib
 import os
 import sys
+import time
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -315,6 +317,119 @@ def test_run_never_enumerates_or_persists_the_environment_into_the_result(
     assert "environment" not in field_names
     for value in dataclasses.asdict(result).values():
         assert "super-secret-value" not in repr(value)
+
+
+def test_run_drains_large_simultaneous_stdout_and_stderr_without_deadlock(
+    tmp_path: Path,
+) -> None:
+    """Writing this much to both streams overflows the OS pipe buffer many
+    times over; a runner that reads them one at a time (rather than with a
+    dedicated concurrent reader per stream) would deadlock here instead of
+    returning (System Design SS10.1/AC-014)."""
+
+    runner = SubprocessRunner(FakeClock(now=NOW))
+    sink = RecordingAttemptLogSink()
+    size = 2_000_000
+    spec = _spec(_helper_argv("--large", str(size)), tmp_path)
+
+    result = runner.run(spec, sink=sink)
+
+    assert result.return_code == 0
+    assert result.outcome is RunOutcome.SUCCEEDED
+    assert result.stdout_byte_count == size
+    assert result.stderr_byte_count == size
+
+    stdout_chunks = [
+        payload for channel, payload, _ in sink.writes if channel == "stdout"
+    ]
+    stderr_chunks = [
+        payload for channel, payload, _ in sink.writes if channel == "stderr"
+    ]
+    assert sum(len(chunk) for chunk in stdout_chunks) == size
+    assert sum(len(chunk) for chunk in stderr_chunks) == size
+    assert hashlib.sha256(b"".join(stdout_chunks)).hexdigest() == result.stdout_sha256
+    assert hashlib.sha256(b"".join(stderr_chunks)).hexdigest() == result.stderr_sha256
+
+    # Forwarding is incremental, not one giant post-hoc write of the whole
+    # buffer: with a 64 KiB chunk size and 2 MB of output, many chunks land.
+    assert len(stdout_chunks) > 1
+    assert len(stderr_chunks) > 1
+
+
+def test_run_preserves_full_partial_output_even_when_the_child_then_fails(
+    tmp_path: Path,
+) -> None:
+    runner = SubprocessRunner(FakeClock(now=NOW))
+    sink = RecordingAttemptLogSink()
+    size = 500_000
+    spec = _spec(_helper_argv("--large", str(size), "--exit-code", "9"), tmp_path)
+
+    result = runner.run(spec, sink=sink)
+
+    assert result.return_code == 9
+    assert result.outcome is RunOutcome.PROCESS_ERROR
+    assert result.stdout_byte_count == size
+    assert result.stderr_byte_count == size
+    assert result.termination_confirmed is True
+
+
+def test_run_returns_within_the_grace_bound_when_a_descendant_holds_a_pipe_open(
+    tmp_path: Path,
+) -> None:
+    """A detached descendant that inherits the stdout/stderr pipes and holds
+    them open must not block `run()` past `termination_grace_seconds`;
+    actually killing that descendant is M05-03's job (process-group
+    signaling) -- until then, the honest answer is an early return with
+    `termination_confirmed=False` (System Design SS10.2), never a hang."""
+
+    runner = SubprocessRunner(FakeClock(now=NOW))
+    sink = RecordingAttemptLogSink()
+    spec = ProcessSpec(
+        argv=_helper_argv("--stderr", "before-the-fork", "--fork-hold", "5"),
+        cwd=tmp_path,
+        stdin=None,
+        timeout_seconds=30.0,
+        termination_grace_seconds=0.2,
+    )
+
+    started = time.monotonic()
+    result = runner.run(spec, sink=sink)
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 3.0
+    assert result.return_code == 0
+    assert result.outcome is RunOutcome.PROCESS_ERROR
+    assert result.termination_confirmed is False
+    stderr_chunks = [
+        payload for channel, payload, _ in sink.writes if channel == "stderr"
+    ]
+    assert stderr_chunks == [b"before-the-fork\n"]
+
+
+def test_run_join_bound_is_governed_by_termination_grace_seconds(
+    tmp_path: Path,
+) -> None:
+    """A larger grace bound must still let `run()` return promptly once the
+    descendant actually exits well within it -- the bound is a ceiling on
+    how long `run()` waits for a stuck reader, not a mandatory delay."""
+
+    runner = SubprocessRunner(FakeClock(now=NOW))
+    sink = RecordingAttemptLogSink()
+    spec = ProcessSpec(
+        argv=_helper_argv(),
+        cwd=tmp_path,
+        stdin=None,
+        timeout_seconds=30.0,
+        termination_grace_seconds=10.0,
+    )
+
+    started = time.monotonic()
+    result = runner.run(spec, sink=sink)
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 2.0
+    assert result.return_code == 0
+    assert result.termination_confirmed is True
 
 
 def test_run_uses_the_injected_clock_for_timestamps_and_duration(
