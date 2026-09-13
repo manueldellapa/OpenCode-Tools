@@ -662,8 +662,26 @@ def test_repository_and_issue_identity_invariants() -> None:
     with pytest.raises(ValueError, match="canonical HTTPS URL"):
         IssueRef(
             locator=_locator(),
+            url="https://github.com/example/backend/issues/4?ref=pr",
+            title="Issue",
+        )
+    with pytest.raises(ValueError, match="must not contain control characters"):
+        IssueRef(
+            locator=_locator(),
             url="https://github.com/example/backend/issues/4\n",
             title="Issue",
+        )
+    with pytest.raises(ValueError, match="must not contain control characters"):
+        IssueRef(
+            locator=_locator(),
+            url="https://github.com/example/backend/issues/4",
+            title="Issue\x00",
+        )
+    with pytest.raises(ValueError, match="exceeds the defensive length limit"):
+        IssueRef(
+            locator=_locator(),
+            url="https://github.com/example/backend/issues/4",
+            title="x" * 2001,
         )
     with pytest.raises(ValueError, match="schema_version must be 1"):
         IssueRef(

@@ -2,20 +2,74 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import cast
 
 import pytest
 
-from opencode_tools.domain import AgentRole, AgentStatus, ReviewStatus
+from opencode_tools.domain import (
+    AgentRole,
+    AgentStatus,
+    IssueLocator,
+    ParsedAgentResponse,
+    RepositoryIdentity,
+    ReviewStatus,
+)
 from opencode_tools.errors import ProtocolError
 from opencode_tools.protocol import parse_agent_response
 
 FIXTURES_ROOT = Path(__file__).resolve().parents[1] / "fixtures" / "protocol"
 
+# Matches the ISSUE_REF_JSON envelope baked into architect-ready.txt.
+DEFAULT_LOCATOR = IssueLocator(
+    RepositoryIdentity(
+        host="github.com",
+        owner="octocat",
+        repository="hello-world",
+        source="test",
+    ),
+    number=42,
+)
+
 
 def _fixture_text(name: str) -> str:
     return (FIXTURES_ROOT / name).read_text(encoding="utf-8")
+
+
+def _parse(
+    role: AgentRole,
+    text: str,
+    *,
+    issue_locator: IssueLocator = DEFAULT_LOCATOR,
+) -> ParsedAgentResponse:
+    return parse_agent_response(role, text, issue_locator=issue_locator)
+
+
+_VALID_ENVELOPE_FIELDS: dict[str, object] = {
+    "schema_version": 1,
+    "host": "github.com",
+    "owner": "octocat",
+    "repository": "hello-world",
+    "number": 42,
+    "url": "https://github.com/octocat/hello-world/issues/42",
+    "title": "Fix retry policy",
+}
+
+
+def _envelope(
+    overrides: dict[str, object] | None = None, *, drop: str | None = None
+) -> str:
+    fields = dict(_VALID_ENVELOPE_FIELDS)
+    if overrides:
+        fields.update(overrides)
+    if drop is not None:
+        del fields[drop]
+    return json.dumps(fields)
+
+
+def _ready_text(envelope: str) -> str:
+    return f"Handoff text.\nISSUE_REF_JSON: {envelope}\nAGENT_STATUS: READY"
 
 
 # --- golden role/status matrix: every canonical combination parses ----------
@@ -100,22 +154,24 @@ def test_parses_every_canonical_role_status_combination(
     review_status: ReviewStatus | None,
     expected_body: str,
 ) -> None:
-    result = parse_agent_response(role, _fixture_text(fixture_name))
+    result = _parse(role, _fixture_text(fixture_name))
 
     assert result.role is role
     assert result.agent_status is agent_status
     assert result.review_status is review_status
     assert result.body == expected_body
     assert result.protocol_version == 1
-    # ISSUE_REF_JSON schema validation and locator identity comparison are
-    # M06-02 (issue #20); this parser only proves the envelope's position.
-    assert result.issue_ref is None
+    if fixture_name == "architect-ready.txt":
+        # The only canonical form that carries an envelope.
+        assert result.issue_ref is not None
+        assert result.issue_ref.locator == DEFAULT_LOCATOR
+        assert result.issue_ref.title == "Fix retry policy"
+    else:
+        assert result.issue_ref is None
 
 
 def test_changes_required_is_a_successful_parse_not_an_exception() -> None:
-    result = parse_agent_response(
-        AgentRole.REVIEWER, _fixture_text("reviewer-changes-required.txt")
-    )
+    result = _parse(AgentRole.REVIEWER, _fixture_text("reviewer-changes-required.txt"))
 
     assert result.review_status is ReviewStatus.CHANGES_REQUIRED
 
@@ -134,7 +190,7 @@ def test_prose_that_merely_starts_with_a_reserved_word_stays_opaque_body() -> No
         "AGENT_STATUS: COMPLETED"
     )
 
-    result = parse_agent_response(AgentRole.CODER, text)
+    result = _parse(AgentRole.CODER, text)
 
     assert result.agent_status is AgentStatus.COMPLETED
     assert result.body == (
@@ -146,16 +202,14 @@ def test_prose_that_merely_starts_with_a_reserved_word_stays_opaque_body() -> No
 def test_body_preserves_internal_blank_lines_and_whitespace_byte_for_byte() -> None:
     text = "Line one.\n\n  Indented line two.  \nAGENT_STATUS: FAILED"
 
-    result = parse_agent_response(AgentRole.CODER, text)
+    result = _parse(AgentRole.CODER, text)
 
     assert result.body == "Line one.\n\n  Indented line two.  "
 
 
 def test_completed_and_approved_allow_an_empty_body() -> None:
-    coder_result = parse_agent_response(AgentRole.CODER, "AGENT_STATUS: COMPLETED")
-    reviewer_result = parse_agent_response(
-        AgentRole.REVIEWER, "REVIEW_STATUS: APPROVED"
-    )
+    coder_result = _parse(AgentRole.CODER, "AGENT_STATUS: COMPLETED")
+    reviewer_result = _parse(AgentRole.REVIEWER, "REVIEW_STATUS: APPROVED")
 
     assert coder_result.body == ""
     assert reviewer_result.body == ""
@@ -164,7 +218,7 @@ def test_completed_and_approved_allow_an_empty_body() -> None:
 @pytest.mark.parametrize(
     ("role", "text"),
     [
-        (AgentRole.ARCHITECT, 'ISSUE_REF_JSON: {"a": 1}\nAGENT_STATUS: READY'),
+        (AgentRole.ARCHITECT, f"ISSUE_REF_JSON: {_envelope()}\nAGENT_STATUS: READY"),
         (AgentRole.ARCHITECT, "   \nAGENT_STATUS: FAILED"),
         (AgentRole.CODER, "AGENT_STATUS: FAILED"),
         (AgentRole.REVIEWER, "AGENT_STATUS: FAILED"),
@@ -173,7 +227,7 @@ def test_completed_and_approved_allow_an_empty_body() -> None:
 )
 def test_empty_body_is_rejected_when_required(role: AgentRole, text: str) -> None:
     with pytest.raises(ProtocolError) as exc_info:
-        parse_agent_response(role, text)
+        _parse(role, text)
 
     assert exc_info.value.code == "protocol.empty_body"
 
@@ -192,7 +246,7 @@ def test_empty_body_is_rejected_when_required(role: AgentRole, text: str) -> Non
 )
 def test_final_status_from_the_agent_is_always_rejected(text: str) -> None:
     with pytest.raises(ProtocolError) as exc_info:
-        parse_agent_response(AgentRole.CODER, text)
+        _parse(AgentRole.CODER, text)
 
     assert exc_info.value.code == "protocol.final_status_reserved"
 
@@ -224,7 +278,7 @@ def test_final_status_from_the_agent_is_always_rejected(text: str) -> None:
 )
 def test_malformed_reserved_prefix_lines_are_rejected(text: str) -> None:
     with pytest.raises(ProtocolError) as exc_info:
-        parse_agent_response(AgentRole.ARCHITECT, text)
+        _parse(AgentRole.ARCHITECT, text)
 
     assert exc_info.value.code == "protocol.malformed_marker"
 
@@ -236,7 +290,7 @@ def test_duplicate_identical_markers_are_rejected() -> None:
     text = "AGENT_STATUS: COMPLETED\nAGENT_STATUS: COMPLETED"
 
     with pytest.raises(ProtocolError) as exc_info:
-        parse_agent_response(AgentRole.CODER, text)
+        _parse(AgentRole.CODER, text)
 
     assert exc_info.value.code == "protocol.duplicate_marker"
 
@@ -245,7 +299,7 @@ def test_conflicting_markers_in_the_same_family_are_rejected() -> None:
     text = "AGENT_STATUS: COMPLETED\nAGENT_STATUS: FAILED"
 
     with pytest.raises(ProtocolError) as exc_info:
-        parse_agent_response(AgentRole.CODER, text)
+        _parse(AgentRole.CODER, text)
 
     assert exc_info.value.code == "protocol.conflicting_marker"
 
@@ -254,7 +308,7 @@ def test_conflicting_markers_across_families_are_rejected() -> None:
     text = "AGENT_STATUS: FAILED\nREVIEW_STATUS: APPROVED"
 
     with pytest.raises(ProtocolError) as exc_info:
-        parse_agent_response(AgentRole.REVIEWER, text)
+        _parse(AgentRole.REVIEWER, text)
 
     assert exc_info.value.code == "protocol.conflicting_marker"
 
@@ -274,7 +328,7 @@ def test_conflicting_markers_across_families_are_rejected() -> None:
 )
 def test_missing_marker_is_rejected(text: str) -> None:
     with pytest.raises(ProtocolError) as exc_info:
-        parse_agent_response(AgentRole.CODER, text)
+        _parse(AgentRole.CODER, text)
 
     assert exc_info.value.code == "protocol.marker_missing"
 
@@ -289,7 +343,7 @@ def test_missing_marker_is_rejected(text: str) -> None:
 )
 def test_marker_not_terminal_is_rejected(text: str) -> None:
     with pytest.raises(ProtocolError) as exc_info:
-        parse_agent_response(AgentRole.CODER, text)
+        _parse(AgentRole.CODER, text)
 
     assert exc_info.value.code == "protocol.marker_not_terminal"
 
@@ -299,13 +353,13 @@ def test_a_marker_line_indented_off_column_zero_is_invisible_to_the_scanner() ->
     # all (System Design SS9.2 requires column zero), so this is indistinguishable
     # from a response that carries no marker whatsoever.
     with pytest.raises(ProtocolError) as exc_info:
-        parse_agent_response(AgentRole.CODER, " AGENT_STATUS: COMPLETED")
+        _parse(AgentRole.CODER, " AGENT_STATUS: COMPLETED")
 
     assert exc_info.value.code == "protocol.marker_missing"
 
 
 def test_single_trailing_newline_after_the_marker_is_still_terminal() -> None:
-    result = parse_agent_response(AgentRole.CODER, "AGENT_STATUS: COMPLETED\n")
+    result = _parse(AgentRole.CODER, "AGENT_STATUS: COMPLETED\n")
 
     assert result.agent_status is AgentStatus.COMPLETED
     assert result.body == ""
@@ -329,7 +383,7 @@ def test_single_trailing_newline_after_the_marker_is_still_terminal() -> None:
 )
 def test_marker_not_allowed_for_role_is_rejected(role: AgentRole, text: str) -> None:
     with pytest.raises(ProtocolError) as exc_info:
-        parse_agent_response(role, text)
+        _parse(role, text)
 
     assert exc_info.value.code == "protocol.marker_not_allowed_for_role"
 
@@ -341,7 +395,7 @@ def test_issue_ref_missing_for_architect_ready_is_rejected() -> None:
     text = "Handoff text.\nAGENT_STATUS: READY"
 
     with pytest.raises(ProtocolError) as exc_info:
-        parse_agent_response(AgentRole.ARCHITECT, text)
+        _parse(AgentRole.ARCHITECT, text)
 
     assert exc_info.value.code == "protocol.issue_ref_missing"
 
@@ -350,7 +404,7 @@ def test_issue_ref_present_for_architect_failed_is_rejected() -> None:
     text = 'ISSUE_REF_JSON: {"a": 1}\nAGENT_STATUS: FAILED'
 
     with pytest.raises(ProtocolError) as exc_info:
-        parse_agent_response(AgentRole.ARCHITECT, text)
+        _parse(AgentRole.ARCHITECT, text)
 
     assert exc_info.value.code == "protocol.issue_ref_position"
 
@@ -359,7 +413,7 @@ def test_issue_ref_present_for_a_non_architect_role_is_rejected() -> None:
     text = 'ISSUE_REF_JSON: {"a": 1}\nAGENT_STATUS: COMPLETED'
 
     with pytest.raises(ProtocolError) as exc_info:
-        parse_agent_response(AgentRole.CODER, text)
+        _parse(AgentRole.CODER, text)
 
     assert exc_info.value.code == "protocol.issue_ref_position"
 
@@ -379,7 +433,7 @@ def test_role_mismatch_is_rejected_before_envelope_position_is_even_checked(
     # each of these carries a marker that is invalid for `role` on its own,
     # regardless of the misplaced envelope alongside it.
     with pytest.raises(ProtocolError) as exc_info:
-        parse_agent_response(role, text)
+        _parse(role, text)
 
     assert exc_info.value.code == "protocol.marker_not_allowed_for_role"
 
@@ -388,7 +442,7 @@ def test_issue_ref_not_immediately_before_the_marker_is_rejected() -> None:
     text = 'ISSUE_REF_JSON: {"a": 1}\nExtra line.\nAGENT_STATUS: READY'
 
     with pytest.raises(ProtocolError) as exc_info:
-        parse_agent_response(AgentRole.ARCHITECT, text)
+        _parse(AgentRole.ARCHITECT, text)
 
     assert exc_info.value.code == "protocol.issue_ref_position"
 
@@ -397,9 +451,132 @@ def test_issue_ref_appearing_twice_is_rejected() -> None:
     text = 'ISSUE_REF_JSON: {"a": 1}\nISSUE_REF_JSON: {"a": 1}\nAGENT_STATUS: READY'
 
     with pytest.raises(ProtocolError) as exc_info:
-        parse_agent_response(AgentRole.ARCHITECT, text)
+        _parse(AgentRole.ARCHITECT, text)
 
     assert exc_info.value.code == "protocol.issue_ref_duplicate"
+
+
+# --- ISSUE_REF_JSON: schema, types, and identity (System Design SS9.3) -----
+
+
+def test_a_valid_envelope_produces_an_issue_ref_matching_the_locator() -> None:
+    result = _parse(AgentRole.ARCHITECT, _ready_text(_envelope()))
+
+    assert result.issue_ref is not None
+    assert result.issue_ref.locator == DEFAULT_LOCATOR
+    assert result.issue_ref.title == "Fix retry policy"
+    assert result.issue_ref.url == "https://github.com/octocat/hello-world/issues/42"
+    assert result.issue_ref.schema_version == 1
+
+
+def test_malformed_json_syntax_is_rejected() -> None:
+    with pytest.raises(ProtocolError) as exc_info:
+        _parse(AgentRole.ARCHITECT, _ready_text("{not json"))
+
+    assert exc_info.value.code == "protocol.issue_ref_invalid_json"
+
+
+@pytest.mark.parametrize("value", ["[]", '"just a string"', "42", "null", "true"])
+def test_a_non_object_envelope_is_rejected(value: str) -> None:
+    with pytest.raises(ProtocolError) as exc_info:
+        _parse(AgentRole.ARCHITECT, _ready_text(value))
+
+    assert exc_info.value.code == "protocol.issue_ref_not_object"
+
+
+def test_a_missing_key_is_rejected() -> None:
+    with pytest.raises(ProtocolError) as exc_info:
+        _parse(AgentRole.ARCHITECT, _ready_text(_envelope(drop="title")))
+
+    assert exc_info.value.code == "protocol.issue_ref_missing_key"
+
+
+def test_an_unexpected_key_is_rejected() -> None:
+    with pytest.raises(ProtocolError) as exc_info:
+        _parse(AgentRole.ARCHITECT, _ready_text(_envelope({"extra": "unexpected"})))
+
+    assert exc_info.value.code == "protocol.issue_ref_unknown_key"
+
+
+@pytest.mark.parametrize("key", ["schema_version", "number"])
+def test_a_boolean_is_rejected_for_an_integer_field(key: str) -> None:
+    with pytest.raises(ProtocolError) as exc_info:
+        _parse(AgentRole.ARCHITECT, _ready_text(_envelope({key: True})))
+
+    assert exc_info.value.code == "protocol.issue_ref_invalid_type"
+
+
+def test_schema_version_other_than_one_is_rejected() -> None:
+    with pytest.raises(ProtocolError) as exc_info:
+        _parse(AgentRole.ARCHITECT, _ready_text(_envelope({"schema_version": 2})))
+
+    assert exc_info.value.code == "protocol.issue_ref_invalid_value"
+
+
+@pytest.mark.parametrize("key", ["host", "owner", "repository", "url", "title"])
+def test_a_non_string_value_is_rejected_for_a_string_field(key: str) -> None:
+    with pytest.raises(ProtocolError) as exc_info:
+        _parse(AgentRole.ARCHITECT, _ready_text(_envelope({key: 1})))
+
+    assert exc_info.value.code == "protocol.issue_ref_invalid_type"
+
+
+@pytest.mark.parametrize("key", ["host", "owner", "repository", "url", "title"])
+def test_an_empty_string_is_rejected_for_a_string_field(key: str) -> None:
+    with pytest.raises(ProtocolError) as exc_info:
+        _parse(AgentRole.ARCHITECT, _ready_text(_envelope({key: ""})))
+
+    assert exc_info.value.code == "protocol.issue_ref_invalid_value"
+
+
+def test_a_control_character_in_a_string_field_is_rejected() -> None:
+    with pytest.raises(ProtocolError) as exc_info:
+        _parse(AgentRole.ARCHITECT, _ready_text(_envelope({"title": "bad\ntitle"})))
+
+    assert exc_info.value.code == "protocol.issue_ref_invalid_value"
+
+
+def test_an_overlong_field_is_rejected() -> None:
+    with pytest.raises(ProtocolError) as exc_info:
+        _parse(AgentRole.ARCHITECT, _ready_text(_envelope({"title": "x" * 2001})))
+
+    assert exc_info.value.code == "protocol.issue_ref_invalid_value"
+
+
+def test_an_oversized_envelope_is_rejected() -> None:
+    with pytest.raises(ProtocolError) as exc_info:
+        _parse(AgentRole.ARCHITECT, _ready_text(_envelope({"title": "x" * 9000})))
+
+    assert exc_info.value.code == "protocol.issue_ref_invalid_value"
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"host": "example.com"},
+        {"owner": "someone-else"},
+        {"repository": "other-repo"},
+        {"number": 99},
+    ],
+)
+def test_identity_mismatch_against_the_locator_is_rejected(
+    overrides: dict[str, object],
+) -> None:
+    with pytest.raises(ProtocolError) as exc_info:
+        _parse(AgentRole.ARCHITECT, _ready_text(_envelope(overrides)))
+
+    assert exc_info.value.code == "protocol.issue_ref_identity_mismatch"
+
+
+def test_a_non_canonical_url_is_rejected() -> None:
+    mismatched = _envelope(
+        {"url": "https://github.com/octocat/hello-world/issues/42?ref=pr"}
+    )
+
+    with pytest.raises(ProtocolError) as exc_info:
+        _parse(AgentRole.ARCHITECT, _ready_text(mismatched))
+
+    assert exc_info.value.code == "protocol.issue_ref_url_mismatch"
 
 
 # --- SS9.2's 7-step ordered grammar wins deterministically over lower rules -
@@ -441,7 +618,7 @@ def test_rule_precedence_holds_when_two_violations_coexist(
     role: AgentRole, text: str, expected_code: str
 ) -> None:
     with pytest.raises(ProtocolError) as exc_info:
-        parse_agent_response(role, text)
+        _parse(role, text)
 
     assert exc_info.value.code == expected_code
 
@@ -451,9 +628,18 @@ def test_rule_precedence_holds_when_two_violations_coexist(
 
 def test_rejects_a_role_that_is_not_an_agent_role_instance() -> None:
     with pytest.raises(TypeError, match="role must be AgentRole"):
-        parse_agent_response(cast(AgentRole, "ARCHITECT"), "AGENT_STATUS: READY")
+        _parse(cast(AgentRole, "ARCHITECT"), "AGENT_STATUS: READY")
 
 
 def test_rejects_non_string_text() -> None:
     with pytest.raises(TypeError, match="text must be a string"):
-        parse_agent_response(AgentRole.CODER, cast(str, b"AGENT_STATUS: COMPLETED"))
+        _parse(AgentRole.CODER, cast(str, b"AGENT_STATUS: COMPLETED"))
+
+
+def test_rejects_an_issue_locator_that_is_not_an_issue_locator_instance() -> None:
+    with pytest.raises(TypeError, match="issue_locator must be IssueLocator"):
+        parse_agent_response(
+            AgentRole.CODER,
+            "AGENT_STATUS: COMPLETED",
+            issue_locator=cast(IssueLocator, "not-a-locator"),
+        )

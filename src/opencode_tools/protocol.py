@@ -3,22 +3,27 @@
 This module validates only the single terminal assistant text an adapter has
 already decoded and newline-normalized (System Design SS9.1-SS9.2); it never
 reads NDJSON, tool events, reasoning, or stderr, and it never inspects issue
-or repository content. It also never classifies a provider signal and never
-decides a state-machine or review-cycle outcome -- `CHANGES_REQUIRED` and a
-valid `AGENT_STATUS: FAILED` are both a successful *parse* here.
+or repository content beyond the pre-resolved `IssueLocator` it is handed. It
+also never classifies a provider signal and never decides a state-machine or
+review-cycle outcome -- `CHANGES_REQUIRED` and a valid `AGENT_STATUS: FAILED`
+are both a successful *parse* here.
 
-`ISSUE_REF_JSON` v1 schema validation and identity comparison against a
-pre-resolved `IssueLocator` (System Design SS9.3) are a later milestone; this
-module only recognizes the envelope line by its reserved prefix and enforces
-its required position, so `ParsedAgentResponse.issue_ref` is always `None`
-here (ADR-002, ADR-010).
+`ISSUE_REF_JSON`'s schema, types, and identity are validated against the
+pre-resolved `IssueLocator` (System Design SS9.3): Python never fetches or
+semantically checks the GitHub issue itself, only the envelope's own closed
+JSON shape and its consistency with what was already resolved before the
+architect ran (ADR-002, ADR-007, ADR-010).
 """
 
 from __future__ import annotations
 
+import json
+
 from opencode_tools.domain import (
     AgentRole,
     AgentStatus,
+    IssueLocator,
+    IssueRef,
     ParsedAgentResponse,
     ReviewStatus,
 )
@@ -51,6 +56,133 @@ _ROLE_AGENT_STATUSES: dict[AgentRole, frozenset[AgentStatus]] = {
     AgentRole.CODER: frozenset({AgentStatus.COMPLETED, AgentStatus.FAILED}),
     AgentRole.REVIEWER: frozenset({AgentStatus.FAILED}),
 }
+
+_ISSUE_REF_SCHEMA_KEYS = frozenset(
+    {"schema_version", "host", "owner", "repository", "number", "url", "title"}
+)
+_ISSUE_REF_STRING_KEYS: tuple[str, ...] = (
+    "host",
+    "owner",
+    "repository",
+    "url",
+    "title",
+)
+_MAX_ENVELOPE_JSON_LENGTH = 8192
+_MAX_ENVELOPE_STRING_LENGTH = 2000
+
+
+def _contains_control_character(value: str) -> bool:
+    return any(ord(character) < 0x20 or ord(character) == 0x7F for character in value)
+
+
+def _require_envelope_string(payload: dict[str, object], key: str) -> str:
+    value = payload[key]
+    if type(value) is not str:
+        raise ProtocolError(
+            "protocol.issue_ref_invalid_type",
+            f"ISSUE_REF_JSON.{key} must be a JSON string.",
+        )
+    if not value or _contains_control_character(value):
+        raise ProtocolError(
+            "protocol.issue_ref_invalid_value",
+            f"ISSUE_REF_JSON.{key} must be non-empty and free of control characters.",
+        )
+    if len(value) > _MAX_ENVELOPE_STRING_LENGTH:
+        raise ProtocolError(
+            "protocol.issue_ref_invalid_value",
+            f"ISSUE_REF_JSON.{key} exceeds the defensive length limit.",
+        )
+    return value
+
+
+def _validate_issue_ref_envelope(value: str, *, locator: IssueLocator) -> IssueRef:
+    """Parse and validate one `ISSUE_REF_JSON` value against `locator`.
+
+    Applies System Design SS9.3's closed v1 schema: exactly seven keys,
+    strict JSON integers with booleans explicitly rejected, defensive
+    strings, and host/owner/repository/number matching `locator` exactly.
+    The canonical HTTPS URL match and non-empty title are then proven by
+    constructing `IssueRef` itself. Fetching or semantically checking the
+    GitHub issue is out of scope: Python never retrieves it.
+    """
+
+    if len(value) > _MAX_ENVELOPE_JSON_LENGTH:
+        raise ProtocolError(
+            "protocol.issue_ref_invalid_value",
+            "ISSUE_REF_JSON exceeds the defensive length limit.",
+        )
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError:
+        raise ProtocolError(
+            "protocol.issue_ref_invalid_json",
+            "ISSUE_REF_JSON is not valid JSON.",
+        ) from None
+
+    if type(parsed) is not dict:
+        raise ProtocolError(
+            "protocol.issue_ref_not_object",
+            "ISSUE_REF_JSON must be a single JSON object.",
+        )
+
+    keys = frozenset(parsed)
+    missing_keys = _ISSUE_REF_SCHEMA_KEYS - keys
+    if missing_keys:
+        raise ProtocolError(
+            "protocol.issue_ref_missing_key",
+            f"ISSUE_REF_JSON is missing key(s): {sorted(missing_keys)}.",
+        )
+    extra_keys = keys - _ISSUE_REF_SCHEMA_KEYS
+    if extra_keys:
+        raise ProtocolError(
+            "protocol.issue_ref_unknown_key",
+            f"ISSUE_REF_JSON has unexpected key(s): {sorted(extra_keys)}.",
+        )
+
+    schema_version = parsed["schema_version"]
+    if type(schema_version) is not int:
+        raise ProtocolError(
+            "protocol.issue_ref_invalid_type",
+            "ISSUE_REF_JSON.schema_version must be a JSON integer.",
+        )
+    if schema_version != 1:
+        raise ProtocolError(
+            "protocol.issue_ref_invalid_value",
+            "ISSUE_REF_JSON.schema_version must be 1.",
+        )
+
+    number = parsed["number"]
+    if type(number) is not int:
+        raise ProtocolError(
+            "protocol.issue_ref_invalid_type",
+            "ISSUE_REF_JSON.number must be a JSON integer.",
+        )
+
+    strings = {
+        key: _require_envelope_string(parsed, key) for key in _ISSUE_REF_STRING_KEYS
+    }
+
+    identity = locator.repository_identity
+    if (
+        strings["host"] != identity.host
+        or strings["owner"] != identity.owner
+        or strings["repository"] != identity.repository
+        or number != locator.number
+    ):
+        raise ProtocolError(
+            "protocol.issue_ref_identity_mismatch",
+            "ISSUE_REF_JSON does not match the pre-resolved issue locator.",
+        )
+
+    try:
+        return IssueRef(
+            locator=locator,
+            url=strings["url"],
+            title=strings["title"],
+            schema_version=schema_version,
+        )
+    except ValueError as error:
+        raise ProtocolError("protocol.issue_ref_url_mismatch", str(error)) from None
 
 
 def _split_logical_lines(text: str) -> tuple[str, ...]:
@@ -93,22 +225,30 @@ def _reserved_family(line: str) -> str | None:
     return None
 
 
-def parse_agent_response(role: AgentRole, text: str) -> ParsedAgentResponse:
+def parse_agent_response(
+    role: AgentRole,
+    text: str,
+    *,
+    issue_locator: IssueLocator,
+) -> ParsedAgentResponse:
     """Validate one terminal assistant `text` for `role` and parse it.
 
     Applies the `agent-protocol/1` grammar in the order fixed by System
     Design SS9.2: any `FINAL_STATUS` line is rejected first; then any other
     malformed reserved-prefix line; then duplicate or conflicting status
     markers; then the single terminal marker's position and role match;
-    then `ISSUE_REF_JSON` placement; then the non-empty body requirement.
-    Raises `ProtocolError` for every violation; never returns a partially
-    valid result.
+    then `ISSUE_REF_JSON` placement, schema, and identity versus
+    `issue_locator` (SS9.3); then the non-empty body requirement. Raises
+    `ProtocolError` for every violation; never returns a partially valid
+    result.
     """
 
     if type(role) is not AgentRole:
         raise TypeError("role must be AgentRole")
     if not isinstance(text, str):
         raise TypeError("text must be a string")
+    if type(issue_locator) is not IssueLocator:
+        raise TypeError("issue_locator must be IssueLocator")
 
     lines = _split_logical_lines(text)
     reserved_lines = [
@@ -198,6 +338,7 @@ def parse_agent_response(role: AgentRole, text: str) -> ParsedAgentResponse:
             "protocol.issue_ref_duplicate",
             "ISSUE_REF_JSON may appear at most once.",
         )
+    issue_ref: IssueRef | None = None
     if issue_ref_indexes:
         issue_ref_index = issue_ref_indexes[0]
         if not is_architect_ready or issue_ref_index != marker_index - 1:
@@ -207,6 +348,8 @@ def parse_agent_response(role: AgentRole, text: str) -> ParsedAgentResponse:
                 "architect READY marker.",
             )
         body_end = issue_ref_index
+        envelope_value = lines[issue_ref_index][len(_ISSUE_REF_LINE_PREFIX) :]
+        issue_ref = _validate_issue_ref_envelope(envelope_value, locator=issue_locator)
     elif is_architect_ready:
         raise ProtocolError(
             "protocol.issue_ref_missing",
@@ -233,6 +376,7 @@ def parse_agent_response(role: AgentRole, text: str) -> ParsedAgentResponse:
         body=body,
         agent_status=agent_status,
         review_status=review_status,
+        issue_ref=issue_ref,
     )
 
 

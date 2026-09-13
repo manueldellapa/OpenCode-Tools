@@ -140,6 +140,16 @@ def _contains_control_character(value: str) -> bool:
     return any(ord(character) < 0x20 or ord(character) == 0x7F for character in value)
 
 
+_MAX_ISSUE_REF_STRING_LENGTH = 2000
+
+
+def _require_defensive_text(value: str, field_name: str) -> None:
+    if _contains_control_character(value):
+        raise ValueError(f"{field_name} must not contain control characters")
+    if len(value) > _MAX_ISSUE_REF_STRING_LENGTH:
+        raise ValueError(f"{field_name} exceeds the defensive length limit")
+
+
 def _is_repository_slug(value: str) -> bool:
     segments = value.split("/")
     if len(segments) not in (2, 3):
@@ -589,7 +599,9 @@ class IssueRef:
         if not isinstance(self.locator, IssueLocator):
             raise TypeError("locator must be IssueLocator")
         _require_non_empty(self.url, "url")
+        _require_defensive_text(self.url, "url")
         _require_non_empty(self.title, "title")
+        _require_defensive_text(self.title, "title")
         _require_int(self.schema_version, "schema_version", minimum=1)
         if self.schema_version != 1:
             raise ValueError("schema_version must be 1")
