@@ -31,6 +31,8 @@ scenario:
 - `FAKE_OPENCODE_STDERR`: extra text written to stderr for any call.
 - `FAKE_OPENCODE_CALL_LOG_FILE`: path this process appends one line of
   space-joined argv to, so tests can assert call count/order/content.
+- `FAKE_OPENCODE_SLEEP_SECONDS`: blocks for this many seconds before
+  responding to any call, for exercising a deadline miss.
 
 Any call for which the relevant environment variable is unset prints
 nothing on stdout and exits 0, which is a valid "empty" default for tests
@@ -41,6 +43,7 @@ from __future__ import annotations
 
 import os
 import sys
+import time
 
 _DEFAULT_RUN_HELP = (
     "Usage: opencode run [--agent <name>] [--format json] [--dir <path>]\n"
@@ -62,6 +65,10 @@ def _echo_file(path: str) -> None:
 def main(argv: list[str]) -> int:
     _log_call(argv)
     sys.stdin.buffer.read()
+
+    sleep_seconds = os.environ.get("FAKE_OPENCODE_SLEEP_SECONDS")
+    if sleep_seconds:
+        time.sleep(float(sleep_seconds))
 
     if argv == ["--version"]:
         sys.stdout.write(os.environ.get("FAKE_OPENCODE_VERSION", "1.17.18") + "\n")

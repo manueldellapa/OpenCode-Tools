@@ -31,7 +31,7 @@ from opencode_tools.domain import (
     RunOutcome,
     Workspace,
 )
-from opencode_tools.errors import PreflightError, ProtocolError
+from opencode_tools.errors import OpenCodeToolsError, PreflightError, ProtocolError
 from opencode_tools.ports import LogChannel, ProcessRunner
 from opencode_tools.process import sanitize_command
 
@@ -181,6 +181,44 @@ class TransportResult:
             raise ValueError("session_id must be a non-empty string")
         if not isinstance(self.terminal_text, str):
             raise TypeError("terminal_text must be a string")
+
+
+_EXPORT_METHOD = "sanitized_session_export"
+
+
+@dataclass(frozen=True, slots=True)
+class AgentIdentityEvidence:
+    """Proof that one invocation's export matched the requested role (SS10.5).
+
+    Only `requested_agent`, `verified_agent`, `method`, `version`, and
+    `digest` are ever retained; the raw export JSON and any model/provider
+    ID are not (ADR-005, System Design SS18.3). Because this type can only
+    be constructed by `verify_agent_identity` after a successful match,
+    `requested_agent == verified_agent` is a class invariant, not something
+    a caller needs to re-check.
+    """
+
+    requested_agent: str
+    verified_agent: str
+    method: str
+    version: str
+    digest: str
+
+    def __post_init__(self) -> None:
+        for field_name in (
+            "requested_agent",
+            "verified_agent",
+            "method",
+            "version",
+            "digest",
+        ):
+            value = getattr(self, field_name)
+            if not isinstance(value, str) or not value:
+                raise ValueError(f"{field_name} must be a non-empty string")
+        if self.requested_agent != self.verified_agent:
+            raise ValueError(
+                "requested_agent and verified_agent must match a proven identity"
+            )
 
 
 def resolve_executable() -> Path:
@@ -446,10 +484,14 @@ def open_run_capture_sink(log_name: str) -> _BoundedCapturingSink:
 
 
 def _require_process_succeeded(
-    result: ProcessResult, *, code: str, message: str
+    result: ProcessResult,
+    *,
+    error_cls: type[OpenCodeToolsError],
+    code: str,
+    message: str,
 ) -> None:
     if result.outcome is not RunOutcome.SUCCEEDED:
-        raise PreflightError(
+        raise error_cls(
             code,
             message,
             technical_detail=(
@@ -458,24 +500,28 @@ def _require_process_succeeded(
         )
 
 
-def _decode_or_raise(sink: _BoundedCapturingSink, *, code: str) -> str:
+def _decode_or_raise(
+    sink: _BoundedCapturingSink, *, error_cls: type[OpenCodeToolsError], code: str
+) -> str:
     if sink.overflowed("stdout"):
-        raise PreflightError(
+        raise error_cls(
             code, "OpenCode utility output exceeded the defensive size limit."
         )
     text = _strict_utf8(sink.bytes_for("stdout"))
     if text is None:
-        raise PreflightError(code, "OpenCode utility output was not valid UTF-8.")
+        raise error_cls(code, "OpenCode utility output was not valid UTF-8.")
     return text
 
 
-def _parse_json_object(text: str, *, code: str, what: str) -> dict[str, object]:
+def _parse_json_object(
+    text: str, *, error_cls: type[OpenCodeToolsError], code: str, what: str
+) -> dict[str, object]:
     try:
         parsed = json.loads(text)
     except json.JSONDecodeError:
-        raise PreflightError(code, f"{what} was not valid JSON.") from None
+        raise error_cls(code, f"{what} was not valid JSON.") from None
     if not isinstance(parsed, dict):
-        raise PreflightError(code, f"{what} must be a JSON object.")
+        raise error_cls(code, f"{what} must be a JSON object.")
     return cast(dict[str, object], parsed)
 
 
@@ -647,14 +693,20 @@ def _fetch_raw_control_plane(
     )
     _require_process_succeeded(
         config_result,
+        error_cls=PreflightError,
         code="opencode.debug_config_call_failed",
         message="opencode debug config did not complete successfully.",
     )
     config_text = _decode_or_raise(
-        config_sink, code="opencode.debug_config_call_failed"
+        config_sink,
+        error_cls=PreflightError,
+        code="opencode.debug_config_call_failed",
     )
     config = _parse_json_object(
-        config_text, code="opencode.debug_config_invalid", what="opencode debug config"
+        config_text,
+        error_cls=PreflightError,
+        code="opencode.debug_config_invalid",
+        what="opencode debug config",
     )
 
     agents: dict[AgentRole, dict[str, object]] = {}
@@ -671,14 +723,18 @@ def _fetch_raw_control_plane(
         )
         _require_process_succeeded(
             agent_result,
+            error_cls=PreflightError,
             code="opencode.debug_agent_call_failed",
             message=f"opencode debug agent {token} did not complete successfully.",
         )
         agent_text = _decode_or_raise(
-            agent_sink, code="opencode.debug_agent_call_failed"
+            agent_sink,
+            error_cls=PreflightError,
+            code="opencode.debug_agent_call_failed",
         )
         agents[role] = _parse_json_object(
             agent_text,
+            error_cls=PreflightError,
             code="opencode.debug_agent_invalid",
             what=f"opencode debug agent {token}",
         )
@@ -715,10 +771,13 @@ def run_preflight(
     )
     _require_process_succeeded(
         version_result,
+        error_cls=PreflightError,
         code="opencode.version_call_failed",
         message="opencode --version did not complete successfully.",
     )
-    version_text = _decode_or_raise(version_sink, code="opencode.version_call_failed")
+    version_text = _decode_or_raise(
+        version_sink, error_cls=PreflightError, code="opencode.version_call_failed"
+    )
     version = check_version(version_text)
 
     help_result, help_sink = _run_utility(
@@ -732,10 +791,13 @@ def run_preflight(
     )
     _require_process_succeeded(
         help_result,
+        error_cls=PreflightError,
         code="opencode.capability_call_failed",
         message="opencode run --help did not complete successfully.",
     )
-    help_text = _decode_or_raise(help_sink, code="opencode.capability_call_failed")
+    help_text = _decode_or_raise(
+        help_sink, error_cls=PreflightError, code="opencode.capability_call_failed"
+    )
     check_run_help_capability(help_text)
 
     config, agents = _fetch_raw_control_plane(
@@ -796,11 +858,146 @@ def recheck_control_plane(
         )
 
 
+def verify_agent_identity(
+    role: AgentRole, export: dict[str, object], *, digest: str
+) -> AgentIdentityEvidence:
+    """Verify every top-level assistant message's `info.agent` against `role`.
+
+    The export must have a `messages` array; among entries whose
+    `info.role` is `"assistant"`, every one's `info.agent` must name the
+    same agent, and at least one such message must exist -- several
+    assistant messages from the same agent (a normal multi-turn exchange)
+    are fine, but disagreement is not. `task` is already denied at
+    preflight (M07-02), so a genuine subagent message should never appear;
+    if it -- or a schema surprise, a missing agent field, or a silent
+    fallback to a different agent -- ever does, this is `ProtocolError`,
+    never a fallback or best-effort inference (ADR-005, System Design
+    SS10.5).
+    """
+
+    messages = export.get("messages")
+    if not isinstance(messages, list):
+        raise ProtocolError(
+            "opencode.export_invalid_schema",
+            "opencode export has no messages array.",
+        )
+
+    assistant_agents: set[str] = set()
+    for message in messages:
+        if not isinstance(message, dict):
+            raise ProtocolError(
+                "opencode.export_invalid_schema",
+                "opencode export contains a non-object message.",
+            )
+        info = message.get("info")
+        if not isinstance(info, dict):
+            raise ProtocolError(
+                "opencode.export_invalid_schema",
+                "An opencode export message has no info object.",
+            )
+        if info.get("role") != "assistant":
+            continue
+        agent = info.get("agent")
+        if not isinstance(agent, str) or not agent:
+            raise ProtocolError(
+                "opencode.export_agent_missing",
+                "An assistant message has no non-empty info.agent.",
+            )
+        assistant_agents.add(agent)
+
+    if not assistant_agents:
+        raise ProtocolError(
+            "opencode.export_no_assistant_message",
+            "opencode export has no top-level assistant message.",
+        )
+    if len(assistant_agents) > 1:
+        raise ProtocolError(
+            "opencode.export_ambiguous_agent",
+            "opencode export's assistant messages disagree on info.agent.",
+        )
+
+    verified_agent = next(iter(assistant_agents))
+    requested_agent = _ROLE_TOKENS[role]
+    if verified_agent != requested_agent:
+        raise ProtocolError(
+            "opencode.export_agent_mismatch",
+            f"opencode export shows agent {verified_agent!r}, not the "
+            f"requested {requested_agent!r}.",
+        )
+
+    return AgentIdentityEvidence(
+        requested_agent=requested_agent,
+        verified_agent=verified_agent,
+        method=_EXPORT_METHOD,
+        version=CANDIDATE_OPENCODE_VERSION,
+        digest=digest,
+    )
+
+
+def run_export_and_verify_identity(
+    process_runner: ProcessRunner,
+    *,
+    executable: Path,
+    workspace: Workspace,
+    role: AgentRole,
+    session_id: str,
+    utility_timeout_seconds: float,
+    termination_grace_seconds: float,
+) -> AgentIdentityEvidence:
+    """Run `export <session_id> --sanitize` and verify the effective agent.
+
+    `session_id` is expected to already be the single ID
+    `decode_run_transport` extracted from the preceding `opencode run`
+    (System Design SS10.5); that step is where "zero or more than one
+    session ID" is already resolved to a `ProtocolError`, so this function
+    does not re-derive or disambiguate it, only refuses to proceed with an
+    empty one. The raw export is parsed in memory, bounded by the same
+    utility output limit as every other preflight/utility call, and never
+    persisted -- only the digest of what was examined is (System Design
+    SS10.5, SS18.3).
+    """
+
+    if not session_id:
+        raise ProtocolError(
+            "opencode.export_missing_session_id",
+            "No session ID is available to export.",
+        )
+
+    result, sink = _run_utility(
+        process_runner,
+        executable,
+        ("export", session_id, "--sanitize"),
+        log_name="export-sanitize.log",
+        cwd=workspace.root,
+        timeout_seconds=utility_timeout_seconds,
+        termination_grace_seconds=termination_grace_seconds,
+    )
+    _require_process_succeeded(
+        result,
+        error_cls=ProtocolError,
+        code="opencode.export_call_failed",
+        message="opencode export --sanitize did not complete successfully.",
+    )
+    raw_bytes = sink.bytes_for("stdout")
+    export_text = _decode_or_raise(
+        sink, error_cls=ProtocolError, code="opencode.export_call_failed"
+    )
+    export = _parse_json_object(
+        export_text,
+        error_cls=ProtocolError,
+        code="opencode.export_invalid_schema",
+        what="opencode export",
+    )
+    digest = hashlib.sha256(raw_bytes).hexdigest()
+    return verify_agent_identity(role, export, digest=digest)
+
+
 __all__ = (
     "CANDIDATE_OPENCODE_VERSION",
     "FORBIDDEN_RUN_FLAGS",
     "MAX_NDJSON_LINES",
     "RUN_OUTPUT_LIMIT_BYTES",
+    "AgentIdentityEvidence",
     "ControlPlaneEvidence",
     "TransportResult",
     "build_run_spec",
@@ -816,5 +1013,7 @@ __all__ = (
     "recheck_control_plane",
     "redact_command_for_display",
     "resolve_executable",
+    "run_export_and_verify_identity",
     "run_preflight",
+    "verify_agent_identity",
 )

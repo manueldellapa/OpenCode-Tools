@@ -29,6 +29,7 @@ from opencode_tools.opencode import (
     FORBIDDEN_RUN_FLAGS,
     MAX_NDJSON_LINES,
     RUN_OUTPUT_LIMIT_BYTES,
+    AgentIdentityEvidence,
     ControlPlaneEvidence,
     TransportResult,
     build_run_spec,
@@ -43,6 +44,7 @@ from opencode_tools.opencode import (
     open_run_capture_sink,
     redact_command_for_display,
     resolve_executable,
+    verify_agent_identity,
 )
 
 REPO_ROOT: Final = Path(__file__).resolve().parents[2]
@@ -853,3 +855,146 @@ def test_open_run_capture_sink_uses_the_run_size_limit() -> None:
 def test_transport_result_rejects_an_empty_session_id() -> None:
     with pytest.raises(ValueError, match="session_id"):
         TransportResult(session_id="", terminal_text="AGENT_STATUS: COMPLETED")
+
+
+# =============================================================================
+# M07-05: effective agent identity via sanitized export
+# =============================================================================
+
+EXPORT_FIXTURES = FIXTURES_ROOT / "export"
+
+
+def _export_fixture(name: str) -> dict[str, object]:
+    return cast(
+        dict[str, object],
+        json.loads((EXPORT_FIXTURES / name).read_text(encoding="utf-8")),
+    )
+
+
+# --- verify_agent_identity: correct agent -------------------------------------
+
+
+@pytest.mark.parametrize(
+    "role,fixture_name",
+    [
+        (AgentRole.ARCHITECT, "architect-correct-agent.json"),
+        (AgentRole.CODER, "coder-correct-agent.json"),
+        (AgentRole.REVIEWER, "reviewer-correct-agent.json"),
+    ],
+)
+def test_verify_agent_identity_accepts_the_correct_agent_fixture(
+    role: AgentRole, fixture_name: str
+) -> None:
+    evidence = verify_agent_identity(
+        role, _export_fixture(fixture_name), digest="abc123"
+    )
+    assert isinstance(evidence, AgentIdentityEvidence)
+    assert evidence.requested_agent == evidence.verified_agent == _role_token(role)
+    assert evidence.method == "sanitized_session_export"
+    assert evidence.version == CANDIDATE_OPENCODE_VERSION
+    assert evidence.digest == "abc123"
+
+
+def _role_token(role: AgentRole) -> str:
+    return {
+        AgentRole.ARCHITECT: "architect",
+        AgentRole.CODER: "coder",
+        AgentRole.REVIEWER: "reviewer",
+    }[role]
+
+
+def test_verify_agent_identity_accepts_multiple_messages_from_the_same_agent() -> None:
+    export: dict[str, object] = {
+        "sessionID": "ses_multi_message",
+        "messages": [
+            {
+                "info": {"id": "msg_1", "role": "assistant", "agent": "coder"},
+                "parts": [{"type": "tool", "tool": "bash"}],
+            },
+            {
+                "info": {"id": "msg_2", "role": "assistant", "agent": "coder"},
+                "parts": [{"type": "text", "text": "AGENT_STATUS: COMPLETED"}],
+            },
+        ],
+    }
+    evidence = verify_agent_identity(AgentRole.CODER, export, digest="d")
+    assert evidence.verified_agent == "coder"
+
+
+# --- verify_agent_identity: negative and trust-boundary fixtures -------------
+
+
+def test_verify_agent_identity_rejects_a_mismatched_agent() -> None:
+    with pytest.raises(ProtocolError) as exc_info:
+        verify_agent_identity(
+            AgentRole.ARCHITECT, _export_fixture("agent-mismatch.json"), digest="d"
+        )
+    assert exc_info.value.code == "opencode.export_agent_mismatch"
+
+
+def test_verify_agent_identity_rejects_a_missing_agent_field() -> None:
+    with pytest.raises(ProtocolError) as exc_info:
+        verify_agent_identity(
+            AgentRole.CODER, _export_fixture("agent-field-missing.json"), digest="d"
+        )
+    assert exc_info.value.code == "opencode.export_agent_missing"
+
+
+def test_verify_agent_identity_rejects_zero_assistant_messages() -> None:
+    with pytest.raises(ProtocolError) as exc_info:
+        verify_agent_identity(
+            AgentRole.CODER, _export_fixture("zero-assistant-messages.json"), digest="d"
+        )
+    assert exc_info.value.code == "opencode.export_no_assistant_message"
+
+
+def test_verify_agent_identity_rejects_an_ambiguous_fallback_export() -> None:
+    with pytest.raises(ProtocolError) as exc_info:
+        verify_agent_identity(
+            AgentRole.CODER,
+            _export_fixture("ambiguous-multiple-assistant-agents.json"),
+            digest="d",
+        )
+    assert exc_info.value.code == "opencode.export_ambiguous_agent"
+
+
+@pytest.mark.parametrize(
+    "export",
+    [
+        {"sessionID": "s"},
+        {"sessionID": "s", "messages": "not-a-list"},
+        {"sessionID": "s", "messages": ["not-an-object"]},
+        {"sessionID": "s", "messages": [{"info": "not-an-object"}]},
+    ],
+)
+def test_verify_agent_identity_rejects_an_unexpected_schema(
+    export: dict[str, object],
+) -> None:
+    with pytest.raises(ProtocolError) as exc_info:
+        verify_agent_identity(AgentRole.CODER, export, digest="d")
+    assert exc_info.value.code == "opencode.export_invalid_schema"
+
+
+# --- AgentIdentityEvidence -----------------------------------------------------
+
+
+def test_agent_identity_evidence_rejects_a_mismatched_pair() -> None:
+    with pytest.raises(ValueError, match="requested_agent and verified_agent"):
+        AgentIdentityEvidence(
+            requested_agent="architect",
+            verified_agent="coder",
+            method="sanitized_session_export",
+            version=CANDIDATE_OPENCODE_VERSION,
+            digest="d",
+        )
+
+
+def test_agent_identity_evidence_rejects_an_empty_field() -> None:
+    with pytest.raises(ValueError, match="non-empty"):
+        AgentIdentityEvidence(
+            requested_agent="architect",
+            verified_agent="architect",
+            method="sanitized_session_export",
+            version=CANDIDATE_OPENCODE_VERSION,
+            digest="",
+        )
