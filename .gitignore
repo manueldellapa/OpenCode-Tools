@@ -3,3 +3,6 @@
 
 # Knowledge graph
 graphify-out/
+
+# OpenCode-Tools runtime
+.opencode-tools/
