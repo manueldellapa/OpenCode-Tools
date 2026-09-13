@@ -76,7 +76,14 @@ class AttemptLogSink(Protocol):
         payload: bytes,
         timestamp: datetime,
     ) -> None:
-        """Append one framed record for `channel` at `timestamp`."""
+        """Append one framed record for `channel` at `timestamp`.
+
+        A failure to append (disk full, permission denied, or any other
+        O/S-level fault) must raise `OSError`. `ProcessRunner` treats that
+        as a `LOGGING_ERROR`: it stops draining, terminates any
+        still-running child bounded by `termination_grace_seconds`, and
+        never retries (System Design SS10.1, M05-04).
+        """
         ...
 
     def close(self) -> None:

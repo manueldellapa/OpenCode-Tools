@@ -49,6 +49,7 @@ def _build(
     termination_confirmed: bool = True,
     timed_out: bool = False,
     interrupted: bool = False,
+    logging_error: bool = False,
     stdout_byte_count: int = 0,
     stdout_sha256: str | None = None,
     stderr_byte_count: int = 0,
@@ -65,6 +66,7 @@ def _build(
         termination_confirmed=termination_confirmed,
         timed_out=timed_out,
         interrupted=interrupted,
+        logging_error=logging_error,
         stdout_byte_count=stdout_byte_count,
         stdout_sha256=stdout_sha256 or _empty_digest(),
         stderr_byte_count=stderr_byte_count,
@@ -133,9 +135,29 @@ def test_build_process_result_maps_interrupted_to_interrupted() -> None:
     assert result.timed_out is False
 
 
+def test_build_process_result_maps_logging_error_to_logging_error() -> None:
+    """A sink write fault is `LOGGING_ERROR`, not `PROCESS_ERROR`: process
+    and logging failures must stay distinct categories (M05-04), and
+    neither is ever provider-retryable."""
+
+    result = _build(return_code=-15, termination_confirmed=True, logging_error=True)
+
+    assert result.outcome is RunOutcome.LOGGING_ERROR
+    assert result.timed_out is False
+
+
 def test_build_process_result_rejects_timed_out_and_interrupted_together() -> None:
     with pytest.raises(ValueError, match="mutually exclusive"):
         _build(return_code=None, timed_out=True, interrupted=True)
+
+
+def test_build_process_result_rejects_any_two_of_the_three_stop_reasons_together() -> (
+    None
+):
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        _build(return_code=None, interrupted=True, logging_error=True)
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        _build(return_code=None, timed_out=True, logging_error=True)
 
 
 def test_build_process_result_timeout_takes_precedence_when_termination_unconfirmed() -> (

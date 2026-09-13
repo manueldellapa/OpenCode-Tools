@@ -81,6 +81,32 @@ class RecordingAttemptLogSink:
         self.closed = True
 
 
+class FaultingAttemptLogSink:
+    """An `AttemptLogSink` fake whose `write()` raises `OSError` once at
+    least `fail_after` writes have already succeeded, simulating a
+    disk-full or permission failure partway through draining (M05-04)."""
+
+    def __init__(
+        self, *, path: Path = Path("attempt.log"), fail_after: int = 0
+    ) -> None:
+        self._path = path
+        self._fail_after = fail_after
+        self.writes: list[tuple[str, bytes, datetime]] = []
+        self.closed = False
+
+    @property
+    def path(self) -> Path:
+        return self._path
+
+    def write(self, channel: str, payload: bytes, timestamp: datetime) -> None:
+        if len(self.writes) >= self._fail_after:
+            raise OSError("simulated sink write fault (disk full)")
+        self.writes.append((channel, payload, timestamp))
+
+    def close(self) -> None:
+        self.closed = True
+
+
 NOW = datetime(2026, 9, 13, 8, 0, 0, tzinfo=UTC)
 
 
@@ -632,3 +658,53 @@ def test_run_restores_the_previous_signal_handlers_after_returning(
 
     assert signal.getsignal(signal.SIGTERM) == sentinel_sigterm
     assert signal.getsignal(signal.SIGINT) == sentinel_sigint
+
+
+def test_run_terminates_the_child_and_reports_logging_error_on_a_sink_fault(
+    tmp_path: Path,
+) -> None:
+    """A sink write fault must stop the child well before its own deadline
+    (proving the *fault*, not the timeout, drove the early return),
+    terminate it the same bounded way as a timeout, and be reported as
+    `LOGGING_ERROR` -- never `PROCESS_ERROR` and never provider-retryable
+    (M05-04)."""
+
+    runner = SubprocessRunner(RealClock())
+    sink = FaultingAttemptLogSink(fail_after=1)
+    spec = ProcessSpec(
+        argv=_helper_argv("--large", "500000"),
+        cwd=tmp_path,
+        stdin=None,
+        timeout_seconds=10.0,
+        termination_grace_seconds=0.5,
+    )
+
+    started = time.monotonic()
+    result = runner.run(spec, sink=sink)
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 3.0
+    assert result.outcome is RunOutcome.LOGGING_ERROR
+    assert result.termination_confirmed is True
+
+
+def test_run_preserves_partial_output_captured_before_a_sink_fault(
+    tmp_path: Path,
+) -> None:
+    runner = SubprocessRunner(RealClock())
+    sink = FaultingAttemptLogSink(fail_after=1)
+    total_size = 500_000
+    spec = ProcessSpec(
+        argv=_helper_argv("--large", str(total_size)),
+        cwd=tmp_path,
+        stdin=None,
+        timeout_seconds=10.0,
+        termination_grace_seconds=0.5,
+    )
+
+    result = runner.run(spec, sink=sink)
+
+    captured = result.stdout_byte_count + result.stderr_byte_count
+    assert captured > 0
+    assert captured < 2 * total_size
+    assert len(sink.writes) == 1

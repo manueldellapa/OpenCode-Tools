@@ -61,6 +61,7 @@ def build_process_result(
     termination_confirmed: bool,
     timed_out: bool = False,
     interrupted: bool = False,
+    logging_error: bool = False,
     stdout_byte_count: int,
     stdout_sha256: str,
     stderr_byte_count: int,
@@ -72,30 +73,38 @@ def build_process_result(
     This is the pure half of the process boundary: given the raw facts of a
     spawn (or spawn failure) -- already-computed byte counts and SHA-256
     digests, since draining happens incrementally in `SubprocessRunner`, not
-    from one accumulated blob here -- it decides the outcome:
+    from one accumulated blob here -- it decides the outcome, in this order:
 
     - `timed_out=True` -> `TIMEOUT` (the deadline was missed, System Design
       SS10.2), always, regardless of the return code.
-    - otherwise `interrupted=True` -> `INTERRUPTED` (a SIGINT/SIGTERM
-      cancellation, SH-001), always.
+    - `interrupted=True` -> `INTERRUPTED` (a SIGINT/SIGTERM cancellation,
+      SH-001), always.
+    - `logging_error=True` -> `LOGGING_ERROR` (a sink write faulted, e.g.
+      disk full or permission denied; the child was already terminated,
+      M05-04), always.
     - otherwise `SUCCEEDED` requires both a zero return code *and*
       confirmed termination (the domain invariant); everything else,
       including a `None` return code from a spawn failure (AC-015) or a
       return code of 0 whose reader threads never confirmed a clean join,
       is `PROCESS_ERROR`.
 
-    This never touches `subprocess` or the filesystem, and never retries --
-    a caller mapping `TIMEOUT`/`INTERRUPTED` into a provider retry would be
-    a policy bug elsewhere, not something this function permits.
+    Exactly zero or one of `timed_out`/`interrupted`/`logging_error` may be
+    `True`. This never touches `subprocess` or the filesystem, and never
+    retries -- a caller mapping any of these three into a provider retry
+    would be a policy bug elsewhere, not something this function permits.
     """
 
-    if timed_out and interrupted:
-        raise ValueError("timed_out and interrupted are mutually exclusive")
+    if sum((timed_out, interrupted, logging_error)) > 1:
+        raise ValueError(
+            "timed_out, interrupted, and logging_error are mutually exclusive"
+        )
 
     if timed_out:
         outcome = RunOutcome.TIMEOUT
     elif interrupted:
         outcome = RunOutcome.INTERRUPTED
+    elif logging_error:
+        outcome = RunOutcome.LOGGING_ERROR
     elif return_code == 0 and termination_confirmed:
         outcome = RunOutcome.SUCCEEDED
     else:
@@ -151,22 +160,32 @@ def _wait_for_exit_or_deadline(
     clock: Clock,
     deadline: int,
     cancelled: threading.Event,
-) -> tuple[int | None, bool, bool]:
-    """Poll until the child exits, the deadline passes, or cancellation is
-    requested; never blocks past whichever comes first.
+    sink_fault: threading.Event,
+) -> tuple[int | None, bool, bool, bool]:
+    """Poll until the child exits, the deadline passes, cancellation is
+    requested, or a reader's sink write faults; never blocks past whichever
+    comes first.
 
-    Returns `(return_code, timed_out, interrupted)`: `return_code` is set
-    only when the child had already exited on its own.
+    Returns `(return_code, timed_out, interrupted, logging_error)`:
+    `return_code` is set only when the child had already exited on its own.
+    A sink fault is checked *before* the child's own exit status: a faulted
+    reader keeps draining (rather than closing its pipe) precisely so the
+    child is not incidentally broken-piped into its own unrelated exit code
+    while we are still noticing the fault, so once a fault is observed it
+    must win the race regardless of what `process.poll()` reports next
+    (M05-04).
     """
 
     while True:
+        if sink_fault.is_set():
+            return None, False, False, True
         return_code = process.poll()
         if return_code is not None:
-            return return_code, False, False
+            return return_code, False, False, False
         if cancelled.is_set():
-            return None, False, True
+            return None, False, True, False
         if clock.monotonic_ns() >= deadline:
-            return None, True, False
+            return None, True, False, False
         time.sleep(_POLL_INTERVAL_SECONDS)
 
 
@@ -240,6 +259,16 @@ class _StreamReader(threading.Thread):
     as soon as any data is available instead of blocking until a full chunk
     or EOF, which is what makes the forwarding genuinely incremental rather
     than a large buffered read in disguise.
+
+    A `sink.write()` failure (`OSError`, e.g. disk full or permission
+    denied) sets `sink_fault` and stops counting/forwarding, but keeps
+    draining (and discarding) the pipe rather than closing it: closing our
+    end immediately would deliver a broken pipe to a child that is still
+    actively writing, letting it crash on its own with an unrelated
+    technical exit code -- a race that would non-deterministically report
+    `PROCESS_ERROR` instead of `LOGGING_ERROR` depending on who notices
+    first. `SubprocessRunner` is the one that actually terminates the child
+    once it observes `sink_fault` set (M05-04).
     """
 
     def __init__(
@@ -249,6 +278,7 @@ class _StreamReader(threading.Thread):
         stream: io.BufferedReader,
         sink: AttemptLogSink,
         sink_lock: threading.Lock,
+        sink_fault: threading.Event,
         clock: Clock,
     ) -> None:
         super().__init__(daemon=True)
@@ -256,12 +286,14 @@ class _StreamReader(threading.Thread):
         self._stream = stream
         self._sink = sink
         self._sink_lock = sink_lock
+        self._sink_fault = sink_fault
         self._clock = clock
         self._state_lock = threading.Lock()
         self._byte_count = 0
         self._digest = hashlib.sha256()
 
     def run(self) -> None:
+        faulted = False
         try:
             while True:
                 try:
@@ -270,12 +302,21 @@ class _StreamReader(threading.Thread):
                     return
                 if not chunk:
                     return
+                if faulted:
+                    # Keep draining to avoid backing the child into a
+                    # broken pipe; there is nothing left to do with the
+                    # data once the sink itself has failed.
+                    continue
                 timestamp = self._clock.now()
                 with self._state_lock:
                     self._byte_count += len(chunk)
                     self._digest.update(chunk)
-                with self._sink_lock:
-                    self._sink.write(self._channel, chunk, timestamp)
+                try:
+                    with self._sink_lock:
+                        self._sink.write(self._channel, chunk, timestamp)
+                except OSError:
+                    self._sink_fault.set()
+                    faulted = True
         finally:
             try:
                 self._stream.close()
@@ -370,12 +411,14 @@ class SubprocessRunner:
         stderr_stream = cast(io.BufferedReader, process.stderr)
 
         sink_lock = threading.Lock()
+        sink_fault = threading.Event()
         stdin_writer = _StdinWriter(stream=process.stdin, payload=stdin_payload)
         stdout_reader = _StreamReader(
             channel="stdout",
             stream=stdout_stream,
             sink=sink,
             sink_lock=sink_lock,
+            sink_fault=sink_fault,
             clock=self._clock,
         )
         stderr_reader = _StreamReader(
@@ -383,6 +426,7 @@ class SubprocessRunner:
             stream=stderr_stream,
             sink=sink,
             sink_lock=sink_lock,
+            sink_fault=sink_fault,
             clock=self._clock,
         )
 
@@ -399,15 +443,18 @@ class SubprocessRunner:
         previous_sigterm = signal.signal(signal.SIGTERM, _request_cancellation)
         previous_sigint = signal.signal(signal.SIGINT, _request_cancellation)
         try:
-            return_code, timed_out, interrupted = _wait_for_exit_or_deadline(
-                process,
-                self._clock,
-                deadline_ns(start_ns, spec.timeout_seconds),
-                cancelled,
+            return_code, timed_out, interrupted, logging_error = (
+                _wait_for_exit_or_deadline(
+                    process,
+                    self._clock,
+                    deadline_ns(start_ns, spec.timeout_seconds),
+                    cancelled,
+                    sink_fault,
+                )
             )
 
             termination_confirmed = True
-            if timed_out or interrupted:
+            if timed_out or interrupted or logging_error:
                 return_code, termination_confirmed = _escalate_and_confirm_termination(
                     process, spec.termination_grace_seconds
                 )
@@ -442,6 +489,7 @@ class SubprocessRunner:
             termination_confirmed=termination_confirmed,
             timed_out=timed_out,
             interrupted=interrupted,
+            logging_error=logging_error,
             stdout_byte_count=stdout_byte_count,
             stdout_sha256=stdout_sha256,
             stderr_byte_count=stderr_byte_count,
