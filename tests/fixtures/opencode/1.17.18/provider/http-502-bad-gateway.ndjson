@@ -1,0 +1,2 @@
+{"type": "message.part.updated", "sessionID": "ses_provider_502", "part": {"id": "prt_1", "messageID": "msg_1", "type": "reasoning", "text": "Starting the requested edit.", "time": {"start": 1}}}
+{"type": "session.error", "sessionID": "ses_provider_502", "error": {"name": "ProviderBadGatewayError", "data": {"status": 502, "code": "bad_gateway", "message": "Upstream provider returned a bad gateway response."}}}

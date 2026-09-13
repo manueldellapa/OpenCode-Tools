@@ -1,0 +1,1 @@
+{"type": "message.part.updated", "sessionID": "ses_provider_lookalike_text", "part": {"id": "prt_1", "messageID": "msg_1", "type": "text", "text": "Fixed the client so a 429 rate limit response from the upstream API is retried with backoff instead of crashing.\nAGENT_STATUS: COMPLETED", "time": {"start": 1, "end": 2}}}

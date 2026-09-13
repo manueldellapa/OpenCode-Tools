@@ -1,0 +1,9 @@
+{
+  "sessionID": "ses_reviewer_approved",
+  "messages": [
+    {
+      "info": { "id": "msg_1", "role": "assistant", "agent": "reviewer" },
+      "parts": [{ "type": "text", "text": "REVIEW_STATUS: APPROVED" }]
+    }
+  ]
+}

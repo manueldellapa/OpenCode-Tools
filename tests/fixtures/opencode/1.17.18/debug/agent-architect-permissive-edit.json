@@ -1,0 +1,6 @@
+{
+  "name": "architect",
+  "mode": "primary",
+  "tools": { "ask": false, "task": false },
+  "permission": { "edit": "allow", "bash": "deny", "webfetch": "deny" }
+}

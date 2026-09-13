@@ -1,0 +1,353 @@
+{
+  "schema_version": 1,
+  "opencode_version": "1.17.18",
+  "compatibility_status": "candidate",
+  "provenance": {
+    "method": "Hand-authored offline evidence pack modeling the documented OpenCode 1.17.18 CLI, NDJSON transport, and debug/export JSON contract. No live OpenCode process, network access, or real provider/model was used; every fixture is a static, version-pinned test double checked into the repository.",
+    "authored_for": "OpenCode-Tools GitHub issue #21 (work package M07-01)",
+    "references": [
+      "https://opencode.ai/v2/docs/cli/commands/",
+      "https://raw.githubusercontent.com/anomalyco/opencode/v1.17.18/packages/opencode/src/cli/cmd/run.ts",
+      "https://raw.githubusercontent.com/anomalyco/opencode/v1.17.18/packages/opencode/src/cli/cmd/export.ts",
+      "https://raw.githubusercontent.com/anomalyco/opencode/v1.17.18/packages/opencode/src/cli/cmd/debug/agent.ts"
+    ]
+  },
+  "fixtures": [
+    {
+      "path": "run/architect-ready-success.ndjson",
+      "category": "run-transcript",
+      "kind": "positive",
+      "role": "architect",
+      "sha256": "16db087291d0c649960f8a35c4819dbde9429288db088fae549e62cb9305fcf9",
+      "description": "Clean single-session architect run producing one terminal text with a handoff, ISSUE_REF_JSON, and AGENT_STATUS: READY."
+    },
+    {
+      "path": "run/architect-failed.ndjson",
+      "category": "run-transcript",
+      "kind": "positive",
+      "role": "architect",
+      "sha256": "5060e38c7505e10e569c0481e47ed8f7c28d397e26ae3c3fe2951b9713696ac3",
+      "description": "Clean architect run that reports AGENT_STATUS: FAILED with a non-empty explanation before any handoff is produced."
+    },
+    {
+      "path": "run/coder-completed-success.ndjson",
+      "category": "run-transcript",
+      "kind": "positive",
+      "role": "coder",
+      "sha256": "a975c667438d9290bbd43c8d7cf2d6c63ae54bdff0399a1eb740f06e0d1ce449",
+      "description": "Clean coder run with one tool call followed by a single terminal text ending in AGENT_STATUS: COMPLETED."
+    },
+    {
+      "path": "run/coder-failed.ndjson",
+      "category": "run-transcript",
+      "kind": "positive",
+      "role": "coder",
+      "sha256": "e923016201aeb46ef7d3aa68d621d77e5efcea467fcba19cfa9035c294f23c4c",
+      "description": "Clean coder run that reports AGENT_STATUS: FAILED with a non-empty explanation after a failed tool call."
+    },
+    {
+      "path": "run/reviewer-approved-success.ndjson",
+      "category": "run-transcript",
+      "kind": "positive",
+      "role": "reviewer",
+      "sha256": "1c53bd5a9ee5a46fb734d3bb7b1ece2a460c6fb1b48b7f50e532b174cd51e4c9",
+      "description": "Clean reviewer run whose sole terminal text line is REVIEW_STATUS: APPROVED with an empty body."
+    },
+    {
+      "path": "run/reviewer-changes-required.ndjson",
+      "category": "run-transcript",
+      "kind": "positive",
+      "role": "reviewer",
+      "sha256": "35d6cd5a1dce9acee2aa0be00c8a196a4479f7210e433c6673f8a4b7a6398963",
+      "description": "Clean reviewer run reporting REVIEW_STATUS: CHANGES_REQUIRED with a non-empty body; a valid parse with outcome SUCCEEDED."
+    },
+    {
+      "path": "run/reviewer-failed.ndjson",
+      "category": "run-transcript",
+      "kind": "positive",
+      "role": "reviewer",
+      "sha256": "c02acd64b8c9849927bb40bda4df0540c1b1f067a1b249ccf08794466b3200d4",
+      "description": "Clean reviewer run that reports AGENT_STATUS: FAILED with a non-empty explanation when review cannot proceed."
+    },
+    {
+      "path": "run/exit-nonzero-no-provider-signal.ndjson",
+      "category": "run-process-exit",
+      "kind": "negative",
+      "role": null,
+      "sha256": "27b5d7ba86502ff352ed1f91af0398cca12b17d56824728ea69c71a27f33ba86",
+      "description": "Stream ends after an uncompleted tool call with no session.error event and no terminal text; paired with a non-zero exit code (1) and no trusted provider signal, so it must not authorize a provider retry."
+    },
+    {
+      "path": "run/partial-output-return-code-null.ndjson",
+      "category": "run-process-exit",
+      "kind": "negative",
+      "role": null,
+      "sha256": "0da15b73ffa58a2edce28c7bb5f81459dc84cb1e92709cde725191ab822f9c8a",
+      "description": "Stream stops mid-reasoning with no terminal text at all, modeling a killed child whose return code is nullable rather than observed."
+    },
+    {
+      "path": "provider/http-429-rate-limit.ndjson",
+      "category": "provider-trusted",
+      "kind": "positive",
+      "role": null,
+      "sha256": "cc32eb93f6a1e6facbc926b2877ecf310e72cd7870bfc5039682fb1aeffe4221",
+      "description": "Trusted session.error event carrying HTTP 429 / rate_limit_exceeded, the canonical transient provider signature."
+    },
+    {
+      "path": "provider/http-502-bad-gateway.ndjson",
+      "category": "provider-trusted",
+      "kind": "positive",
+      "role": null,
+      "sha256": "fcf5db92d46b62e6494e3c11582aa142d6f739a15203fbceca60f325b355c751",
+      "description": "Trusted session.error event carrying HTTP 502 / bad_gateway, the canonical transient provider signature."
+    },
+    {
+      "path": "provider/provider-unavailable.ndjson",
+      "category": "provider-trusted",
+      "kind": "positive",
+      "role": null,
+      "sha256": "65e2244b3cc37354fa3079c55d9cac1641fec7f570fdbb60eeff11d525fd0201",
+      "description": "Trusted session.error event carrying the provider_unavailable code, the canonical transient provider signature."
+    },
+    {
+      "path": "provider/overload.ndjson",
+      "category": "provider-trusted",
+      "kind": "positive",
+      "role": null,
+      "sha256": "aef26a73ecdb62f9b10f08a48457e934e89f2d9bcefe19dc7e7a0ebec5f0a7a4",
+      "description": "Trusted session.error event carrying the overloaded_error code, the canonical transient provider signature."
+    },
+    {
+      "path": "provider/rate-limit-textual.ndjson",
+      "category": "provider-trusted",
+      "kind": "positive",
+      "role": null,
+      "sha256": "cbb3e1a819ebb4d0cd5ffaa0b216d79db82eed108fd9dc1e278758d364571e81",
+      "description": "Trusted session.error event carrying a textual rate_limit code distinct from the numeric 429 signature."
+    },
+    {
+      "path": "provider/lookalike-in-assistant-text.ndjson",
+      "category": "provider-lookalike",
+      "kind": "negative",
+      "role": "coder",
+      "sha256": "2f0d6308ae18512d09c628467dccebdc5f56dcde735777b55d0154adb296c03e",
+      "description": "Trust-boundary case: the terminal assistant text mentions 429 and rate limit as ordinary prose with no session.error event; must not be classified as a trusted provider signal."
+    },
+    {
+      "path": "provider/lookalike-in-tool-output.ndjson",
+      "category": "provider-lookalike",
+      "kind": "negative",
+      "role": "coder",
+      "sha256": "aa7511a0e938db97331cdbbb1ebf79db5699a0dcb8eb58175d851b74d4559800",
+      "description": "Trust-boundary case: a tool call's captured output mentions 502 Bad Gateway with no session.error event; must not be classified as a trusted provider signal."
+    },
+    {
+      "path": "malformed/invalid-json-line.ndjson",
+      "category": "transport-malformed",
+      "kind": "negative",
+      "role": null,
+      "sha256": "2afdcf5742c33a94eeae739b5a0e06266eaf5954f8e53b61d53d4ca1d80b2326",
+      "description": "Second line is not valid JSON at all, modeling a truncated or corrupted NDJSON stream."
+    },
+    {
+      "path": "malformed/unknown-event-type.ndjson",
+      "category": "transport-malformed",
+      "kind": "negative",
+      "role": null,
+      "sha256": "579f80bf49e8bcf81daec83c86f2cb2576eb3071b0ab708fd5246f5a8a2b3b05",
+      "description": "Well-formed JSON line whose event type is outside the 1.17.18 schema allowlist."
+    },
+    {
+      "path": "malformed/session-id-mismatch.ndjson",
+      "category": "transport-malformed",
+      "kind": "negative",
+      "role": null,
+      "sha256": "11734ace36c3630ae626a24248637f85d611abae0defe2a8945ac744dcbb3f9d",
+      "description": "Two lines carry different sessionID values, modeling an ambiguous or interleaved transport."
+    },
+    {
+      "path": "malformed/truncated-no-terminal-text.ndjson",
+      "category": "transport-malformed",
+      "kind": "negative",
+      "role": null,
+      "sha256": "4828964facca5de28dd0b5b0b7d11c5b0bb5c42999e0efc38a827df612177c30",
+      "description": "Stream ends with only a reasoning part and a still-running tool call; no completed terminal text part ever appears."
+    },
+    {
+      "path": "malformed/multi-terminal-candidates.ndjson",
+      "category": "transport-malformed",
+      "kind": "negative",
+      "role": null,
+      "sha256": "7a77660073e05994259122880d6fa81642d8968078d2107e7db2534552580d07",
+      "description": "Two distinct messageID groups both present a completed terminal text candidate, making the terminal message ambiguous."
+    },
+    {
+      "path": "malformed/tool-output-marker-spoofing.ndjson",
+      "category": "transport-malformed",
+      "kind": "negative",
+      "role": null,
+      "sha256": "867ce4cdd3f8c0c48cd09f3d57df5635fdcc6739d3fe928e1c5322f82eb9c867",
+      "description": "A tool call's captured output contains a literal AGENT_STATUS: READY line; only the true terminal text part may feed the protocol parser."
+    },
+    {
+      "path": "malformed/reasoning-marker-spoofing.ndjson",
+      "category": "transport-malformed",
+      "kind": "negative",
+      "role": null,
+      "sha256": "f07133c6eb8197aba100db35bd07a9970760762a3dd82e840631bce20206971a",
+      "description": "A reasoning part mentions AGENT_STATUS: COMPLETED as prose; reasoning parts must never feed the protocol parser."
+    },
+    {
+      "path": "malformed/non-utf8-bytes.bin",
+      "category": "transport-malformed",
+      "kind": "negative",
+      "role": null,
+      "sha256": "a4b9f748ee53ff387e2b35fd33f33835e42f2038769c73d94f08990458e51ce8",
+      "description": "Raw captured stdout bytes that are not valid UTF-8, modeling a strict-decode failure before any NDJSON parsing is attempted."
+    },
+    {
+      "path": "malformed/agent-fallback-warning.stdout.txt",
+      "category": "transport-malformed",
+      "kind": "negative",
+      "role": "architect",
+      "sha256": "2c2b96fca2c576fd7841f8c1f708f39c58a0a2634700b1d3b8c8e6ddc00924ab",
+      "description": "Raw captured stdout mixing a plain-text CLI fallback warning line ahead of otherwise valid NDJSON, modeling the silent default-agent fallback that must fail the transport."
+    },
+    {
+      "path": "debug/config-baseline.json",
+      "category": "debug-config",
+      "kind": "positive",
+      "role": null,
+      "sha256": "76363322407f1a059861be1f7096e015ba7380519edfac4e57ddf47d1822531e",
+      "description": "opencode debug config output with manual sharing and auto-update disabled, the accepted preflight baseline."
+    },
+    {
+      "path": "debug/config-auto-share-enabled.json",
+      "category": "debug-config",
+      "kind": "negative",
+      "role": null,
+      "sha256": "9dc592ef0f8942e2e1850e6e71a13ccfe6cd04e8215ddd14b0291ce665eedc81",
+      "description": "opencode debug config output with share set to auto and autoshare true; preflight must reject automatic sharing."
+    },
+    {
+      "path": "debug/agent-architect-baseline.json",
+      "category": "debug-agent",
+      "kind": "positive",
+      "role": "architect",
+      "sha256": "b24fdf4571da2bd6c217d143a3fee96f2953f07cb41c025849de9bd4b0388c76",
+      "description": "opencode debug agent architect output: primary mode, no ask/task tools, read-only permission matrix."
+    },
+    {
+      "path": "debug/agent-coder-baseline.json",
+      "category": "debug-agent",
+      "kind": "positive",
+      "role": "coder",
+      "sha256": "a4899a8544e65e61ef680a2e47527a0d9b305e2f6dab96c39ca378157ffb4c8d",
+      "description": "opencode debug agent coder output: primary mode, no ask/task tools, edit/bash permission allowed for the target."
+    },
+    {
+      "path": "debug/agent-reviewer-baseline.json",
+      "category": "debug-agent",
+      "kind": "positive",
+      "role": "reviewer",
+      "sha256": "c1dcc8ad975dd5c614aa5bd3b2ce38c72cbb6c35280ebd07e9076d78998e1b8f",
+      "description": "opencode debug agent reviewer output: primary mode, no ask/task tools, read-only permission matrix."
+    },
+    {
+      "path": "debug/agent-architect-ask-enabled.json",
+      "category": "debug-agent",
+      "kind": "negative",
+      "role": "architect",
+      "sha256": "0fa2bca4bed34f06fbd355ed2e41f1614197e15ebcba2454c6c371b96b8db802",
+      "description": "opencode debug agent architect output with the ask tool enabled; preflight must reject it."
+    },
+    {
+      "path": "debug/agent-coder-task-enabled.json",
+      "category": "debug-agent",
+      "kind": "negative",
+      "role": "coder",
+      "sha256": "9b875102c518b9ef2cbcb14a8660e55f45dec106f4ba8aebe5bd39736e40a53d",
+      "description": "opencode debug agent coder output with the task tool enabled; preflight must reject any subagent delegation capability."
+    },
+    {
+      "path": "debug/agent-reviewer-subagent-mode.json",
+      "category": "debug-agent",
+      "kind": "negative",
+      "role": "reviewer",
+      "sha256": "0ad554e9a44a1a633c1ebd95bcc44e3f42f29745610c2ab02f71460d50d680f0",
+      "description": "opencode debug agent reviewer output reporting mode subagent instead of primary; preflight must reject non-primary agents."
+    },
+    {
+      "path": "debug/agent-architect-permissive-edit.json",
+      "category": "debug-agent",
+      "kind": "negative",
+      "role": "architect",
+      "sha256": "d7da782bdff3b5b8772aead657b78ba11e306375c310d19177ff169779f5f1a2",
+      "description": "opencode debug agent architect output granting edit permission; preflight must reject any effective policy more permissive than the reviewed read-only baseline."
+    },
+    {
+      "path": "debug/agent-missing.json",
+      "category": "debug-agent",
+      "kind": "negative",
+      "role": "architect",
+      "sha256": "87c205cd2993b4e8a155277047dc40791ed4554d5502884c69c23ce6944fb8fd",
+      "description": "opencode debug agent output for a role that is not defined in the OpenCode configuration at all."
+    },
+    {
+      "path": "export/architect-correct-agent.json",
+      "category": "export-identity",
+      "kind": "positive",
+      "role": "architect",
+      "sha256": "99b8d2dcdb6b4b90a363f0536631f0622b512ba3a257c5b98457f903119ecd14",
+      "description": "Sanitized export whose single top-level assistant message reports info.agent architect, matching the requested role."
+    },
+    {
+      "path": "export/coder-correct-agent.json",
+      "category": "export-identity",
+      "kind": "positive",
+      "role": "coder",
+      "sha256": "a5dfdc730d2e8e8bb773cf61c296a413299e81f04b7a9d030641b5e020766f5c",
+      "description": "Sanitized export whose single top-level assistant message reports info.agent coder, matching the requested role."
+    },
+    {
+      "path": "export/reviewer-correct-agent.json",
+      "category": "export-identity",
+      "kind": "positive",
+      "role": "reviewer",
+      "sha256": "67ff8ecb8b09c51109e780030dcac00264b297fc29f603c64a29bfa77e44d63d",
+      "description": "Sanitized export whose single top-level assistant message reports info.agent reviewer, matching the requested role."
+    },
+    {
+      "path": "export/agent-mismatch.json",
+      "category": "export-identity",
+      "kind": "negative",
+      "role": "architect",
+      "sha256": "4ddadad4a7ec12e4c265fa35f1d2ca6f495d222c7393a044bce321b5ab27e04b",
+      "description": "Sanitized export for a session started as architect whose assistant message reports info.agent coder, modeling a silent fallback identity mismatch."
+    },
+    {
+      "path": "export/agent-field-missing.json",
+      "category": "export-identity",
+      "kind": "negative",
+      "role": "coder",
+      "sha256": "d3d2bfd887013fdadbee2df07864a21cf255ef1e64a761cf87edb12927ffd961",
+      "description": "Sanitized export whose assistant message info object has no agent field at all, modeling an unexpected export schema."
+    },
+    {
+      "path": "export/zero-assistant-messages.json",
+      "category": "export-identity",
+      "kind": "negative",
+      "role": "coder",
+      "sha256": "134c35986750dc21bf7b6995f008c0529e1d2dbed574ba31513269088b4d658b",
+      "description": "Sanitized export whose only message is from the user; no top-level assistant message exists to prove agent identity."
+    },
+    {
+      "path": "export/ambiguous-multiple-assistant-agents.json",
+      "category": "export-identity",
+      "kind": "negative",
+      "role": null,
+      "sha256": "630517e1f7b6814acb4e7ef8960ab199349e3b70fb244445054eb0d2362735b7",
+      "description": "Sanitized export with two top-level assistant messages reporting different info.agent values, one of them the default fallback agent."
+    }
+  ]
+}

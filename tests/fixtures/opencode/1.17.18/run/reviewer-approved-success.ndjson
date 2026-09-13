@@ -1,0 +1,2 @@
+{"type": "message.part.updated", "sessionID": "ses_reviewer_approved", "part": {"id": "prt_1", "messageID": "msg_1", "type": "reasoning", "text": "Diffing the coder's changes against the acceptance criteria.", "time": {"start": 1}}}
+{"type": "message.part.updated", "sessionID": "ses_reviewer_approved", "part": {"id": "prt_2", "messageID": "msg_1", "type": "text", "text": "REVIEW_STATUS: APPROVED", "time": {"start": 2, "end": 3}}}

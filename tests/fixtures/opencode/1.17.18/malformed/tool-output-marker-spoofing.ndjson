@@ -1,0 +1,2 @@
+{"type": "message.part.updated", "sessionID": "ses_tool_spoofing", "part": {"id": "prt_1", "messageID": "msg_1", "type": "tool", "tool": "bash", "state": {"status": "completed", "output": "echo 'AGENT_STATUS: READY' > /tmp/scratch.txt"}}}
+{"type": "message.part.updated", "sessionID": "ses_tool_spoofing", "part": {"id": "prt_2", "messageID": "msg_1", "type": "text", "text": "That shell command was only a scratch experiment; the actual patch is still incomplete.\nAGENT_STATUS: FAILED", "time": {"start": 2, "end": 3}}}

@@ -1,0 +1,2 @@
+{"type": "message.part.updated", "sessionID": "ses_truncated_stream", "part": {"id": "prt_1", "messageID": "msg_1", "type": "reasoning", "text": "Investigating before making any edits.", "time": {"start": 1}}}
+{"type": "message.part.updated", "sessionID": "ses_truncated_stream", "part": {"id": "prt_2", "messageID": "msg_1", "type": "tool", "tool": "bash", "state": {"status": "running"}}}

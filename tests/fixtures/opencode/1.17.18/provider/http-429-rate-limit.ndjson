@@ -1,0 +1,2 @@
+{"type": "message.part.updated", "sessionID": "ses_provider_429", "part": {"id": "prt_1", "messageID": "msg_1", "type": "reasoning", "text": "Starting the requested edit.", "time": {"start": 1}}}
+{"type": "session.error", "sessionID": "ses_provider_429", "error": {"name": "ProviderRateLimitError", "data": {"status": 429, "code": "rate_limit_exceeded", "message": "Too many requests to the provider API."}}}

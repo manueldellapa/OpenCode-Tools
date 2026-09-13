@@ -1,0 +1,2 @@
+{"type": "message.part.updated", "sessionID": "ses_architect_failed", "part": {"id": "prt_1", "messageID": "msg_1", "type": "reasoning", "text": "Attempting to resolve the issue reference before producing a handoff.", "time": {"start": 1}}}
+{"type": "message.part.updated", "sessionID": "ses_architect_failed", "part": {"id": "prt_2", "messageID": "msg_1", "type": "text", "text": "Could not resolve the target repository from the supplied issue locator; aborting before handoff.\nAGENT_STATUS: FAILED", "time": {"start": 2, "end": 3}}}
