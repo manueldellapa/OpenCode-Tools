@@ -28,6 +28,7 @@ from opencode_tools.domain import (
     AgentRole,
     ProcessResult,
     ProcessSpec,
+    ProviderDiagnostic,
     RunOutcome,
     Workspace,
 )
@@ -101,6 +102,19 @@ MAX_NDJSON_LINES = 100_000
 # closed rather than being ignored, per ADR-005's no-best-effort policy.
 _ALLOWED_TRANSPORT_EVENT_TYPES = frozenset({"message.part.updated", "session.error"})
 _ALLOWED_TRANSPORT_PART_TYPES = frozenset({"text", "reasoning", "tool"})
+
+# The only trusted transient-provider signatures for 1.17.18 (FR-028, System
+# Design SS10.6): keyed by the allowlisted `session.error.data.code` value,
+# mapped to the canonical signature label recorded on `ProviderDiagnostic`.
+# A code outside this map -- or the same string anywhere other than a
+# `session.error` event's own `data.code` field -- is never trusted.
+_TRUSTED_PROVIDER_CODES: dict[str, str] = {
+    "rate_limit_exceeded": "429",
+    "bad_gateway": "502",
+    "provider_unavailable": "provider_unavailable",
+    "overloaded_error": "overload",
+    "rate_limit": "rate_limit",
+}
 
 
 class _BoundedCapturingSink:
@@ -481,6 +495,58 @@ def open_run_capture_sink(log_name: str) -> _BoundedCapturingSink:
     """Open the bounded stdout/stderr capture used for one `opencode run`."""
 
     return _BoundedCapturingSink(path=Path(log_name), max_bytes=RUN_OUTPUT_LIMIT_BYTES)
+
+
+def classify_provider_signal(stdout_text: str) -> ProviderDiagnostic | None:
+    """Return the first trusted transient-provider signal in `stdout_text`.
+
+    Reads only `session.error` events and only their allowlisted
+    `error.data.code` field (System Design SS10.6, FR-028); every other
+    event type and every other channel -- issue text, assistant/tool/
+    reasoning content, stderr -- is structurally invisible to this
+    function, so the same string appearing there can never be classified
+    as a provider signal.
+
+    Unparseable or unrecognized lines are skipped rather than raised: this
+    classifier's only job is to answer "is a trusted provider signature
+    present," even in a stream that is otherwise malformed, truncated, or
+    incomplete -- `decode_run_transport` is what validates the transport
+    itself, and a transport violation coexisting with a genuine trusted
+    signal remains a concurrent diagnostic rather than hiding it (ADR-002).
+    When more than one trusted signal is present, the first one in stream
+    order is returned; this function never decides a retry or sleeps.
+    """
+
+    for line in _split_ndjson_lines(stdout_text):
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(event, dict) or event.get("type") != "session.error":
+            continue
+        error = event.get("error")
+        if not isinstance(error, dict):
+            continue
+        data = error.get("data")
+        if not isinstance(data, dict):
+            continue
+        code = data.get("code")
+        if not isinstance(code, str):
+            continue
+        signature = _TRUSTED_PROVIDER_CODES.get(code)
+        if signature is None:
+            continue
+
+        status_code = data.get("status")
+        return ProviderDiagnostic(
+            source="session.error",
+            signature=signature,
+            retryable=True,
+            status_code=status_code if isinstance(status_code, int) else None,
+            code=code,
+        )
+
+    return None
 
 
 def _require_process_succeeded(
@@ -1006,6 +1072,7 @@ __all__ = (
     "check_no_forbidden_flags",
     "check_run_help_capability",
     "check_version",
+    "classify_provider_signal",
     "compute_control_plane_digest",
     "decode_run_output",
     "decode_run_transport",
