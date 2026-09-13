@@ -1,10 +1,11 @@
 """Path resolution and config validation, proven before any agent I/O.
 
 Covers the workspace/target/issue-number shape of a `RunRequest`, and the
-discovery/parsing/closed-schema/range validation that produces `AppConfig`.
-Runtime-root canonicalization, Git-metadata rejection, GitHub target-override
-validation, Git top-level proof, clean-baseline checks, and artifact creation
-remain the responsibility of later milestones.
+discovery/parsing/closed-schema/range validation that produces `AppConfig`,
+including canonical `runtime.root` and closed `github.targets` overrides.
+Ignore/ownership/mode checks, GitHub repository/`gh` resolution, Git
+top-level proof, clean-baseline checks, and artifact creation remain the
+responsibility of later milestones.
 """
 
 from __future__ import annotations
@@ -19,6 +20,7 @@ from opencode_tools.domain import (
     AppConfig,
     ConfigSource,
     ExecutionConfig,
+    GithubTargetOverride,
     ProviderRetryConfig,
     RunRequest,
     Workspace,
@@ -287,12 +289,53 @@ def load_raw_config(
     return RawConfig(source=source, path=resolved_path, data=data)
 
 
-def build_app_config(raw: RawConfig) -> AppConfig:
+def _canonicalize_runtime_root(raw_root: object, *, workspace: Workspace) -> Path:
+    """Canonicalize `runtime.root`, relative to `workspace` when not absolute.
+
+    No existence check: directory creation belongs to a later milestone, so
+    a non-existent runtime root is resolved (not required to exist yet).
+    """
+
+    if not isinstance(raw_root, str):
+        raise ConfigError(
+            "config.field_invalid_type",
+            "runtime.root must be a string",
+        )
+    if not raw_root.strip():
+        raise ConfigError(
+            "config.field_invalid_value",
+            "runtime.root must not be empty",
+        )
+    candidate = Path(raw_root)
+    if not candidate.is_absolute():
+        candidate = workspace.root / candidate
+    return candidate.resolve()
+
+
+def _build_github_targets(
+    github_table: Mapping[str, object],
+) -> tuple[GithubTargetOverride, ...]:
+    targets_table = cast(Mapping[str, object], github_table.get("targets", {}))
+    overrides: list[GithubTargetOverride] = []
+    for target_key, entry in targets_table.items():
+        entry_table = cast(Mapping[str, object], entry)
+        overrides.append(
+            GithubTargetOverride(
+                workspace_relative=Path(target_key),
+                remote=cast("str | None", entry_table.get("remote")),
+                repository=cast("str | None", entry_table.get("repository")),
+            )
+        )
+    return tuple(overrides)
+
+
+def build_app_config(raw: RawConfig, *, workspace: Workspace) -> AppConfig:
     """Apply v1 defaults, ranges, and cross-field rules to produce `AppConfig`.
 
     `raw.data` is already schema-shape-validated by `load_raw_config`; this
-    only fills in per-key defaults and enforces the scalar/cross-field rules
-    of `execution.*`, `provider_retry.*`, and `runtime.root`'s raw string.
+    fills in per-key defaults, enforces the scalar/cross-field rules of
+    `execution.*` and `provider_retry.*`, canonicalizes `runtime.root`
+    relative to `workspace`, and validates `github.targets` overrides.
     """
 
     execution_table = cast(Mapping[str, object], raw.data.get("execution", {}))
@@ -300,6 +343,12 @@ def build_app_config(raw: RawConfig) -> AppConfig:
         Mapping[str, object], raw.data.get("provider_retry", {})
     )
     runtime_table = cast(Mapping[str, object], raw.data.get("runtime", {}))
+    github_table = cast(Mapping[str, object], raw.data.get("github", {}))
+
+    runtime_root = _canonicalize_runtime_root(
+        runtime_table.get("root", _DEFAULT_RUNTIME_ROOT),
+        workspace=workspace,
+    )
 
     try:
         execution = ExecutionConfig(
@@ -346,12 +395,13 @@ def build_app_config(raw: RawConfig) -> AppConfig:
                 ),
             ),
         )
-        runtime_root = cast(str, runtime_table.get("root", _DEFAULT_RUNTIME_ROOT))
+        github_targets = _build_github_targets(github_table)
         return AppConfig(
             source=_CONFIG_SOURCE_BY_RAW[raw.source],
             execution=execution,
             provider_retry=provider_retry,
             runtime_root=runtime_root,
+            github_targets=github_targets,
         )
     except TypeError as error:
         raise ConfigError("config.field_invalid_type", str(error)) from None
@@ -368,7 +418,41 @@ def load_app_config(
     """Discover, parse, and fully validate the effective `AppConfig`."""
 
     raw = load_raw_config(config_path=config_path, workspace=workspace, cwd=cwd)
-    return build_app_config(raw)
+    return build_app_config(raw, workspace=workspace)
+
+
+def sanitize_app_config(config: AppConfig) -> Mapping[str, object]:
+    """Flatten `config` into a plain, JSON-safe mapping with no secrets.
+
+    Suitable for the `config` field of a future `RunRecord`; there are no
+    secrets in `AppConfig` by construction (no model/provider ID, no
+    credentials), so this only converts types into JSON-native primitives.
+    """
+
+    return {
+        "source": config.source.value,
+        "execution": {
+            "opencode_timeout_seconds": config.execution.opencode_timeout_seconds,
+            "utility_timeout_seconds": config.execution.utility_timeout_seconds,
+            "termination_grace_seconds": config.execution.termination_grace_seconds,
+            "max_review_cycles": config.execution.max_review_cycles,
+        },
+        "provider_retry": {
+            "max_attempts": config.provider_retry.max_attempts,
+            "initial_delay_seconds": config.provider_retry.initial_delay_seconds,
+            "multiplier": config.provider_retry.multiplier,
+            "max_delay_seconds": config.provider_retry.max_delay_seconds,
+        },
+        "runtime_root": str(config.runtime_root),
+        "github_targets": tuple(
+            {
+                "workspace_relative": str(override.workspace_relative),
+                "remote": override.remote,
+                "repository": override.repository,
+            }
+            for override in config.github_targets
+        ),
+    }
 
 
 def build_run_request(
@@ -407,4 +491,5 @@ __all__ = (
     "resolve_config_source",
     "resolve_target_root",
     "resolve_workspace",
+    "sanitize_app_config",
 )

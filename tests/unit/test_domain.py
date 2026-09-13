@@ -23,6 +23,7 @@ from opencode_tools.domain import (
     FinalStatus,
     FrozenJsonValue,
     GitCheckRecord,
+    GithubTargetOverride,
     GitSafetyStatus,
     GitState,
     IssueLocator,
@@ -93,7 +94,7 @@ def _app_config() -> AppConfig:
         source=ConfigSource.DEFAULTS,
         execution=_execution_config(),
         provider_retry=_provider_retry_config(),
-        runtime_root=".opencode-tools",
+        runtime_root=WORKSPACE_ROOT / ".opencode-tools",
     )
 
 
@@ -543,11 +544,12 @@ def test_execution_and_provider_retry_config_apply_v1_ranges() -> None:
         )
 
 
-def test_app_config_requires_typed_sections_and_a_non_empty_runtime_root() -> None:
+def test_app_config_requires_typed_sections_and_a_canonical_runtime_root() -> None:
     config = _app_config()
     assert is_dataclass(config)
     assert not hasattr(config, "__dict__")
     assert config.source is ConfigSource.DEFAULTS
+    assert config.github_targets == ()
     config_field = "runtime_root"
     with pytest.raises(FrozenInstanceError):
         setattr(config, config_field, getattr(config, config_field))
@@ -557,22 +559,68 @@ def test_app_config_requires_typed_sections_and_a_non_empty_runtime_root() -> No
             source=ConfigSource.DEFAULTS,
             execution=cast(ExecutionConfig, None),
             provider_retry=_provider_retry_config(),
-            runtime_root=".opencode-tools",
+            runtime_root=WORKSPACE_ROOT / ".opencode-tools",
         )
     with pytest.raises(TypeError, match="provider_retry must be ProviderRetryConfig"):
         AppConfig(
             source=ConfigSource.DEFAULTS,
             execution=_execution_config(),
             provider_retry=cast(ProviderRetryConfig, None),
-            runtime_root=".opencode-tools",
+            runtime_root=WORKSPACE_ROOT / ".opencode-tools",
         )
-    with pytest.raises(ValueError, match="runtime_root must not be empty"):
+    with pytest.raises(ValueError, match="runtime_root must be absolute"):
         AppConfig(
             source=ConfigSource.DEFAULTS,
             execution=_execution_config(),
             provider_retry=_provider_retry_config(),
-            runtime_root="  ",
+            runtime_root=Path(".opencode-tools"),
         )
+    with pytest.raises(ValueError, match="must not be under Git metadata"):
+        AppConfig(
+            source=ConfigSource.DEFAULTS,
+            execution=_execution_config(),
+            provider_retry=_provider_retry_config(),
+            runtime_root=WORKSPACE_ROOT / ".git" / "opencode-tools",
+        )
+    with pytest.raises(ValueError, match="github_targets contains a duplicate"):
+        AppConfig(
+            source=ConfigSource.DEFAULTS,
+            execution=_execution_config(),
+            provider_retry=_provider_retry_config(),
+            runtime_root=WORKSPACE_ROOT / ".opencode-tools",
+            github_targets=(
+                GithubTargetOverride(
+                    workspace_relative=Path("backend"),
+                    remote="origin",
+                ),
+                GithubTargetOverride(
+                    workspace_relative=Path("./backend"),
+                    repository="github.com/example/backend",
+                ),
+            ),
+        )
+
+
+def test_github_target_override_requires_a_remote_or_repository() -> None:
+    override = GithubTargetOverride(workspace_relative=Path("backend"), remote="origin")
+    assert is_dataclass(override)
+    assert not hasattr(override, "__dict__")
+    assert override.repository is None
+
+    with pytest.raises(ValueError, match="workspace_relative must not contain '..'"):
+        GithubTargetOverride(workspace_relative=Path("../backend"), remote="origin")
+    with pytest.raises(ValueError, match="remote must not contain control characters"):
+        GithubTargetOverride(workspace_relative=Path("backend"), remote="ori\x01gin")
+    with pytest.raises(
+        ValueError,
+        match="repository must be 'owner/repo' or 'host/owner/repo'",
+    ):
+        GithubTargetOverride(workspace_relative=Path("backend"), repository="backend")
+    with pytest.raises(
+        ValueError,
+        match="at least one of remote or repository is required",
+    ):
+        GithubTargetOverride(workspace_relative=Path("backend"))
 
 
 def test_repository_and_issue_identity_invariants() -> None:

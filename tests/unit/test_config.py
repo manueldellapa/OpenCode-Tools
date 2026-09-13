@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -14,8 +15,14 @@ from opencode_tools.config import (
     load_raw_config,
     read_config_file,
     resolve_config_source,
+    sanitize_app_config,
 )
-from opencode_tools.domain import AppConfig, ConfigSource, Workspace
+from opencode_tools.domain import (
+    AppConfig,
+    ConfigSource,
+    GithubTargetOverride,
+    Workspace,
+)
 from opencode_tools.errors import ConfigError
 
 FIXTURES_ROOT = Path(__file__).resolve().parents[1] / "fixtures" / "config"
@@ -33,6 +40,9 @@ def _make_workspace(tmp_path: Path) -> Workspace:
 
 def _raw(data: dict[str, object], *, source: str = "defaults") -> RawConfig:
     return RawConfig(source=source, path=None, data=data)
+
+
+FAKE_WORKSPACE = Workspace(root=Path("/opencode-tools-test-workspace"))
 
 
 # --- resolve_config_source: discovery and precedence ------------------------
@@ -274,7 +284,7 @@ def test_load_raw_config_is_reproducible_for_the_same_inputs(tmp_path: Path) -> 
 
 
 def test_build_app_config_applies_all_v1_defaults() -> None:
-    config = build_app_config(_raw({"version": 1}))
+    config = build_app_config(_raw({"version": 1}), workspace=FAKE_WORKSPACE)
 
     assert config.source is ConfigSource.DEFAULTS
     assert config.execution.opencode_timeout_seconds == 1800
@@ -285,7 +295,8 @@ def test_build_app_config_applies_all_v1_defaults() -> None:
     assert config.provider_retry.initial_delay_seconds == 2
     assert config.provider_retry.multiplier == 2.0
     assert config.provider_retry.max_delay_seconds == 30
-    assert config.runtime_root == ".opencode-tools"
+    assert config.runtime_root == FAKE_WORKSPACE.root / ".opencode-tools"
+    assert config.github_targets == ()
 
 
 def test_build_app_config_uses_explicit_values_from_data() -> None:
@@ -306,14 +317,14 @@ def test_build_app_config_uses_explicit_values_from_data() -> None:
         "runtime": {"root": "custom-runtime"},
     }
 
-    config = build_app_config(_raw(data, source="explicit"))
+    config = build_app_config(_raw(data, source="explicit"), workspace=FAKE_WORKSPACE)
 
     assert config.source is ConfigSource.EXPLICIT
     assert config.execution.opencode_timeout_seconds == 900
     assert config.execution.max_review_cycles == 5
     assert config.provider_retry.max_attempts == 4
     assert config.provider_retry.multiplier == 3.0
-    assert config.runtime_root == "custom-runtime"
+    assert config.runtime_root == FAKE_WORKSPACE.root / "custom-runtime"
 
 
 def test_load_app_config_applies_conventional_overrides_over_defaults(
@@ -351,7 +362,7 @@ def test_build_app_config_rejects_wrong_types(
     data: dict[str, object] = {"version": 1, section: {key: value}}
 
     with pytest.raises(ConfigError) as exc_info:
-        build_app_config(_raw(data))
+        build_app_config(_raw(data), workspace=FAKE_WORKSPACE)
 
     assert exc_info.value.code == "config.field_invalid_type"
 
@@ -385,7 +396,7 @@ def test_build_app_config_rejects_out_of_range_values(
     data: dict[str, object] = {"version": 1, section: {key: value}}
 
     with pytest.raises(ConfigError) as exc_info:
-        build_app_config(_raw(data))
+        build_app_config(_raw(data), workspace=FAKE_WORKSPACE)
 
     assert exc_info.value.code == "config.field_invalid_value"
 
@@ -409,7 +420,7 @@ def test_build_app_config_accepts_boundary_values(
 ) -> None:
     data: dict[str, object] = {"version": 1, section: {key: value}}
 
-    config = build_app_config(_raw(data))
+    config = build_app_config(_raw(data), workspace=FAKE_WORKSPACE)
 
     assert getattr(getattr(config, section), key) == value
 
@@ -421,7 +432,7 @@ def test_build_app_config_rejects_max_delay_below_initial_delay() -> None:
     }
 
     with pytest.raises(ConfigError) as exc_info:
-        build_app_config(_raw(data))
+        build_app_config(_raw(data), workspace=FAKE_WORKSPACE)
 
     assert exc_info.value.code == "config.field_invalid_value"
 
@@ -432,7 +443,7 @@ def test_build_app_config_accepts_max_delay_equal_to_initial_delay() -> None:
         "provider_retry": {"initial_delay_seconds": 10, "max_delay_seconds": 10},
     }
 
-    config = build_app_config(_raw(data))
+    config = build_app_config(_raw(data), workspace=FAKE_WORKSPACE)
 
     assert config.provider_retry.max_delay_seconds == 10
 
@@ -444,7 +455,7 @@ def test_build_app_config_rejects_max_delay_above_1800() -> None:
     }
 
     with pytest.raises(ConfigError) as exc_info:
-        build_app_config(_raw(data))
+        build_app_config(_raw(data), workspace=FAKE_WORKSPACE)
 
     assert exc_info.value.code == "config.field_invalid_value"
 
@@ -453,7 +464,7 @@ def test_build_app_config_rejects_an_empty_runtime_root() -> None:
     data: dict[str, object] = {"version": 1, "runtime": {"root": "   "}}
 
     with pytest.raises(ConfigError) as exc_info:
-        build_app_config(_raw(data))
+        build_app_config(_raw(data), workspace=FAKE_WORKSPACE)
 
     assert exc_info.value.code == "config.field_invalid_value"
 
@@ -462,6 +473,198 @@ def test_build_app_config_rejects_a_non_string_runtime_root() -> None:
     data: dict[str, object] = {"version": 1, "runtime": {"root": 5}}
 
     with pytest.raises(ConfigError) as exc_info:
-        build_app_config(_raw(data))
+        build_app_config(_raw(data), workspace=FAKE_WORKSPACE)
 
     assert exc_info.value.code == "config.field_invalid_type"
+
+
+# --- runtime.root: canonicalization and Git-metadata rejection -------------
+
+
+def test_build_app_config_resolves_a_relative_runtime_root_against_workspace() -> None:
+    data: dict[str, object] = {"version": 1, "runtime": {"root": "custom"}}
+
+    config = build_app_config(_raw(data), workspace=FAKE_WORKSPACE)
+
+    assert config.runtime_root == FAKE_WORKSPACE.root / "custom"
+
+
+def test_build_app_config_keeps_an_absolute_runtime_root_as_is() -> None:
+    data: dict[str, object] = {
+        "version": 1,
+        "runtime": {"root": "/elsewhere/runtime"},
+    }
+
+    config = build_app_config(_raw(data), workspace=FAKE_WORKSPACE)
+
+    assert config.runtime_root == Path("/elsewhere/runtime")
+
+
+def test_build_app_config_canonicalizes_a_symlinked_runtime_root(
+    tmp_path: Path,
+) -> None:
+    workspace = _make_workspace(tmp_path)
+    real_dir = tmp_path / "real-runtime"
+    real_dir.mkdir()
+    link = workspace.root / "linked-runtime"
+    link.symlink_to(real_dir, target_is_directory=True)
+    data: dict[str, object] = {"version": 1, "runtime": {"root": "linked-runtime"}}
+
+    config = build_app_config(_raw(data), workspace=workspace)
+
+    assert config.runtime_root == real_dir.resolve()
+
+
+def test_build_app_config_does_not_require_the_runtime_root_to_exist() -> None:
+    data: dict[str, object] = {"version": 1, "runtime": {"root": "not-created-yet"}}
+
+    config = build_app_config(_raw(data), workspace=FAKE_WORKSPACE)
+
+    assert config.runtime_root == FAKE_WORKSPACE.root / "not-created-yet"
+
+
+def test_build_app_config_rejects_a_runtime_root_under_git_metadata() -> None:
+    data: dict[str, object] = {"version": 1, "runtime": {"root": ".git/runtime"}}
+
+    with pytest.raises(ConfigError) as exc_info:
+        build_app_config(_raw(data), workspace=FAKE_WORKSPACE)
+
+    assert exc_info.value.code == "config.field_invalid_value"
+
+
+# --- github.targets: remote/repository and duplicate-after-canonicalization -
+
+
+def test_build_app_config_accepts_valid_github_target_overrides() -> None:
+    data: dict[str, object] = {
+        "version": 1,
+        "github": {
+            "targets": {
+                "Backend": {
+                    "remote": "origin",
+                    "repository": "github.com/example/backend",
+                },
+                "frontend": {"remote": "origin"},
+            }
+        },
+    }
+
+    config = build_app_config(_raw(data), workspace=FAKE_WORKSPACE)
+
+    assert set(config.github_targets) == {
+        GithubTargetOverride(
+            workspace_relative=Path("Backend"),
+            remote="origin",
+            repository="github.com/example/backend",
+        ),
+        GithubTargetOverride(workspace_relative=Path("frontend"), remote="origin"),
+    }
+
+
+def test_build_app_config_rejects_a_target_missing_remote_and_repository() -> None:
+    data: dict[str, object] = {
+        "version": 1,
+        "github": {"targets": {"backend": {}}},
+    }
+
+    with pytest.raises(ConfigError) as exc_info:
+        build_app_config(_raw(data), workspace=FAKE_WORKSPACE)
+
+    assert exc_info.value.code == "config.field_invalid_value"
+
+
+def test_build_app_config_rejects_an_invalid_repository_format() -> None:
+    data: dict[str, object] = {
+        "version": 1,
+        "github": {"targets": {"backend": {"repository": "backend"}}},
+    }
+
+    with pytest.raises(ConfigError) as exc_info:
+        build_app_config(_raw(data), workspace=FAKE_WORKSPACE)
+
+    assert exc_info.value.code == "config.field_invalid_value"
+
+
+def test_build_app_config_rejects_a_remote_with_control_characters() -> None:
+    data: dict[str, object] = {
+        "version": 1,
+        "github": {"targets": {"backend": {"remote": "ori\x01gin"}}},
+    }
+
+    with pytest.raises(ConfigError) as exc_info:
+        build_app_config(_raw(data), workspace=FAKE_WORKSPACE)
+
+    assert exc_info.value.code == "config.field_invalid_value"
+
+
+def test_build_app_config_rejects_duplicate_targets_after_canonicalization() -> None:
+    data: dict[str, object] = {
+        "version": 1,
+        "github": {
+            "targets": {
+                "backend": {"remote": "origin"},
+                "./backend": {"remote": "upstream"},
+            }
+        },
+    }
+
+    with pytest.raises(ConfigError) as exc_info:
+        build_app_config(_raw(data), workspace=FAKE_WORKSPACE)
+
+    assert exc_info.value.code == "config.field_invalid_value"
+
+
+# --- sanitize_app_config: JSON-safe, source-carrying, secret-free ----------
+
+
+def test_sanitize_app_config_produces_a_plain_json_safe_mapping() -> None:
+    data: dict[str, object] = {
+        "version": 1,
+        "github": {"targets": {"backend": {"remote": "origin"}}},
+    }
+    config = build_app_config(_raw(data, source="explicit"), workspace=FAKE_WORKSPACE)
+
+    sanitized = sanitize_app_config(config)
+
+    assert sanitized["source"] == "EXPLICIT"
+    assert sanitized["runtime_root"] == str(FAKE_WORKSPACE.root / ".opencode-tools")
+    execution = sanitized["execution"]
+    assert isinstance(execution, dict)
+    assert execution["opencode_timeout_seconds"] == 1800
+    provider_retry = sanitized["provider_retry"]
+    assert isinstance(provider_retry, dict)
+    assert provider_retry["max_attempts"] == 3
+    assert sanitized["github_targets"] == (
+        {"workspace_relative": "backend", "remote": "origin", "repository": None},
+    )
+    json.dumps(sanitized)
+
+
+# --- load_app_config: end-to-end with runtime.root and github.targets ------
+
+
+def test_load_app_config_resolves_runtime_root_and_github_targets(
+    tmp_path: Path,
+) -> None:
+    workspace = _make_workspace(tmp_path)
+    conventional = workspace.root / CONVENTIONAL_CONFIG_FILENAME
+    conventional.write_text(
+        "version = 1\n"
+        "[runtime]\n"
+        'root = "custom-runtime"\n'
+        '[github.targets."Backend"]\n'
+        'remote = "origin"\n'
+        'repository = "github.com/example/backend"\n',
+        encoding="utf-8",
+    )
+
+    config = load_app_config(config_path=None, workspace=workspace, cwd=tmp_path)
+
+    assert config.runtime_root == (workspace.root / "custom-runtime").resolve()
+    assert config.github_targets == (
+        GithubTargetOverride(
+            workspace_relative=Path("Backend"),
+            remote="origin",
+            repository="github.com/example/backend",
+        ),
+    )

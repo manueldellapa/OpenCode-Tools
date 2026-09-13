@@ -136,6 +136,19 @@ def _require_optional_non_empty(value: object, field_name: str) -> None:
         _require_non_empty(value, field_name)
 
 
+def _contains_control_character(value: str) -> bool:
+    return any(ord(character) < 0x20 or ord(character) == 0x7F for character in value)
+
+
+def _is_repository_slug(value: str) -> bool:
+    segments = value.split("/")
+    if len(segments) not in (2, 3):
+        return False
+    return all(
+        segment and not _contains_control_character(segment) for segment in segments
+    )
+
+
 def _require_exact_enum(
     value: object,
     enum_type: type[StrEnum],
@@ -476,18 +489,39 @@ class ProviderRetryConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class GithubTargetOverride:
+    """One closed, target-specific GitHub override (System Design SS14.2)."""
+
+    workspace_relative: Path
+    remote: str | None = None
+    repository: str | None = None
+
+    def __post_init__(self) -> None:
+        _require_path(self.workspace_relative, "workspace_relative", absolute=False)
+        _require_optional_non_empty(self.remote, "remote")
+        if self.remote is not None and _contains_control_character(self.remote):
+            raise ValueError("remote must not contain control characters")
+        _require_optional_non_empty(self.repository, "repository")
+        if self.repository is not None and not _is_repository_slug(self.repository):
+            raise ValueError("repository must be 'owner/repo' or 'host/owner/repo'")
+        if self.remote is None and self.repository is None:
+            raise ValueError("at least one of remote or repository is required")
+
+
+@dataclass(frozen=True, slots=True)
 class AppConfig:
     """The fully validated, typed effective configuration for one run.
 
-    `github_targets` overrides and the canonical, Git-metadata-checked
-    `runtime.root` remain the responsibility of a later milestone;
-    `runtime_root` here is only the raw, non-empty schema string.
+    `runtime_root` is the canonical, Git-metadata-checked absolute path;
+    ignore/ownership/mode checks and directory creation are the
+    responsibility of a later milestone.
     """
 
     source: ConfigSource
     execution: ExecutionConfig
     provider_retry: ProviderRetryConfig
-    runtime_root: str
+    runtime_root: Path
+    github_targets: tuple[GithubTargetOverride, ...] = ()
 
     def __post_init__(self) -> None:
         _require_exact_enum(self.source, ConfigSource, "source")
@@ -495,7 +529,20 @@ class AppConfig:
             raise TypeError("execution must be ExecutionConfig")
         if not isinstance(self.provider_retry, ProviderRetryConfig):
             raise TypeError("provider_retry must be ProviderRetryConfig")
-        _require_non_empty(self.runtime_root, "runtime_root")
+        _require_path(self.runtime_root, "runtime_root", absolute=True)
+        if ".git" in self.runtime_root.parts:
+            raise ValueError("runtime_root must not be under Git metadata")
+        github_targets = _copy_records(
+            self.github_targets,
+            GithubTargetOverride,
+            "github_targets",
+        )
+        seen_targets: set[Path] = set()
+        for override in github_targets:
+            if override.workspace_relative in seen_targets:
+                raise ValueError("github_targets contains a duplicate target")
+            seen_targets.add(override.workspace_relative)
+        object.__setattr__(self, "github_targets", github_targets)
 
 
 @dataclass(frozen=True, slots=True)
@@ -1190,6 +1237,7 @@ __all__ = (
     "GitCheckRecord",
     "GitSafetyStatus",
     "GitState",
+    "GithubTargetOverride",
     "IssueLocator",
     "IssueRef",
     "IssueResult",
