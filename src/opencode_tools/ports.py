@@ -60,6 +60,16 @@ class AttemptLogSink(Protocol):
     not this contract's.
     """
 
+    @property
+    def path(self) -> Path:
+        """Return the sink's own workspace-relative path.
+
+        `ProcessRunner` echoes this into `ProcessResult.log_path` without
+        knowing the naming convention (role, review cycle, attempt) that
+        produced it.
+        """
+        ...
+
     def write(
         self,
         channel: LogChannel,

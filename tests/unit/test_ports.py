@@ -167,9 +167,14 @@ def _run_record() -> RunRecord:
 class RecordingAttemptLogSink:
     """A minimal `AttemptLogSink` fake that records writes in call order."""
 
-    def __init__(self) -> None:
+    def __init__(self, path: Path = Path("attempt.log")) -> None:
+        self._path = path
         self.writes: list[tuple[LogChannel, bytes, datetime]] = []
         self.closed = False
+
+    @property
+    def path(self) -> Path:
+        return self._path
 
     def write(
         self,
