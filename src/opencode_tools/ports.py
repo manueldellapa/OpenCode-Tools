@@ -60,13 +60,30 @@ class AttemptLogSink(Protocol):
     not this contract's.
     """
 
+    @property
+    def path(self) -> Path:
+        """Return the sink's own workspace-relative path.
+
+        `ProcessRunner` echoes this into `ProcessResult.log_path` without
+        knowing the naming convention (role, review cycle, attempt) that
+        produced it.
+        """
+        ...
+
     def write(
         self,
         channel: LogChannel,
         payload: bytes,
         timestamp: datetime,
     ) -> None:
-        """Append one framed record for `channel` at `timestamp`."""
+        """Append one framed record for `channel` at `timestamp`.
+
+        A failure to append (disk full, permission denied, or any other
+        O/S-level fault) must raise `OSError`. `ProcessRunner` treats that
+        as a `LOGGING_ERROR`: it stops draining, terminates any
+        still-running child bounded by `termination_grace_seconds`, and
+        never retries (System Design SS10.1, M05-04).
+        """
         ...
 
     def close(self) -> None:
