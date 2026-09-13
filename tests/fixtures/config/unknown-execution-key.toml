@@ -1,0 +1,5 @@
+version = 1
+
+[execution]
+opencode_timeout_seconds = 1800
+retry_jitter = true

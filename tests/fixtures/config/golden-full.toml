@@ -1,0 +1,21 @@
+version = 1
+
+[execution]
+opencode_timeout_seconds = 1800
+utility_timeout_seconds = 30
+termination_grace_seconds = 5
+max_review_cycles = 3
+
+[provider_retry]
+max_attempts = 3
+initial_delay_seconds = 2
+multiplier = 2.0
+max_delay_seconds = 30
+
+[runtime]
+root = ".opencode-tools"
+
+# Only when the target's remote is not enough or must be constrained.
+[github.targets."Backend"]
+remote = "origin"
+repository = "github.com/example/backend"

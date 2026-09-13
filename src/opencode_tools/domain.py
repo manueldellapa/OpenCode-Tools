@@ -93,6 +93,14 @@ class PersistenceStatus(StrEnum):
     INCOMPLETE = "INCOMPLETE"
 
 
+class ConfigSource(StrEnum):
+    """Where the effective v1 configuration came from."""
+
+    EXPLICIT = "EXPLICIT"
+    CONVENTIONAL = "CONVENTIONAL"
+    DEFAULTS = "DEFAULTS"
+
+
 _PROCESS_RESULT_OUTCOMES = frozenset(
     {
         RunOutcome.SUCCEEDED,
@@ -128,6 +136,19 @@ def _require_optional_non_empty(value: object, field_name: str) -> None:
         _require_non_empty(value, field_name)
 
 
+def _contains_control_character(value: str) -> bool:
+    return any(ord(character) < 0x20 or ord(character) == 0x7F for character in value)
+
+
+def _is_repository_slug(value: str) -> bool:
+    segments = value.split("/")
+    if len(segments) not in (2, 3):
+        return False
+    return all(
+        segment and not _contains_control_character(segment) for segment in segments
+    )
+
+
 def _require_exact_enum(
     value: object,
     enum_type: type[StrEnum],
@@ -151,6 +172,18 @@ def _require_int(value: object, field_name: str, *, minimum: int) -> None:
         raise TypeError(f"{field_name} must be an integer")
     if value < minimum:
         raise ValueError(f"{field_name} must be at least {minimum}")
+
+
+def _require_int_range(
+    value: object,
+    field_name: str,
+    *,
+    minimum: int,
+    maximum: int,
+) -> None:
+    _require_int(value, field_name, minimum=minimum)
+    if cast(int, value) > maximum:
+        raise ValueError(f"{field_name} must be at most {maximum}")
 
 
 def _require_optional_int(
@@ -181,6 +214,30 @@ def _finite_number(value: object, field_name: str, *, positive: bool) -> float:
         raise ValueError(f"{field_name} must be finite")
     if positive and normalized <= 0:
         raise ValueError(f"{field_name} must be greater than zero")
+    return normalized
+
+
+def _finite_range(
+    value: object,
+    field_name: str,
+    *,
+    minimum: float,
+    maximum: float,
+    minimum_exclusive: bool = False,
+) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise TypeError(f"{field_name} must be a finite number")
+    normalized = float(value)
+    if not isfinite(normalized):
+        raise ValueError(f"{field_name} must be finite")
+    lower_bound_ok = (
+        normalized > minimum if minimum_exclusive else normalized >= minimum
+    )
+    if not lower_bound_ok:
+        bound = f">{minimum}" if minimum_exclusive else f">={minimum}"
+        raise ValueError(f"{field_name} must be {bound}")
+    if normalized > maximum:
+        raise ValueError(f"{field_name} must be <={maximum}")
     return normalized
 
 
@@ -318,6 +375,174 @@ class TargetRepository:
             absolute=False,
         )
         _require_path(self.git_common_dir, "git_common_dir", absolute=True)
+
+
+@dataclass(frozen=True, slots=True)
+class RunRequest:
+    """The CLI-facing request proven valid before any agent or artifact I/O.
+
+    `target_root` is only the canonicalized target path; the Git top-level
+    proof that yields a full `TargetRepository` (with `git_common_dir`)
+    happens later, in `GitSafetyPort.resolve_target`.
+    """
+
+    issue_number: int
+    workspace: Workspace
+    target_root: Path
+
+    def __post_init__(self) -> None:
+        _require_int(self.issue_number, "issue_number", minimum=1)
+        if not isinstance(self.workspace, Workspace):
+            raise TypeError("workspace must be Workspace")
+        _require_path(self.target_root, "target_root", absolute=True)
+        if not self.target_root.is_relative_to(self.workspace.root):
+            raise ValueError("target_root must be contained in workspace")
+
+
+@dataclass(frozen=True, slots=True)
+class ExecutionConfig:
+    """Bounded execution timing frozen by the v1 schema (System Design SS14.2)."""
+
+    opencode_timeout_seconds: float
+    utility_timeout_seconds: float
+    termination_grace_seconds: float
+    max_review_cycles: int
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "opencode_timeout_seconds",
+            _finite_range(
+                self.opencode_timeout_seconds,
+                "opencode_timeout_seconds",
+                minimum=1,
+                maximum=7200,
+            ),
+        )
+        object.__setattr__(
+            self,
+            "utility_timeout_seconds",
+            _finite_range(
+                self.utility_timeout_seconds,
+                "utility_timeout_seconds",
+                minimum=1,
+                maximum=300,
+            ),
+        )
+        object.__setattr__(
+            self,
+            "termination_grace_seconds",
+            _finite_range(
+                self.termination_grace_seconds,
+                "termination_grace_seconds",
+                minimum=0.1,
+                maximum=60,
+            ),
+        )
+        _require_int_range(
+            self.max_review_cycles,
+            "max_review_cycles",
+            minimum=1,
+            maximum=20,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class ProviderRetryConfig:
+    """Provider retry policy frozen by the v1 schema (System Design SS14.2)."""
+
+    max_attempts: int
+    initial_delay_seconds: float
+    multiplier: float
+    max_delay_seconds: float
+
+    def __post_init__(self) -> None:
+        _require_int_range(self.max_attempts, "max_attempts", minimum=1, maximum=10)
+        initial_delay = _finite_range(
+            self.initial_delay_seconds,
+            "initial_delay_seconds",
+            minimum=0.1,
+            maximum=300,
+        )
+        object.__setattr__(self, "initial_delay_seconds", initial_delay)
+        object.__setattr__(
+            self,
+            "multiplier",
+            _finite_range(
+                self.multiplier,
+                "multiplier",
+                minimum=1.0,
+                maximum=10.0,
+                minimum_exclusive=True,
+            ),
+        )
+        object.__setattr__(
+            self,
+            "max_delay_seconds",
+            _finite_range(
+                self.max_delay_seconds,
+                "max_delay_seconds",
+                minimum=initial_delay,
+                maximum=1800,
+            ),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class GithubTargetOverride:
+    """One closed, target-specific GitHub override (System Design SS14.2)."""
+
+    workspace_relative: Path
+    remote: str | None = None
+    repository: str | None = None
+
+    def __post_init__(self) -> None:
+        _require_path(self.workspace_relative, "workspace_relative", absolute=False)
+        _require_optional_non_empty(self.remote, "remote")
+        if self.remote is not None and _contains_control_character(self.remote):
+            raise ValueError("remote must not contain control characters")
+        _require_optional_non_empty(self.repository, "repository")
+        if self.repository is not None and not _is_repository_slug(self.repository):
+            raise ValueError("repository must be 'owner/repo' or 'host/owner/repo'")
+        if self.remote is None and self.repository is None:
+            raise ValueError("at least one of remote or repository is required")
+
+
+@dataclass(frozen=True, slots=True)
+class AppConfig:
+    """The fully validated, typed effective configuration for one run.
+
+    `runtime_root` is the canonical, Git-metadata-checked absolute path;
+    ignore/ownership/mode checks and directory creation are the
+    responsibility of a later milestone.
+    """
+
+    source: ConfigSource
+    execution: ExecutionConfig
+    provider_retry: ProviderRetryConfig
+    runtime_root: Path
+    github_targets: tuple[GithubTargetOverride, ...] = ()
+
+    def __post_init__(self) -> None:
+        _require_exact_enum(self.source, ConfigSource, "source")
+        if not isinstance(self.execution, ExecutionConfig):
+            raise TypeError("execution must be ExecutionConfig")
+        if not isinstance(self.provider_retry, ProviderRetryConfig):
+            raise TypeError("provider_retry must be ProviderRetryConfig")
+        _require_path(self.runtime_root, "runtime_root", absolute=True)
+        if ".git" in self.runtime_root.parts:
+            raise ValueError("runtime_root must not be under Git metadata")
+        github_targets = _copy_records(
+            self.github_targets,
+            GithubTargetOverride,
+            "github_targets",
+        )
+        seen_targets: set[Path] = set()
+        for override in github_targets:
+            if override.workspace_relative in seen_targets:
+                raise ValueError("github_targets contains a duplicate target")
+            seen_targets.add(override.workspace_relative)
+        object.__setattr__(self, "github_targets", github_targets)
 
 
 @dataclass(frozen=True, slots=True)
@@ -1001,14 +1226,18 @@ __all__ = (
     "AgentResult",
     "AgentRole",
     "AgentStatus",
+    "AppConfig",
     "AttemptRecord",
+    "ConfigSource",
     "DomainRecord",
     "ErrorRecord",
+    "ExecutionConfig",
     "FinalStatus",
     "FrozenJsonValue",
     "GitCheckRecord",
     "GitSafetyStatus",
     "GitState",
+    "GithubTargetOverride",
     "IssueLocator",
     "IssueRef",
     "IssueResult",
@@ -1022,10 +1251,12 @@ __all__ = (
     "ProcessResult",
     "ProcessSpec",
     "ProviderDiagnostic",
+    "ProviderRetryConfig",
     "RepositoryIdentity",
     "ReviewStatus",
     "RunOutcome",
     "RunRecord",
+    "RunRequest",
     "TargetRepository",
     "Workspace",
     "to_primitive",
