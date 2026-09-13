@@ -321,6 +321,28 @@ class TargetRepository:
 
 
 @dataclass(frozen=True, slots=True)
+class RunRequest:
+    """The CLI-facing request proven valid before any agent or artifact I/O.
+
+    `target_root` is only the canonicalized target path; the Git top-level
+    proof that yields a full `TargetRepository` (with `git_common_dir`)
+    happens later, in `GitSafetyPort.resolve_target`.
+    """
+
+    issue_number: int
+    workspace: Workspace
+    target_root: Path
+
+    def __post_init__(self) -> None:
+        _require_int(self.issue_number, "issue_number", minimum=1)
+        if not isinstance(self.workspace, Workspace):
+            raise TypeError("workspace must be Workspace")
+        _require_path(self.target_root, "target_root", absolute=True)
+        if not self.target_root.is_relative_to(self.workspace.root):
+            raise ValueError("target_root must be contained in workspace")
+
+
+@dataclass(frozen=True, slots=True)
 class RepositoryIdentity:
     """A normalized GitHub repository identity and its resolution source."""
 
@@ -1026,6 +1048,7 @@ __all__ = (
     "ReviewStatus",
     "RunOutcome",
     "RunRecord",
+    "RunRequest",
     "TargetRepository",
     "Workspace",
     "to_primitive",

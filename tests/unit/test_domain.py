@@ -37,6 +37,7 @@ from opencode_tools.domain import (
     ReviewStatus,
     RunOutcome,
     RunRecord,
+    RunRequest,
     TargetRepository,
     Workspace,
     to_primitive,
@@ -59,6 +60,10 @@ def _target() -> TargetRepository:
         workspace_relative=Path("backend"),
         git_common_dir=TARGET_ROOT / ".git",
     )
+
+
+def _run_request() -> RunRequest:
+    return RunRequest(issue_number=4, workspace=_workspace(), target_root=TARGET_ROOT)
 
 
 def _identity() -> RepositoryIdentity:
@@ -395,6 +400,51 @@ def test_workspace_and_target_apply_only_pure_path_invariants() -> None:
             root=Path("/workspace/backend"),
             workspace_relative=Path("../backend"),
             git_common_dir=Path("/workspace/backend/.git"),
+        )
+
+
+def test_run_request_requires_a_positive_issue_and_contained_target() -> None:
+    request = _run_request()
+    assert is_dataclass(request)
+    assert not hasattr(request, "__dict__")
+    field_name = "issue_number"
+    with pytest.raises(FrozenInstanceError):
+        setattr(request, field_name, getattr(request, field_name))
+
+    assert (
+        RunRequest(
+            issue_number=4,
+            workspace=_workspace(),
+            target_root=WORKSPACE_ROOT,
+        ).target_root
+        == WORKSPACE_ROOT
+    )
+
+    with pytest.raises(TypeError, match="issue_number must be an integer"):
+        RunRequest(
+            issue_number=cast(int, True),
+            workspace=_workspace(),
+            target_root=TARGET_ROOT,
+        )
+    with pytest.raises(ValueError, match="issue_number must be at least 1"):
+        RunRequest(issue_number=0, workspace=_workspace(), target_root=TARGET_ROOT)
+    with pytest.raises(TypeError, match="workspace must be Workspace"):
+        RunRequest(
+            issue_number=4,
+            workspace=cast(Workspace, WORKSPACE_ROOT),
+            target_root=TARGET_ROOT,
+        )
+    with pytest.raises(ValueError, match="target_root must be absolute"):
+        RunRequest(
+            issue_number=4,
+            workspace=_workspace(),
+            target_root=Path("relative/backend"),
+        )
+    with pytest.raises(ValueError, match="target_root must be contained in workspace"):
+        RunRequest(
+            issue_number=4,
+            workspace=_workspace(),
+            target_root=Path("/elsewhere/backend"),
         )
 
 
