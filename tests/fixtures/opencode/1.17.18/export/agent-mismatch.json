@@ -1,0 +1,9 @@
+{
+  "sessionID": "ses_architect_ready",
+  "messages": [
+    {
+      "info": { "id": "msg_1", "role": "assistant", "agent": "coder" },
+      "parts": [{ "type": "text", "text": "AGENT_STATUS: READY" }]
+    }
+  ]
+}

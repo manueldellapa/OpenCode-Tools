@@ -1,0 +1,11 @@
+{
+  "sessionID": "ses_coder_completed",
+  "messages": [
+    {
+      "info": { "id": "msg_0", "role": "user" },
+      "parts": [
+        { "type": "text", "text": "Please implement the fix described in the issue." }
+      ]
+    }
+  ]
+}

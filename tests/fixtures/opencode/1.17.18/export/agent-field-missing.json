@@ -1,0 +1,9 @@
+{
+  "sessionID": "ses_coder_completed",
+  "messages": [
+    {
+      "info": { "id": "msg_1", "role": "assistant" },
+      "parts": [{ "type": "text", "text": "AGENT_STATUS: COMPLETED" }]
+    }
+  ]
+}

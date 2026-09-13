@@ -1,0 +1,2 @@
+[opencode] warning: agent "architect" was not found; falling back to the default agent
+{"type": "message.part.updated", "sessionID": "ses_agent_fallback", "part": {"id": "prt_1", "messageID": "msg_1", "type": "text", "text": "AGENT_STATUS: READY", "time": {"start": 1, "end": 2}}}

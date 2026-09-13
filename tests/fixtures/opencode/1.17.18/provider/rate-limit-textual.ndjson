@@ -1,0 +1,1 @@
+{"type": "session.error", "sessionID": "ses_provider_rate_limit", "error": {"name": "ProviderRateLimitError", "data": {"code": "rate_limit", "message": "Rate limit reached for this provider account."}}}

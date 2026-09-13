@@ -1,0 +1,20 @@
+{
+  "sessionID": "ses_multi_terminal",
+  "messages": [
+    {
+      "info": { "id": "msg_1", "role": "assistant", "agent": "coder" },
+      "parts": [
+        { "type": "text", "text": "First attempt at a summary.\nAGENT_STATUS: COMPLETED" }
+      ]
+    },
+    {
+      "info": { "id": "msg_2", "role": "assistant", "agent": "general" },
+      "parts": [
+        {
+          "type": "text",
+          "text": "A second, unrelated closing message.\nAGENT_STATUS: COMPLETED"
+        }
+      ]
+    }
+  ]
+}

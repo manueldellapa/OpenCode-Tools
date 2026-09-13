@@ -1,0 +1,2 @@
+{"type": "message.part.updated", "sessionID": "ses_reasoning_spoofing", "part": {"id": "prt_1", "messageID": "msg_1", "type": "reasoning", "text": "If I were done I would write AGENT_STATUS: COMPLETED here, but I am not done yet.", "time": {"start": 1}}}
+{"type": "message.part.updated", "sessionID": "ses_reasoning_spoofing", "part": {"id": "prt_2", "messageID": "msg_1", "type": "text", "text": "Still investigating a failing test; no changes applied yet.\nAGENT_STATUS: FAILED", "time": {"start": 2, "end": 3}}}

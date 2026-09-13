@@ -1,0 +1,1 @@
+{"type": "session.error", "sessionID": "ses_provider_unavailable", "error": {"name": "ProviderUnavailableError", "data": {"status": 503, "code": "provider_unavailable", "message": "The configured provider is temporarily unavailable."}}}

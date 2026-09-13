@@ -1,0 +1,2 @@
+{"type": "message.part.updated", "sessionID": "ses_malformed_invalid_json", "part": {"id": "prt_1", "messageID": "msg_1", "type": "reasoning", "text": "Starting.", "time": {"start": 1}}}
+{"type": "message.part.updated", "sessionID": "ses_malformed_invalid_json", "part": {"id": "prt_2", "messageID": "msg_1", "type": "text", "text": "Finishing up.

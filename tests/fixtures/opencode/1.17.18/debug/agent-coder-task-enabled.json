@@ -1,0 +1,6 @@
+{
+  "name": "coder",
+  "mode": "primary",
+  "tools": { "ask": false, "task": true },
+  "permission": { "edit": "allow", "bash": "allow", "webfetch": "deny" }
+}

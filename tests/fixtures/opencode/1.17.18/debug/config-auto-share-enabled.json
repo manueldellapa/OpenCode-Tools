@@ -1,0 +1,10 @@
+{
+  "share": "auto",
+  "autoshare": true,
+  "autoupdate": false,
+  "agent": {
+    "architect": { "mode": "primary" },
+    "coder": { "mode": "primary" },
+    "reviewer": { "mode": "primary" }
+  }
+}
