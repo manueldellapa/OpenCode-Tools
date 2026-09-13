@@ -15,10 +15,24 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import shutil
 from pathlib import Path
 from typing import Final, cast
 
 import pytest
+
+from opencode_tools.domain import AgentRole
+from opencode_tools.errors import PreflightError
+from opencode_tools.opencode import (
+    CANDIDATE_OPENCODE_VERSION,
+    ControlPlaneEvidence,
+    check_debug_agent,
+    check_debug_config,
+    check_run_help_capability,
+    check_version,
+    compute_control_plane_digest,
+    resolve_executable,
+)
 
 REPO_ROOT: Final = Path(__file__).resolve().parents[2]
 FIXTURES_ROOT: Final = REPO_ROOT / "tests" / "fixtures" / "opencode" / "1.17.18"
@@ -274,3 +288,221 @@ def test_compatibility_doc_declares_the_version_candidate_not_supported() -> Non
     assert OPENCODE_VERSION in doc
     assert "candidate" in doc.lower()
     assert "not yet supported" in doc.lower() or "not supported" in doc.lower()
+
+
+# =============================================================================
+# M07-02: exact-version and capability/control-plane preflight
+# =============================================================================
+
+
+def _fixture_json(relative_path: str) -> dict[str, object]:
+    return cast(
+        dict[str, object],
+        json.loads((FIXTURES_ROOT / relative_path).read_text(encoding="utf-8")),
+    )
+
+
+# --- resolve_executable -----------------------------------------------------
+
+
+def test_resolve_executable_returns_the_resolved_which_path(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    fake = tmp_path / "opencode"
+    fake.write_text("#!/bin/sh\n", encoding="utf-8")
+    fake.chmod(0o755)
+    monkeypatch.setattr(
+        shutil, "which", lambda name: str(fake) if name == "opencode" else None
+    )
+    assert resolve_executable() == fake.resolve()
+
+
+def test_resolve_executable_fails_closed_when_not_on_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(shutil, "which", lambda name: None)
+    with pytest.raises(PreflightError) as exc_info:
+        resolve_executable()
+    assert exc_info.value.code == "opencode.executable_not_found"
+
+
+# --- check_version -----------------------------------------------------------
+
+
+def test_check_version_accepts_the_exact_candidate() -> None:
+    assert (
+        check_version(f"{CANDIDATE_OPENCODE_VERSION}\n") == CANDIDATE_OPENCODE_VERSION
+    )
+
+
+@pytest.mark.parametrize(
+    "raw_output", ["1.17.19", "1.17.1", "opencode 1.17.18", "v1.17.18", ""]
+)
+def test_check_version_rejects_anything_but_an_exact_match(raw_output: str) -> None:
+    with pytest.raises(PreflightError) as exc_info:
+        check_version(raw_output)
+    assert exc_info.value.code == "opencode.version_mismatch"
+
+
+# --- check_run_help_capability -----------------------------------------------
+
+
+def test_check_run_help_capability_accepts_all_required_tokens() -> None:
+    check_run_help_capability(
+        "Usage: opencode run [--agent <name>] [--format json] [--dir <path>]"
+    )
+
+
+@pytest.mark.parametrize(
+    "raw_output",
+    [
+        "Usage: opencode run [--format json] [--dir <path>]",
+        "Usage: opencode run [--agent <name>] [--dir <path>]",
+        "Usage: opencode run [--agent <name>] [--format json]",
+        "",
+    ],
+)
+def test_check_run_help_capability_rejects_missing_tokens(raw_output: str) -> None:
+    with pytest.raises(PreflightError) as exc_info:
+        check_run_help_capability(raw_output)
+    assert exc_info.value.code == "opencode.capability_missing"
+
+
+# --- check_debug_config -------------------------------------------------------
+
+
+def test_check_debug_config_accepts_the_baseline_fixture() -> None:
+    check_debug_config(_fixture_json("debug/config-baseline.json"))
+
+
+def test_check_debug_config_rejects_the_auto_share_fixture() -> None:
+    with pytest.raises(PreflightError) as exc_info:
+        check_debug_config(_fixture_json("debug/config-auto-share-enabled.json"))
+    assert exc_info.value.code == "opencode.debug_config_rejected"
+
+
+# --- check_debug_agent ---------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "role,fixture_name",
+    [
+        (AgentRole.ARCHITECT, "debug/agent-architect-baseline.json"),
+        (AgentRole.CODER, "debug/agent-coder-baseline.json"),
+        (AgentRole.REVIEWER, "debug/agent-reviewer-baseline.json"),
+    ],
+)
+def test_check_debug_agent_accepts_each_role_baseline(
+    role: AgentRole, fixture_name: str
+) -> None:
+    check_debug_agent(role, _fixture_json(fixture_name))
+
+
+@pytest.mark.parametrize(
+    "role,fixture_name,expected_code",
+    [
+        (
+            AgentRole.ARCHITECT,
+            "debug/agent-architect-ask-enabled.json",
+            "opencode.debug_agent_rejected",
+        ),
+        (
+            AgentRole.CODER,
+            "debug/agent-coder-task-enabled.json",
+            "opencode.debug_agent_rejected",
+        ),
+        (
+            AgentRole.REVIEWER,
+            "debug/agent-reviewer-subagent-mode.json",
+            "opencode.debug_agent_rejected",
+        ),
+        (
+            AgentRole.ARCHITECT,
+            "debug/agent-architect-permissive-edit.json",
+            "opencode.debug_agent_rejected",
+        ),
+        (
+            AgentRole.ARCHITECT,
+            "debug/agent-missing.json",
+            "opencode.debug_agent_identity_mismatch",
+        ),
+    ],
+)
+def test_check_debug_agent_rejects_each_negative_fixture(
+    role: AgentRole, fixture_name: str, expected_code: str
+) -> None:
+    with pytest.raises(PreflightError) as exc_info:
+        check_debug_agent(role, _fixture_json(fixture_name))
+    assert exc_info.value.code == expected_code
+
+
+def test_check_debug_agent_rejects_a_fallback_to_a_different_named_agent() -> None:
+    fallback_agent: dict[str, object] = {
+        "name": "general",
+        "mode": "primary",
+        "tools": {"ask": False, "task": False},
+        "permission": {"edit": "deny", "bash": "deny", "webfetch": "deny"},
+    }
+    with pytest.raises(PreflightError) as exc_info:
+        check_debug_agent(AgentRole.ARCHITECT, fallback_agent)
+    assert exc_info.value.code == "opencode.debug_agent_identity_mismatch"
+
+
+# --- compute_control_plane_digest ---------------------------------------------
+
+
+def _baseline_agents() -> dict[AgentRole, dict[str, object]]:
+    return {
+        AgentRole.ARCHITECT: _fixture_json("debug/agent-architect-baseline.json"),
+        AgentRole.CODER: _fixture_json("debug/agent-coder-baseline.json"),
+        AgentRole.REVIEWER: _fixture_json("debug/agent-reviewer-baseline.json"),
+    }
+
+
+def test_compute_control_plane_digest_is_stable_regardless_of_key_order() -> None:
+    agents = _baseline_agents()
+    config_a = {"share": "manual", "autoshare": False}
+    config_b = {"autoshare": False, "share": "manual"}
+
+    assert compute_control_plane_digest(
+        config=config_a, agents=agents
+    ) == compute_control_plane_digest(config=config_b, agents=agents)
+
+
+def test_compute_control_plane_digest_changes_when_content_changes() -> None:
+    agents = _baseline_agents()
+    digest_before = compute_control_plane_digest(
+        config={"share": "manual"}, agents=agents
+    )
+    digest_after = compute_control_plane_digest(config={"share": "auto"}, agents=agents)
+    assert digest_before != digest_after
+
+
+# --- ControlPlaneEvidence ------------------------------------------------------
+
+
+def test_control_plane_evidence_rejects_a_non_candidate_version(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="candidate version"):
+        ControlPlaneEvidence(
+            version="1.17.19",
+            executable=tmp_path / "opencode",
+            control_plane_digest="digest",
+        )
+
+
+def test_control_plane_evidence_rejects_a_relative_executable() -> None:
+    with pytest.raises(ValueError, match="absolute"):
+        ControlPlaneEvidence(
+            version=CANDIDATE_OPENCODE_VERSION,
+            executable=Path("opencode"),
+            control_plane_digest="digest",
+        )
+
+
+def test_control_plane_evidence_rejects_an_empty_digest(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="digest"):
+        ControlPlaneEvidence(
+            version=CANDIDATE_OPENCODE_VERSION,
+            executable=tmp_path / "opencode",
+            control_plane_digest="",
+        )
