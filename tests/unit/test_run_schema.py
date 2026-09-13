@@ -50,7 +50,7 @@ from opencode_tools.domain import (
     Workspace,
     to_primitive,
 )
-from opencode_tools.runlog import serialize_run_record
+from opencode_tools.runlog import persist_run_record, serialize_run_record
 
 WORKSPACE_ROOT = Path("/workspaces/opencode-tools")
 TARGET_ROOT = WORKSPACE_ROOT / "backend"
@@ -229,6 +229,14 @@ def _full_run_record() -> RunRecord:
 def test_serialize_run_record_rejects_a_non_run_record() -> None:
     with pytest.raises(TypeError, match="record must be RunRecord"):
         serialize_run_record(cast(RunRecord, {"not": "a run record"}))
+
+
+def test_persist_run_record_rejects_a_non_run_record() -> None:
+    # Real atomic-replace behavior needs a real filesystem and is covered by
+    # tests/component/test_runtime_store.py; this only proves the same
+    # input-validation guard as `serialize_run_record` before any I/O.
+    with pytest.raises(TypeError, match="record must be RunRecord"):
+        persist_run_record(cast(RunRecord, {"not": "a run record"}))
 
 
 def test_serialize_run_record_matches_the_golden_minimal_fixture() -> None:

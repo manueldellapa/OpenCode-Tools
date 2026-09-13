@@ -1,11 +1,16 @@
-"""Component tests for the M08-01 runtime layout against a real filesystem.
+"""Component tests for the M08-01/M08-03 runtime store against a real
+filesystem.
 
-Exercises `create_run_directory`, `allocate_run_directory`, and
-`open_private_exclusive` with real `tmp_path` directories: exclusive `mkdir`
-collisions, bounded regeneration, POSIX `0700`/`0600` mode enforcement, and
-anti-symlink rejection (System Design SS15.2, SS15.6; ADR-008; ADR-009;
-AC-021, AC-034). `run.json` schema/content and the attempt-log sink itself
-are later milestones and are not exercised here.
+Exercises `create_run_directory`, `allocate_run_directory`,
+`open_private_exclusive`, and `persist_run_record` with real `tmp_path`
+directories: exclusive `mkdir` collisions, bounded regeneration, POSIX
+`0700`/`0600` mode enforcement, anti-symlink rejection, and atomic
+serialize/open/write/replace with fault injection at every step proving the
+last valid `run.json` is never touched and only the failing temp file is
+ever cleaned up (System Design SS15.2, SS15.4, SS15.6; ADR-008; ADR-009;
+AC-021, AC-033, AC-034). `run.json` schema/content itself is
+`tests/unit/test_run_schema.py`; the attempt-log sink (M08-04) is a later
+milestone and is not exercised here.
 """
 
 from __future__ import annotations
@@ -13,11 +18,20 @@ from __future__ import annotations
 import os
 import secrets
 import stat
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
 
+import opencode_tools.runlog as runlog_module
+from opencode_tools.domain import (
+    PersistenceStatus,
+    PipelinePhase,
+    RunRecord,
+    TargetRepository,
+    Workspace,
+)
 from opencode_tools.errors import LoggingError
 from opencode_tools.runlog import (
     DIRECTORY_MODE,
@@ -25,10 +39,13 @@ from opencode_tools.runlog import (
     allocate_run_directory,
     create_run_directory,
     open_private_exclusive,
+    persist_run_record,
+    serialize_run_record,
 )
 
 NOW = datetime(2026, 9, 11, 14, 23, 45, 123456, tzinfo=UTC)
 RUN_ID = "20260911T142345.123456Z-a1b2c3d4e5f6"
+WORKSPACE_ROOT = Path("/workspaces/opencode-tools")
 
 
 class FakeClock:
@@ -46,6 +63,31 @@ class FakeClock:
 
 def _mode(path: Path) -> int:
     return stat.S_IMODE(path.lstat().st_mode)
+
+
+def _run_record(*, artifact_path: Path, run_id: str = RUN_ID) -> RunRecord:
+    target_root = WORKSPACE_ROOT / "backend"
+    return RunRecord(
+        schema_version=1,
+        run_id=run_id,
+        artifact_path=artifact_path,
+        workspace=Workspace(root=WORKSPACE_ROOT),
+        target=TargetRepository(
+            root=target_root,
+            workspace_relative=Path("backend"),
+            git_common_dir=target_root / ".git",
+        ),
+        issue_number=4,
+        config={},
+        environment={},
+        started_at=NOW,
+        current_phase=PipelinePhase.PREFLIGHT,
+        persistence_status=PersistenceStatus.OK,
+    )
+
+
+def _leftover_temp_files(run_directory: Path) -> list[Path]:
+    return [path for path in run_directory.iterdir() if path.name != "run.json"]
 
 
 def test_create_run_directory_creates_runs_and_the_run_directory_privately(
@@ -214,3 +256,141 @@ def test_open_private_exclusive_fails_closed_on_a_symlink(tmp_path: Path) -> Non
 def test_open_private_exclusive_rejects_a_relative_path(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="path must be absolute"):
         open_private_exclusive(Path("relative.log"))
+
+
+def test_persist_run_record_writes_a_valid_private_document(tmp_path: Path) -> None:
+    run_directory = create_run_directory(tmp_path, RUN_ID)
+    document_path = run_directory / "run.json"
+    record = _run_record(artifact_path=document_path)
+
+    persist_run_record(record)
+
+    assert document_path.read_bytes() == serialize_run_record(record)
+    assert _mode(document_path) == FILE_MODE
+    assert _leftover_temp_files(run_directory) == []
+
+
+def test_persist_run_record_atomically_replaces_the_previous_document(
+    tmp_path: Path,
+) -> None:
+    run_directory = create_run_directory(tmp_path, RUN_ID)
+    document_path = run_directory / "run.json"
+    first = _run_record(artifact_path=document_path)
+    persist_run_record(first)
+
+    second = replace(first, current_phase=PipelinePhase.FINISHED)
+    persist_run_record(second)
+
+    assert document_path.read_bytes() == serialize_run_record(second)
+    assert document_path.read_bytes() != serialize_run_record(first)
+    assert _leftover_temp_files(run_directory) == []
+
+
+def test_persist_run_record_leaves_the_last_valid_document_on_a_serialize_fault(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    run_directory = create_run_directory(tmp_path, RUN_ID)
+    document_path = run_directory / "run.json"
+    good_record = _run_record(artifact_path=document_path)
+    persist_run_record(good_record)
+    expected_bytes = document_path.read_bytes()
+
+    def _raise(record: RunRecord) -> bytes:
+        raise ValueError("simulated serialize fault")
+
+    monkeypatch.setattr(runlog_module, "serialize_run_record", _raise)
+
+    with pytest.raises(LoggingError) as excinfo:
+        persist_run_record(good_record)
+
+    assert excinfo.value.code == "runlog.run_record_serialize_failed"
+    assert document_path.read_bytes() == expected_bytes
+    assert _leftover_temp_files(run_directory) == []
+
+
+def test_persist_run_record_leaves_the_last_valid_document_on_an_open_fault(
+    tmp_path: Path,
+) -> None:
+    run_directory = create_run_directory(tmp_path, RUN_ID)
+    document_path = run_directory / "run.json"
+    good_record = _run_record(artifact_path=document_path)
+    persist_run_record(good_record)
+    expected_bytes = document_path.read_bytes()
+
+    run_directory.chmod(0o500)  # remove write: O_CREAT on a new temp fails
+    try:
+        with pytest.raises(LoggingError) as excinfo:
+            persist_run_record(good_record)
+    finally:
+        run_directory.chmod(DIRECTORY_MODE)
+
+    assert excinfo.value.code == "runlog.artifact_file_open_failed"
+    assert document_path.read_bytes() == expected_bytes
+
+
+def test_persist_run_record_removes_its_temp_file_and_raises_on_a_write_fault(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    run_directory = create_run_directory(tmp_path, RUN_ID)
+    document_path = run_directory / "run.json"
+    record = _run_record(artifact_path=document_path)
+
+    def _raise(file_descriptor: int) -> None:
+        raise OSError("simulated disk-full fsync failure")
+
+    monkeypatch.setattr(os, "fsync", _raise)
+
+    with pytest.raises(LoggingError) as excinfo:
+        persist_run_record(record)
+
+    assert excinfo.value.code == "runlog.run_record_write_failed"
+    assert not document_path.exists()
+    assert _leftover_temp_files(run_directory) == []
+
+
+def test_persist_run_record_leaves_the_last_valid_document_on_a_replace_fault(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    run_directory = create_run_directory(tmp_path, RUN_ID)
+    document_path = run_directory / "run.json"
+    good_record = _run_record(artifact_path=document_path)
+    persist_run_record(good_record)
+    expected_bytes = document_path.read_bytes()
+
+    def _raise(source: object, destination: object) -> None:
+        raise OSError("simulated cross-device replace failure")
+
+    monkeypatch.setattr(os, "replace", _raise)
+
+    with pytest.raises(LoggingError) as excinfo:
+        persist_run_record(good_record)
+
+    assert excinfo.value.code == "runlog.run_record_replace_failed"
+    assert document_path.read_bytes() == expected_bytes
+    assert _leftover_temp_files(run_directory) == []
+
+
+def test_persist_run_record_tolerates_a_directory_fsync_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    run_directory = create_run_directory(tmp_path, RUN_ID)
+    document_path = run_directory / "run.json"
+    record = _run_record(artifact_path=document_path)
+
+    real_fsync = os.fsync
+    call_count = 0
+
+    def _flaky_fsync(file_descriptor: int) -> None:
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            real_fsync(file_descriptor)
+            return
+        raise OSError("simulated directory fsync failure")
+
+    monkeypatch.setattr(os, "fsync", _flaky_fsync)
+
+    persist_run_record(record)  # must not raise: directory fsync is best effort
+
+    assert document_path.read_bytes() == serialize_run_record(record)
+    assert call_count == 2

@@ -1,17 +1,19 @@
-"""Run ID, directory layout, private naming, and `run.json` v1 serialization.
+"""Run ID, directory layout, private naming, `run.json` v1 serialization, and
+its atomic, fail-closed persistence.
 
-Covers the M08-01 and M08-02 slices of the runtime store (System Design
-SS15.1, SS15.2, SS15.3, SS15.6; ADR-008; ADR-009): the UTC-plus-random run ID
-format, the `<runtime_root>/runs/<run-id>` layout created via exclusive
-`mkdir` with bounded collision retry, the canonical role/cycle/attempt
-attempt-log filename, the exclusive, non-truncating, anti-symlink primitive
-used to open a fresh artifact file, and the deterministic UTF-8 encoding of a
-`RunRecord` into `run.json` v1 bytes. The schema itself -- every group and
-canonical field System Design SS15.3 lists -- is `domain.RunRecord` and
-`domain.to_primitive()` (M02); atomic replace and failure semantics (M08-03)
-and the attempt-log sink itself (M08-04) are later milestones and stay out of
-this module for now, as does the runtime root's own ignore/ownership
-preflight, which is `M10`'s bootstrap and is assumed already valid here.
+Covers the M08-01 through M08-03 slices of the runtime store (System Design
+SS15.1-SS15.4, SS15.6; ADR-008; ADR-009): the UTC-plus-random run ID format,
+the `<runtime_root>/runs/<run-id>` layout created via exclusive `mkdir` with
+bounded collision retry, the canonical role/cycle/attempt attempt-log
+filename, the exclusive, non-truncating, anti-symlink primitive used to open
+a fresh artifact file, the deterministic UTF-8 encoding of a `RunRecord`
+into `run.json` v1 bytes, and replacing `run.json` with that encoding via an
+exclusive same-directory temp file, `flush`/`fsync`, and `os.replace()`. The
+schema itself -- every group and canonical field System Design SS15.3 lists
+-- is `domain.RunRecord` and `domain.to_primitive()` (M02). The attempt-log
+sink itself (M08-04) is a later milestone and stays out of this module for
+now, as does the runtime root's own ignore/ownership preflight, which is
+`M10`'s bootstrap and is assumed already valid here.
 """
 
 from __future__ import annotations
@@ -286,6 +288,96 @@ def serialize_run_record(record: RunRecord) -> bytes:
     return text.encode("utf-8")
 
 
+_TEMP_DOCUMENT_SUFFIX: Final = ".tmp"
+
+
+def _temp_document_name() -> str:
+    return f".run.json.{secrets.token_hex(8)}{_TEMP_DOCUMENT_SUFFIX}"
+
+
+def _best_effort_unlink(path: Path) -> None:
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+
+
+def _fsync_directory_best_effort(path: Path) -> None:
+    try:
+        directory_fd = os.open(path, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(directory_fd)
+    except OSError:
+        pass
+    finally:
+        os.close(directory_fd)
+
+
+def persist_run_record(record: RunRecord) -> None:
+    """Atomically replace `record.artifact_path` (`run.json`) on disk.
+
+    Follows System Design SS15.4 exactly: serialize fully in memory first
+    (`serialize_run_record`), write a fresh, unpredictable, exclusive
+    `0600` temp file in the same run directory (`open_private_exclusive`),
+    flush and `fsync` it, close it, `os.replace()` it onto `run.json` on the
+    same filesystem, then best-effort `fsync` the directory (a durability
+    refinement some filesystems do not support, so a failure there is never
+    fatal). A failure at any other step raises `LoggingError` and removes
+    only its own temp file -- a previously persisted, valid `run.json` is
+    never touched, recovered, or presented as a second source of truth
+    (ADR-008; FR-044, FR-052; AC-033).
+
+    Raising is the whole fail-closed contract here: this function does not
+    -- and, with no orchestrator yet built, cannot -- itself stop further
+    invocations; that a caller sees this exception and halts is exactly the
+    mechanism the design relies on instead of silently treating a failed
+    write as success.
+    """
+
+    if type(record) is not RunRecord:
+        raise TypeError("record must be RunRecord")
+
+    try:
+        payload = serialize_run_record(record)
+    except (TypeError, ValueError) as error:
+        raise LoggingError(
+            "runlog.run_record_serialize_failed",
+            "failed to serialize the run record",
+            technical_detail=type(error).__name__,
+        ) from None
+
+    run_directory = record.artifact_path.parent
+    temp_path = run_directory / _temp_document_name()
+
+    file_descriptor = open_private_exclusive(temp_path)
+    try:
+        with os.fdopen(file_descriptor, "wb") as stream:
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+    except OSError as error:
+        _best_effort_unlink(temp_path)
+        raise LoggingError(
+            "runlog.run_record_write_failed",
+            f"failed to write the run record: {temp_path}",
+            technical_detail=type(error).__name__,
+        ) from None
+
+    try:
+        os.replace(temp_path, record.artifact_path)
+    except OSError as error:
+        _best_effort_unlink(temp_path)
+        raise LoggingError(
+            "runlog.run_record_replace_failed",
+            f"failed to atomically replace: {record.artifact_path}",
+            technical_detail=type(error).__name__,
+        ) from None
+
+    _fsync_directory_best_effort(run_directory)
+
+
 __all__ = (
     "DIRECTORY_MODE",
     "FILE_MODE",
@@ -296,5 +388,6 @@ __all__ = (
     "format_run_id",
     "generate_run_id",
     "open_private_exclusive",
+    "persist_run_record",
     "serialize_run_record",
 )
