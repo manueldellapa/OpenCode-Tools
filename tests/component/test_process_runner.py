@@ -4,11 +4,11 @@ These tests spawn `tests/component/helpers/echo_process.py` through the real
 Python interpreter (`sys.executable`), never a fixture or mock, to prove the
 POSIX spawn boundary itself: no shell, no `os.chdir()`, stdin delivered
 out-of-band from argv/environment, cwd honored per child, concurrent bounded
-draining of large simultaneous stdout/stderr without deadlock, bounded
-reader-thread joins when a descendant lingers, and a technically faithful
-`ProcessResult` for both the success and the process-error paths (AC-014
-partial, AC-015). Deadline-based timeout and process-group termination are a
-later milestone (M05-03) and are not exercised here.
+draining of large simultaneous stdout/stderr without deadlock, deadline-based
+timeout and process-group `SIGTERM`/`SIGKILL` escalation reaching descendants
+(but not one that escaped the group), SIGINT/SIGTERM cancellation (SH-001),
+and a technically faithful `ProcessResult` for the success, process-error,
+timeout, and interrupted paths (AC-014, AC-015, AC-032).
 """
 
 from __future__ import annotations
@@ -16,7 +16,9 @@ from __future__ import annotations
 import dataclasses
 import hashlib
 import os
+import signal
 import sys
+import threading
 import time
 from datetime import UTC, datetime
 from pathlib import Path
@@ -42,6 +44,22 @@ class FakeClock:
     def monotonic_ns(self) -> int:
         self._monotonic_ns += 1
         return self._monotonic_ns
+
+
+class RealClock:
+    """A `Clock` that reads genuine wall/monotonic time.
+
+    The deadline/escalation tests below need `run()`'s internal polling
+    loop to track *real* elapsed time against a real hanging child --
+    `FakeClock`'s instant step counter would never reach a deadline
+    computed in real seconds within a reasonable number of polls.
+    """
+
+    def now(self) -> datetime:
+        return datetime.now(UTC)
+
+    def monotonic_ns(self) -> int:
+        return time.monotonic_ns()
 
 
 class RecordingAttemptLogSink:
@@ -80,6 +98,22 @@ def _spec(
         timeout_seconds=30.0,
         termination_grace_seconds=5.0,
         environment_overrides=environment_overrides or {},
+    )
+
+
+def _bounded_spec(
+    argv: tuple[str, ...],
+    cwd: Path,
+    *,
+    timeout_seconds: float = 0.2,
+    termination_grace_seconds: float = 0.2,
+) -> ProcessSpec:
+    return ProcessSpec(
+        argv=argv,
+        cwd=cwd,
+        stdin=None,
+        timeout_seconds=timeout_seconds,
+        termination_grace_seconds=termination_grace_seconds,
     )
 
 
@@ -435,6 +469,12 @@ def test_run_join_bound_is_governed_by_termination_grace_seconds(
 def test_run_uses_the_injected_clock_for_timestamps_and_duration(
     tmp_path: Path,
 ) -> None:
+    """`started_at`/`finished_at` come straight from the fake, proving the
+    clock is genuinely injected. `duration_ns` can only be asserted as
+    positive, not to an exact step count: since M05-03, `run()` polls
+    `clock.monotonic_ns()` once per deadline check while waiting for the
+    real child to exit, and that poll count depends on real scheduling."""
+
     clock = FakeClock(now=NOW, start_ns=100)
     runner = SubprocessRunner(clock)
     sink = RecordingAttemptLogSink()
@@ -444,4 +484,151 @@ def test_run_uses_the_injected_clock_for_timestamps_and_duration(
 
     assert result.started_at == NOW
     assert result.finished_at == NOW
-    assert result.duration_ns == 1
+    assert result.duration_ns >= 1
+
+
+def test_run_times_out_a_hanging_child_and_confirms_its_termination(
+    tmp_path: Path,
+) -> None:
+    runner = SubprocessRunner(RealClock())
+    sink = RecordingAttemptLogSink()
+    spec = _bounded_spec(_helper_argv("--sleep", "10"), tmp_path)
+
+    started = time.monotonic()
+    result = runner.run(spec, sink=sink)
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 3.0
+    assert result.outcome is RunOutcome.TIMEOUT
+    assert result.timed_out is True
+    assert result.termination_confirmed is True
+    assert result.return_code is not None
+    assert result.return_code < 0  # exited by a signal, not its own return
+
+
+def test_run_never_treats_a_timeout_as_a_provider_retry(tmp_path: Path) -> None:
+    """AC-015's sibling guarantee for timeouts (ADR-004): TIMEOUT is never
+    classified as PROVIDER_ERROR, so it can never enter the provider retry
+    loop regardless of what retry.decide_retry later does with it."""
+
+    runner = SubprocessRunner(RealClock())
+    sink = RecordingAttemptLogSink()
+    spec = _bounded_spec(_helper_argv("--sleep", "10"), tmp_path)
+
+    result = runner.run(spec, sink=sink)
+
+    assert result.outcome is not RunOutcome.PROVIDER_ERROR
+
+
+def test_run_escalates_to_sigkill_when_the_child_ignores_sigterm(
+    tmp_path: Path,
+) -> None:
+    runner = SubprocessRunner(RealClock())
+    sink = RecordingAttemptLogSink()
+    spec = _bounded_spec(_helper_argv("--ignore-sigterm", "--sleep", "10"), tmp_path)
+
+    started = time.monotonic()
+    result = runner.run(spec, sink=sink)
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 3.0
+    assert result.outcome is RunOutcome.TIMEOUT
+    assert result.termination_confirmed is True
+    assert result.return_code == -signal.SIGKILL
+
+
+def test_run_kills_the_whole_process_group_including_descendants(
+    tmp_path: Path,
+) -> None:
+    """A descendant that stays in the child's process group (plain
+    `fork()`, no `setsid()`) must be reaped by the same `killpg` that
+    terminates the direct child -- otherwise its held-open pipe would
+    prevent a confirmed termination."""
+
+    runner = SubprocessRunner(RealClock())
+    sink = RecordingAttemptLogSink()
+    spec = _bounded_spec(_helper_argv("--fork-and-sleep", "10"), tmp_path)
+
+    started = time.monotonic()
+    result = runner.run(spec, sink=sink)
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 3.0
+    assert result.outcome is RunOutcome.TIMEOUT
+    assert result.termination_confirmed is True
+
+
+def test_run_reports_unconfirmed_termination_when_a_descendant_escapes_the_group(
+    tmp_path: Path,
+) -> None:
+    """A descendant that calls its own `os.setsid()` leaves the child's
+    process group; `killpg` on that group terminates the direct child fine,
+    but can never reach the escaped descendant, which keeps holding a pipe
+    open -- the honest, documented outcome is `termination_confirmed=False`
+    (System Design SS10.2), never a hang and never a false `True`."""
+
+    runner = SubprocessRunner(RealClock())
+    sink = RecordingAttemptLogSink()
+    spec = _bounded_spec(_helper_argv("--detach-fork-hold", "10"), tmp_path)
+
+    started = time.monotonic()
+    result = runner.run(spec, sink=sink)
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 3.0
+    assert result.outcome is RunOutcome.TIMEOUT
+    assert result.termination_confirmed is False
+
+
+def test_run_applies_the_same_escalation_on_sigint_cancellation(
+    tmp_path: Path,
+) -> None:
+    """SH-001: an incoming SIGINT while a child is active reuses the exact
+    same bounded escalation as a timeout, reported as INTERRUPTED rather
+    than TIMEOUT, and still returns well before the child's own sleep."""
+
+    runner = SubprocessRunner(RealClock())
+    sink = RecordingAttemptLogSink()
+    spec = ProcessSpec(
+        argv=_helper_argv("--sleep", "10"),
+        cwd=tmp_path,
+        stdin=None,
+        timeout_seconds=30.0,
+        termination_grace_seconds=0.2,
+    )
+
+    def _send_sigint_shortly() -> None:
+        time.sleep(0.2)
+        os.kill(os.getpid(), signal.SIGINT)
+
+    canceller = threading.Thread(target=_send_sigint_shortly, daemon=True)
+    started = time.monotonic()
+    canceller.start()
+    result = runner.run(spec, sink=sink)
+    elapsed = time.monotonic() - started
+    canceller.join(timeout=2.0)
+
+    assert elapsed < 3.0
+    assert result.outcome is RunOutcome.INTERRUPTED
+    assert result.timed_out is False
+    assert result.termination_confirmed is True
+
+
+def test_run_restores_the_previous_signal_handlers_after_returning(
+    tmp_path: Path,
+) -> None:
+    """Installing SIGINT/SIGTERM handlers for the duration of one child's
+    execution must not leak into the rest of the process: whatever handler
+    was registered before `run()` is called must be back in place after."""
+
+    sentinel_sigterm = signal.getsignal(signal.SIGTERM)
+    sentinel_sigint = signal.getsignal(signal.SIGINT)
+
+    runner = SubprocessRunner(RealClock())
+    sink = RecordingAttemptLogSink()
+    spec = _spec(_helper_argv(), tmp_path)
+
+    runner.run(spec, sink=sink)
+
+    assert signal.getsignal(signal.SIGTERM) == sentinel_sigterm
+    assert signal.getsignal(signal.SIGINT) == sentinel_sigint

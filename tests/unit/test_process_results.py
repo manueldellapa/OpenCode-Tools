@@ -15,7 +15,22 @@ from pathlib import Path
 import pytest
 
 from opencode_tools.domain import ProcessResult, RunOutcome
-from opencode_tools.process import build_process_result, sanitize_command
+from opencode_tools.process import build_process_result, deadline_ns, sanitize_command
+
+
+class FakeClock:
+    """A `Clock` fake with a fixed wall-clock time and a step counter."""
+
+    def __init__(self, *, start_ns: int = 0) -> None:
+        self._monotonic_ns = start_ns
+
+    def now(self) -> datetime:
+        return STARTED_AT
+
+    def monotonic_ns(self) -> int:
+        self._monotonic_ns += 1
+        return self._monotonic_ns
+
 
 STARTED_AT = datetime(2026, 9, 13, 8, 0, 0, tzinfo=UTC)
 FINISHED_AT = datetime(2026, 9, 13, 8, 0, 1, tzinfo=UTC)
@@ -32,6 +47,8 @@ def _build(
     *,
     return_code: int | None,
     termination_confirmed: bool = True,
+    timed_out: bool = False,
+    interrupted: bool = False,
     stdout_byte_count: int = 0,
     stdout_sha256: str | None = None,
     stderr_byte_count: int = 0,
@@ -46,6 +63,8 @@ def _build(
         duration_ns=duration_ns,
         return_code=return_code,
         termination_confirmed=termination_confirmed,
+        timed_out=timed_out,
+        interrupted=interrupted,
         stdout_byte_count=stdout_byte_count,
         stdout_sha256=stdout_sha256 or _empty_digest(),
         stderr_byte_count=stderr_byte_count,
@@ -90,6 +109,46 @@ def test_build_process_result_preserves_a_false_termination_confirmed() -> None:
 
     result = _build(return_code=0, termination_confirmed=False)
 
+    assert result.termination_confirmed is False
+
+
+def test_build_process_result_maps_a_timeout_to_timeout_regardless_of_return_code() -> (
+    None
+):
+    """A killed-by-signal return code (negative on POSIX) must not slip
+    into `PROCESS_ERROR`: a deadline miss is always `TIMEOUT` (System
+    Design SS10.2), and `TIMEOUT` is never provider-retryable (AC-015's
+    sibling guarantee for timeouts, ADR-004)."""
+
+    result = _build(return_code=-15, termination_confirmed=True, timed_out=True)
+
+    assert result.outcome is RunOutcome.TIMEOUT
+    assert result.timed_out is True
+
+
+def test_build_process_result_maps_interrupted_to_interrupted() -> None:
+    result = _build(return_code=-15, termination_confirmed=True, interrupted=True)
+
+    assert result.outcome is RunOutcome.INTERRUPTED
+    assert result.timed_out is False
+
+
+def test_build_process_result_rejects_timed_out_and_interrupted_together() -> None:
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        _build(return_code=None, timed_out=True, interrupted=True)
+
+
+def test_build_process_result_timeout_takes_precedence_when_termination_unconfirmed() -> (
+    None
+):
+    """An unconfirmed termination during a timeout escalation is still a
+    `TIMEOUT`, not silently downgraded to a generic `PROCESS_ERROR` -- the
+    distinction matters for diagnosing a stuck deadline versus a plain
+    technical failure."""
+
+    result = _build(return_code=None, termination_confirmed=False, timed_out=True)
+
+    assert result.outcome is RunOutcome.TIMEOUT
     assert result.termination_confirmed is False
 
 
@@ -147,6 +206,34 @@ def test_build_process_result_preserves_the_sanitized_command_tuple() -> None:
 
     assert result.command == COMMAND
     assert result.cwd == CWD
+
+
+def test_deadline_ns_adds_timeout_seconds_converted_to_nanoseconds() -> None:
+    assert deadline_ns(1_000, 2.0) == 1_000 + 2_000_000_000
+
+
+def test_deadline_ns_truncates_fractional_nanoseconds() -> None:
+    # 0.1s == 100_000_000ns exactly, but a value that doesn't divide evenly
+    # (e.g. thirds of a second) must still return an int deadline.
+    result = deadline_ns(0, 1 / 3)
+
+    assert isinstance(result, int)
+    assert result == int((1 / 3) * 1_000_000_000)
+
+
+def test_deadline_ns_is_a_pure_function_of_a_fake_clocks_readings() -> None:
+    """`deadline_ns` needs no real process and no real waiting: given a
+    fake clock's own start reading, it is entirely deterministic (M05-03's
+    "deadline con clock fake" test requirement)."""
+
+    clock = FakeClock(start_ns=0)
+    start = clock.monotonic_ns()
+    deadline = deadline_ns(start, timeout_seconds=0.000001)
+
+    assert clock.monotonic_ns() < deadline  # one tick later, still short of it
+    for _ in range(2_000):
+        clock.monotonic_ns()
+    assert clock.monotonic_ns() >= deadline  # many ticks later, past it
 
 
 def test_sanitize_command_returns_argv_unchanged_when_no_credentials_present() -> None:
