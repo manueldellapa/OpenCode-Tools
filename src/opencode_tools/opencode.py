@@ -84,6 +84,24 @@ _PERMISSION_BASELINE: dict[AgentRole, dict[str, str]] = {
 # fault -- it just stops the affected channel from growing further.
 _UTILITY_OUTPUT_LIMIT_BYTES = 1_048_576
 
+# `opencode run` can legitimately produce much more output than a utility
+# call (agent conversation, tool output), so it gets its own, larger
+# versioned byte budget (System Design SS10.1).
+RUN_OUTPUT_LIMIT_BYTES = 8 * 1_048_576
+
+# Independent of the overall byte budget: bounds the number of NDJSON lines
+# this adapter will ever parse for one run, so a pathological number of
+# tiny lines cannot force unbounded parse work even while staying under the
+# byte budget (System Design SS10.5's "limiti dimensionali").
+MAX_NDJSON_LINES = 100_000
+
+# The transport-level event/part shapes this exact-version adapter
+# recognizes (System Design SS10.5). Anything else -- including a real
+# OpenCode event type this adapter simply does not know about yet -- fails
+# closed rather than being ignored, per ADR-005's no-best-effort policy.
+_ALLOWED_TRANSPORT_EVENT_TYPES = frozenset({"message.part.updated", "session.error"})
+_ALLOWED_TRANSPORT_PART_TYPES = frozenset({"text", "reasoning", "tool"})
+
 
 class _BoundedCapturingSink:
     """An in-memory `AttemptLogSink` that bounds and exposes captured bytes.
@@ -145,6 +163,24 @@ class ControlPlaneEvidence:
             raise ValueError("executable must be an absolute path")
         if not self.control_plane_digest:
             raise ValueError("control_plane_digest must not be empty")
+
+
+@dataclass(frozen=True, slots=True)
+class TransportResult:
+    """The single decoded terminal assistant text and its session (SS10.5).
+
+    `protocol.py` applies the `agent-protocol/1` grammar only to
+    `terminal_text`; it never sees the NDJSON this was decoded from.
+    """
+
+    session_id: str
+    terminal_text: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.session_id, str) or not self.session_id:
+            raise ValueError("session_id must be a non-empty string")
+        if not isinstance(self.terminal_text, str):
+            raise TypeError("terminal_text must be a string")
 
 
 def resolve_executable() -> Path:
@@ -246,6 +282,167 @@ def _strict_utf8(data: bytes) -> str | None:
         return data.decode("utf-8")
     except UnicodeDecodeError:
         return None
+
+
+def _split_ndjson_lines(text: str) -> tuple[str, ...]:
+    """Normalize CRLF/CR to LF only, then split into logical lines.
+
+    Mirrors `protocol.py`'s own `_split_logical_lines` newline handling, but
+    independently: ADR-002 keeps the transport and the application-protocol
+    grammar from sharing an implementation, not just a responsibility.
+    """
+
+    normalized = text.replace("\r\n", "\n").replace("\r", "\n")
+    if normalized == "":
+        return ()
+    if normalized.endswith("\n"):
+        return tuple(normalized[:-1].split("\n"))
+    return tuple(normalized.split("\n"))
+
+
+def decode_run_transport(text: str) -> TransportResult:
+    """Decode already UTF-8-decoded `opencode run --format json` stdout.
+
+    Applies, in order (System Design SS9.2/SS10.5, ADR-002/ADR-005): CRLF/CR
+    normalization only; bounded NDJSON line splitting; per-line JSON
+    validity and an allowed event-type/part-type/session-ID check; grouping
+    completed `text` parts by `messageID` (last write for a given ID wins),
+    with `tool` and `reasoning` parts excluded entirely from the result; and
+    a requirement that exactly one completed group exists once the stream
+    ends. Every violation is `ProtocolError`; this never searches for a
+    marker itself -- that is `protocol.py`'s job on the single string this
+    function returns.
+    """
+
+    lines = _split_ndjson_lines(text)
+    if len(lines) > MAX_NDJSON_LINES:
+        raise ProtocolError(
+            "opencode.transport_output_too_large",
+            "opencode run produced more NDJSON lines than the defensive limit.",
+        )
+
+    session_id: str | None = None
+    completed_text_by_message: dict[str, str] = {}
+    completed_order: list[str] = []
+
+    for line in lines:
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            raise ProtocolError(
+                "opencode.transport_invalid_json",
+                "opencode run produced a line that is not valid JSON.",
+            ) from None
+        if not isinstance(event, dict):
+            raise ProtocolError(
+                "opencode.transport_invalid_event",
+                "An NDJSON line is not a JSON object.",
+            )
+
+        event_type = event.get("type")
+        if event_type not in _ALLOWED_TRANSPORT_EVENT_TYPES:
+            raise ProtocolError(
+                "opencode.transport_unknown_event_type",
+                f"opencode run produced an unrecognized event type: {event_type!r}.",
+            )
+
+        line_session_id = event.get("sessionID")
+        if not isinstance(line_session_id, str) or not line_session_id:
+            raise ProtocolError(
+                "opencode.transport_invalid_event",
+                "An NDJSON line is missing a non-empty sessionID.",
+            )
+        if session_id is None:
+            session_id = line_session_id
+        elif line_session_id != session_id:
+            raise ProtocolError(
+                "opencode.transport_session_id_mismatch",
+                "opencode run produced more than one distinct sessionID.",
+            )
+
+        if event_type != "message.part.updated":
+            continue
+
+        part = event.get("part")
+        if not isinstance(part, dict):
+            raise ProtocolError(
+                "opencode.transport_invalid_event",
+                "A message.part.updated event has no part object.",
+            )
+        part_type = part.get("type")
+        if part_type not in _ALLOWED_TRANSPORT_PART_TYPES:
+            raise ProtocolError(
+                "opencode.transport_unknown_event_type",
+                f"opencode run produced an unrecognized part type: {part_type!r}.",
+            )
+        if part_type != "text":
+            continue
+
+        message_id = part.get("messageID")
+        if not isinstance(message_id, str) or not message_id:
+            raise ProtocolError(
+                "opencode.transport_invalid_event",
+                "A text part is missing a non-empty messageID.",
+            )
+        text_value = part.get("text")
+        if not isinstance(text_value, str):
+            raise ProtocolError(
+                "opencode.transport_invalid_event",
+                "A text part is missing its text string.",
+            )
+
+        time_info = part.get("time")
+        is_complete = isinstance(time_info, dict) and "end" in time_info
+        if is_complete:
+            if message_id not in completed_text_by_message:
+                completed_order.append(message_id)
+            completed_text_by_message[message_id] = text_value
+
+    if not completed_order:
+        raise ProtocolError(
+            "opencode.transport_no_terminal_text",
+            "opencode run produced no completed terminal assistant text.",
+        )
+    if len(completed_order) > 1:
+        raise ProtocolError(
+            "opencode.transport_multiple_terminal_candidates",
+            "opencode run produced more than one candidate terminal assistant text.",
+        )
+
+    assert session_id is not None  # guaranteed once completed_order is non-empty
+    return TransportResult(
+        session_id=session_id,
+        terminal_text=completed_text_by_message[completed_order[0]],
+    )
+
+
+def decode_run_output(stdout: bytes, *, overflowed: bool) -> TransportResult:
+    """Decode raw `opencode run` stdout bytes into one terminal assistant text.
+
+    Thin wrapper around `decode_run_transport` that first rejects output
+    that already overflowed the versioned size limit (`overflowed`, from
+    `sink.overflowed("stdout")` against `RUN_OUTPUT_LIMIT_BYTES`) and output
+    that is not strict UTF-8, both `ProtocolError` (ADR-002, ADR-005).
+    """
+
+    if overflowed:
+        raise ProtocolError(
+            "opencode.transport_output_too_large",
+            "opencode run stdout exceeded the defensive size limit.",
+        )
+    text = _strict_utf8(stdout)
+    if text is None:
+        raise ProtocolError(
+            "opencode.transport_invalid_utf8",
+            "opencode run stdout was not valid UTF-8.",
+        )
+    return decode_run_transport(text)
+
+
+def open_run_capture_sink(log_name: str) -> _BoundedCapturingSink:
+    """Open the bounded stdout/stderr capture used for one `opencode run`."""
+
+    return _BoundedCapturingSink(path=Path(log_name), max_bytes=RUN_OUTPUT_LIMIT_BYTES)
 
 
 def _require_process_succeeded(
@@ -602,7 +799,10 @@ def recheck_control_plane(
 __all__ = (
     "CANDIDATE_OPENCODE_VERSION",
     "FORBIDDEN_RUN_FLAGS",
+    "MAX_NDJSON_LINES",
+    "RUN_OUTPUT_LIMIT_BYTES",
     "ControlPlaneEvidence",
+    "TransportResult",
     "build_run_spec",
     "check_debug_agent",
     "check_debug_config",
@@ -610,6 +810,9 @@ __all__ = (
     "check_run_help_capability",
     "check_version",
     "compute_control_plane_digest",
+    "decode_run_output",
+    "decode_run_transport",
+    "open_run_capture_sink",
     "recheck_control_plane",
     "redact_command_for_display",
     "resolve_executable",

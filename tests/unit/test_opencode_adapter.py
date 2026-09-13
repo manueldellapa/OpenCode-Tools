@@ -16,17 +16,21 @@ import hashlib
 import json
 import re
 import shutil
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Final, cast
 
 import pytest
 
 from opencode_tools.domain import AgentRole, ProcessSpec, Workspace
-from opencode_tools.errors import PreflightError
+from opencode_tools.errors import PreflightError, ProtocolError
 from opencode_tools.opencode import (
     CANDIDATE_OPENCODE_VERSION,
     FORBIDDEN_RUN_FLAGS,
+    MAX_NDJSON_LINES,
+    RUN_OUTPUT_LIMIT_BYTES,
     ControlPlaneEvidence,
+    TransportResult,
     build_run_spec,
     check_debug_agent,
     check_debug_config,
@@ -34,6 +38,9 @@ from opencode_tools.opencode import (
     check_run_help_capability,
     check_version,
     compute_control_plane_digest,
+    decode_run_output,
+    decode_run_transport,
+    open_run_capture_sink,
     redact_command_for_display,
     resolve_executable,
 )
@@ -652,3 +659,197 @@ def test_redact_command_for_display_redacts_credentials_in_argv(
     )
     displayed = redact_command_for_display(spec)
     assert "secret" not in " ".join(displayed)
+
+
+# =============================================================================
+# M07-04: NDJSON transport decoder
+# =============================================================================
+
+RUN_FIXTURES = FIXTURES_ROOT / "run"
+PROVIDER_FIXTURES = FIXTURES_ROOT / "provider"
+MALFORMED_FIXTURES = FIXTURES_ROOT / "malformed"
+NOW = datetime(2026, 9, 13, 12, 0, 0, tzinfo=UTC)
+
+
+def _text(path: Path) -> str:
+    return path.read_text(encoding="utf-8")
+
+
+# --- decode_run_transport: one clean terminal text per success fixture ------
+
+
+@pytest.mark.parametrize(
+    "fixture_name,expected_session_id,expected_terminal_suffix",
+    [
+        (
+            "architect-ready-success.ndjson",
+            "ses_architect_ready",
+            "AGENT_STATUS: READY",
+        ),
+        ("architect-failed.ndjson", "ses_architect_failed", "AGENT_STATUS: FAILED"),
+        (
+            "coder-completed-success.ndjson",
+            "ses_coder_completed",
+            "AGENT_STATUS: COMPLETED",
+        ),
+        ("coder-failed.ndjson", "ses_coder_failed", "AGENT_STATUS: FAILED"),
+        (
+            "reviewer-approved-success.ndjson",
+            "ses_reviewer_approved",
+            "REVIEW_STATUS: APPROVED",
+        ),
+        (
+            "reviewer-changes-required.ndjson",
+            "ses_reviewer_changes_required",
+            "REVIEW_STATUS: CHANGES_REQUIRED",
+        ),
+        ("reviewer-failed.ndjson", "ses_reviewer_failed", "AGENT_STATUS: FAILED"),
+    ],
+)
+def test_decode_run_transport_produces_one_terminal_text_per_clean_transcript(
+    fixture_name: str, expected_session_id: str, expected_terminal_suffix: str
+) -> None:
+    result = decode_run_transport(_text(RUN_FIXTURES / fixture_name))
+    assert isinstance(result, TransportResult)
+    assert result.session_id == expected_session_id
+    assert result.terminal_text.endswith(expected_terminal_suffix)
+
+
+# --- transport, session, and terminal-candidate violations -------------------
+
+
+@pytest.mark.parametrize(
+    "fixture_name,expected_code",
+    [
+        ("invalid-json-line.ndjson", "opencode.transport_invalid_json"),
+        ("unknown-event-type.ndjson", "opencode.transport_unknown_event_type"),
+        ("session-id-mismatch.ndjson", "opencode.transport_session_id_mismatch"),
+        ("truncated-no-terminal-text.ndjson", "opencode.transport_no_terminal_text"),
+        (
+            "multi-terminal-candidates.ndjson",
+            "opencode.transport_multiple_terminal_candidates",
+        ),
+    ],
+)
+def test_decode_run_transport_fails_closed_on_each_malformed_fixture(
+    fixture_name: str, expected_code: str
+) -> None:
+    with pytest.raises(ProtocolError) as exc_info:
+        decode_run_transport(_text(MALFORMED_FIXTURES / fixture_name))
+    assert exc_info.value.code == expected_code
+
+
+def test_decode_run_transport_fails_closed_on_a_non_json_warning_line() -> None:
+    text = _text(MALFORMED_FIXTURES / "agent-fallback-warning.stdout.txt")
+    with pytest.raises(ProtocolError) as exc_info:
+        decode_run_transport(text)
+    assert exc_info.value.code == "opencode.transport_invalid_json"
+
+
+def test_decode_run_transport_fails_closed_when_no_events_are_present() -> None:
+    with pytest.raises(ProtocolError) as exc_info:
+        decode_run_transport("")
+    assert exc_info.value.code == "opencode.transport_no_terminal_text"
+
+
+# --- tool/reasoning exclusion and marker-spoofing resistance -----------------
+
+
+def test_decode_run_transport_excludes_tool_output_from_the_result() -> None:
+    result = decode_run_transport(
+        _text(MALFORMED_FIXTURES / "tool-output-marker-spoofing.ndjson")
+    )
+    assert "AGENT_STATUS: READY" not in result.terminal_text
+    assert result.terminal_text.endswith("AGENT_STATUS: FAILED")
+
+
+def test_decode_run_transport_excludes_reasoning_from_the_result() -> None:
+    result = decode_run_transport(
+        _text(MALFORMED_FIXTURES / "reasoning-marker-spoofing.ndjson")
+    )
+    assert "AGENT_STATUS: COMPLETED" not in result.terminal_text
+    assert result.terminal_text.endswith("AGENT_STATUS: FAILED")
+
+
+def test_decode_run_transport_excludes_a_provider_error_event_from_the_result() -> None:
+    with pytest.raises(ProtocolError) as exc_info:
+        decode_run_transport(_text(PROVIDER_FIXTURES / "http-429-rate-limit.ndjson"))
+    assert exc_info.value.code == "opencode.transport_no_terminal_text"
+
+
+# --- CRLF/CR normalization ----------------------------------------------------
+
+
+def test_decode_run_transport_normalizes_crlf_to_lf() -> None:
+    crlf_text = _text(RUN_FIXTURES / "architect-ready-success.ndjson").replace(
+        "\n", "\r\n"
+    )
+    result = decode_run_transport(crlf_text)
+    assert result.terminal_text.endswith("AGENT_STATUS: READY")
+
+
+def test_decode_run_transport_normalizes_bare_cr_to_lf() -> None:
+    cr_text = _text(RUN_FIXTURES / "architect-ready-success.ndjson").replace("\n", "\r")
+    result = decode_run_transport(cr_text)
+    assert result.terminal_text.endswith("AGENT_STATUS: READY")
+
+
+# --- dimension limits ----------------------------------------------------------
+
+
+def test_decode_run_transport_rejects_more_than_the_line_limit() -> None:
+    filler_line = json.dumps(
+        {
+            "type": "message.part.updated",
+            "sessionID": "ses_limit",
+            "part": {"id": "prt", "messageID": "msg", "type": "reasoning", "text": "x"},
+        }
+    )
+    text = "\n".join([filler_line] * (MAX_NDJSON_LINES + 1))
+    with pytest.raises(ProtocolError) as exc_info:
+        decode_run_transport(text)
+    assert exc_info.value.code == "opencode.transport_output_too_large"
+
+
+# --- decode_run_output: byte-level overflow and UTF-8 wrapper ----------------
+
+
+def test_decode_run_output_rejects_overflowed_stdout() -> None:
+    with pytest.raises(ProtocolError) as exc_info:
+        decode_run_output(b"irrelevant", overflowed=True)
+    assert exc_info.value.code == "opencode.transport_output_too_large"
+
+
+def test_decode_run_output_rejects_invalid_utf8() -> None:
+    invalid_bytes = (MALFORMED_FIXTURES / "non-utf8-bytes.bin").read_bytes()
+    with pytest.raises(ProtocolError) as exc_info:
+        decode_run_output(invalid_bytes, overflowed=False)
+    assert exc_info.value.code == "opencode.transport_invalid_utf8"
+
+
+def test_decode_run_output_decodes_valid_bytes() -> None:
+    raw = (RUN_FIXTURES / "coder-completed-success.ndjson").read_bytes()
+    result = decode_run_output(raw, overflowed=False)
+    assert result.terminal_text.endswith("AGENT_STATUS: COMPLETED")
+
+
+# --- open_run_capture_sink -----------------------------------------------------
+
+
+def test_open_run_capture_sink_uses_the_run_size_limit() -> None:
+    sink = open_run_capture_sink("run.log")
+    assert sink.path == Path("run.log")
+
+    sink.write("stdout", b"x" * RUN_OUTPUT_LIMIT_BYTES, NOW)
+    assert not sink.overflowed("stdout")
+
+    sink.write("stdout", b"x", NOW)
+    assert sink.overflowed("stdout")
+
+
+# --- TransportResult -----------------------------------------------------------
+
+
+def test_transport_result_rejects_an_empty_session_id() -> None:
+    with pytest.raises(ValueError, match="session_id"):
+        TransportResult(session_id="", terminal_text="AGENT_STATUS: COMPLETED")
