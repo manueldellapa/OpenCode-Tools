@@ -39,6 +39,7 @@ from opencode_tools.domain import (
     ProviderDiagnostic,
     ProviderRetryConfig,
     RepositoryIdentity,
+    RetryDecision,
     ReviewStatus,
     RunOutcome,
     RunRecord,
@@ -167,6 +168,15 @@ def _provider_diagnostic() -> ProviderDiagnostic:
         retryable=True,
         status_code=502,
         code="provider_unavailable",
+    )
+
+
+def _retry_decision() -> RetryDecision:
+    return RetryDecision(
+        should_retry=True,
+        next_provider_attempt=2,
+        planned_delay_seconds=2.0,
+        retry_suppressed_due_to_target_change=False,
     )
 
 
@@ -324,6 +334,7 @@ def _record_samples() -> tuple[tuple[object, str], ...]:
         (_process_spec(), "argv"),
         (_process_result(), "duration_ns"),
         (_provider_diagnostic(), "source"),
+        (_retry_decision(), "should_retry"),
         (_parsed_response(), "body"),
         (_agent_result(), "provider_attempt"),
         (_git_state(), "branch"),
@@ -707,6 +718,63 @@ def test_positive_counters_and_non_negative_measurements() -> None:
             stderr_sha256="stderr",
             outcome=RunOutcome.PROCESS_ERROR,
         )
+
+
+def test_retry_decision_requires_consistent_retry_fields() -> None:
+    with pytest.raises(ValueError, match="next_provider_attempt must be at least 2"):
+        RetryDecision(
+            should_retry=True,
+            next_provider_attempt=1,
+            planned_delay_seconds=2.0,
+            retry_suppressed_due_to_target_change=False,
+        )
+    with pytest.raises(
+        ValueError, match="planned_delay_seconds must be greater than zero"
+    ):
+        RetryDecision(
+            should_retry=True,
+            next_provider_attempt=2,
+            planned_delay_seconds=0,
+            retry_suppressed_due_to_target_change=False,
+        )
+    with pytest.raises(
+        ValueError,
+        match="retry_suppressed_due_to_target_change must be False",
+    ):
+        RetryDecision(
+            should_retry=True,
+            next_provider_attempt=2,
+            planned_delay_seconds=2.0,
+            retry_suppressed_due_to_target_change=True,
+        )
+    with pytest.raises(
+        ValueError,
+        match="next_provider_attempt must be None when should_retry is False",
+    ):
+        RetryDecision(
+            should_retry=False,
+            next_provider_attempt=2,
+            planned_delay_seconds=None,
+            retry_suppressed_due_to_target_change=False,
+        )
+    with pytest.raises(
+        ValueError,
+        match="planned_delay_seconds must be None when should_retry is False",
+    ):
+        RetryDecision(
+            should_retry=False,
+            next_provider_attempt=None,
+            planned_delay_seconds=2.0,
+            retry_suppressed_due_to_target_change=False,
+        )
+
+    denied = RetryDecision(
+        should_retry=False,
+        next_provider_attempt=None,
+        planned_delay_seconds=None,
+        retry_suppressed_due_to_target_change=True,
+    )
+    assert denied.next_provider_attempt is None
 
 
 def test_timestamps_must_be_timezone_aware_utc() -> None:

@@ -729,6 +729,58 @@ class ProviderDiagnostic:
 
 
 @dataclass(frozen=True, slots=True)
+class RetryDecision:
+    """A pure provider-retry verdict: whether to retry and its planned delay.
+
+    `retry_suppressed_due_to_target_change` records, independently of the
+    other guards, that a coder's Git fingerprint changed before a provider
+    failure (System Design SS12.2, AC-013); it is never set alongside a
+    positive retry decision.
+    """
+
+    should_retry: bool
+    next_provider_attempt: int | None
+    planned_delay_seconds: float | None
+    retry_suppressed_due_to_target_change: bool
+
+    def __post_init__(self) -> None:
+        _require_bool(self.should_retry, "should_retry")
+        _require_bool(
+            self.retry_suppressed_due_to_target_change,
+            "retry_suppressed_due_to_target_change",
+        )
+        if self.should_retry:
+            if self.retry_suppressed_due_to_target_change:
+                raise ValueError(
+                    "retry_suppressed_due_to_target_change must be False "
+                    "when should_retry is True"
+                )
+            _require_int(
+                self.next_provider_attempt,
+                "next_provider_attempt",
+                minimum=2,
+            )
+            object.__setattr__(
+                self,
+                "planned_delay_seconds",
+                _finite_number(
+                    self.planned_delay_seconds,
+                    "planned_delay_seconds",
+                    positive=True,
+                ),
+            )
+        else:
+            if self.next_provider_attempt is not None:
+                raise ValueError(
+                    "next_provider_attempt must be None when should_retry is False"
+                )
+            if self.planned_delay_seconds is not None:
+                raise ValueError(
+                    "planned_delay_seconds must be None when should_retry is False"
+                )
+
+
+@dataclass(frozen=True, slots=True)
 class ParsedAgentResponse:
     """A transport-independent, terminal protocol response."""
 
@@ -1133,6 +1185,7 @@ type PersistableDomainRecord = (
     | IssueRef
     | ProcessResult
     | ProviderDiagnostic
+    | RetryDecision
     | ParsedAgentResponse
     | AgentResult
     | GitState
@@ -1161,6 +1214,7 @@ _SERIALIZABLE_RECORD_TYPES = (
     IssueRef,
     ProcessResult,
     ProviderDiagnostic,
+    RetryDecision,
     ParsedAgentResponse,
     AgentResult,
     GitState,
@@ -1253,6 +1307,7 @@ __all__ = (
     "ProviderDiagnostic",
     "ProviderRetryConfig",
     "RepositoryIdentity",
+    "RetryDecision",
     "ReviewStatus",
     "RunOutcome",
     "RunRecord",
