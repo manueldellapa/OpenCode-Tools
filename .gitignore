@@ -4,5 +4,13 @@
 # Knowledge graph
 graphify-out/
 
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Virtual environments
+.venv/
+
 # OpenCode-Tools runtime
 .opencode-tools/
