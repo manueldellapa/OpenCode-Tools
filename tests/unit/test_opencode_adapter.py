@@ -21,16 +21,20 @@ from typing import Final, cast
 
 import pytest
 
-from opencode_tools.domain import AgentRole
+from opencode_tools.domain import AgentRole, ProcessSpec, Workspace
 from opencode_tools.errors import PreflightError
 from opencode_tools.opencode import (
     CANDIDATE_OPENCODE_VERSION,
+    FORBIDDEN_RUN_FLAGS,
     ControlPlaneEvidence,
+    build_run_spec,
     check_debug_agent,
     check_debug_config,
+    check_no_forbidden_flags,
     check_run_help_capability,
     check_version,
     compute_control_plane_digest,
+    redact_command_for_display,
     resolve_executable,
 )
 
@@ -506,3 +510,145 @@ def test_control_plane_evidence_rejects_an_empty_digest(tmp_path: Path) -> None:
             executable=tmp_path / "opencode",
             control_plane_digest="",
         )
+
+
+# =============================================================================
+# M07-03: command builder and flag deny-list
+# =============================================================================
+
+
+def _workspace(tmp_path: Path) -> Workspace:
+    return Workspace(root=tmp_path)
+
+
+# --- build_run_spec ------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "role,token",
+    [
+        (AgentRole.ARCHITECT, "architect"),
+        (AgentRole.CODER, "coder"),
+        (AgentRole.REVIEWER, "reviewer"),
+    ],
+)
+def test_build_run_spec_produces_the_exact_argv_for_each_role(
+    role: AgentRole, token: str, tmp_path: Path
+) -> None:
+    executable = tmp_path / "opencode"
+    workspace = _workspace(tmp_path / "workspace")
+
+    spec = build_run_spec(
+        executable,
+        role,
+        "the prompt",
+        workspace,
+        timeout_seconds=30,
+        termination_grace_seconds=5,
+    )
+
+    assert spec.argv == (
+        str(executable),
+        "run",
+        "--agent",
+        token,
+        "--format",
+        "json",
+        "--dir",
+        str(workspace.root),
+    )
+    assert spec.cwd == workspace.root
+    assert spec.stdin == "the prompt"
+
+
+def test_build_run_spec_never_includes_a_forbidden_flag(tmp_path: Path) -> None:
+    executable = tmp_path / "opencode"
+    workspace = _workspace(tmp_path / "workspace")
+
+    spec = build_run_spec(
+        executable,
+        AgentRole.CODER,
+        "the prompt",
+        workspace,
+        timeout_seconds=30,
+        termination_grace_seconds=5,
+    )
+
+    assert not any(flag in spec.argv for flag in FORBIDDEN_RUN_FLAGS)
+    assert not any("--model" in token for token in spec.argv)
+
+
+def test_build_run_spec_rejects_a_relative_executable(tmp_path: Path) -> None:
+    workspace = _workspace(tmp_path / "workspace")
+    with pytest.raises(ValueError, match="absolute"):
+        build_run_spec(
+            Path("opencode"),
+            AgentRole.ARCHITECT,
+            "the prompt",
+            workspace,
+            timeout_seconds=30,
+            termination_grace_seconds=5,
+        )
+
+
+# --- check_no_forbidden_flags ---------------------------------------------------
+
+
+def test_check_no_forbidden_flags_accepts_a_clean_argv() -> None:
+    check_no_forbidden_flags(("/usr/bin/opencode", "run", "--agent", "coder"))
+
+
+@pytest.mark.parametrize("flag", FORBIDDEN_RUN_FLAGS)
+def test_check_no_forbidden_flags_rejects_each_forbidden_flag(flag: str) -> None:
+    with pytest.raises(AssertionError):
+        check_no_forbidden_flags(("/usr/bin/opencode", "run", flag))
+
+
+# --- redact_command_for_display -------------------------------------------------
+
+
+def test_redact_command_for_display_appends_marker_when_stdin_present(
+    tmp_path: Path,
+) -> None:
+    spec = ProcessSpec(
+        argv=("/usr/bin/opencode", "run", "--agent", "coder"),
+        cwd=tmp_path,
+        stdin="the prompt",
+        timeout_seconds=30,
+        termination_grace_seconds=5,
+    )
+    assert redact_command_for_display(spec) == (
+        "/usr/bin/opencode",
+        "run",
+        "--agent",
+        "coder",
+        "<PROMPT_REDACTED>",
+    )
+    assert "the prompt" not in redact_command_for_display(spec)
+
+
+def test_redact_command_for_display_omits_marker_when_stdin_absent(
+    tmp_path: Path,
+) -> None:
+    spec = ProcessSpec(
+        argv=("/usr/bin/opencode", "--version"),
+        cwd=tmp_path,
+        stdin=None,
+        timeout_seconds=30,
+        termination_grace_seconds=5,
+    )
+    assert redact_command_for_display(spec) == ("/usr/bin/opencode", "--version")
+
+
+def test_redact_command_for_display_redacts_credentials_in_argv(
+    tmp_path: Path,
+) -> None:
+    spec = ProcessSpec(
+        argv=("/usr/bin/git", "fetch", "https://user:secret@example.com/repo.git"),
+        cwd=tmp_path,
+        stdin=None,
+        timeout_seconds=30,
+        termination_grace_seconds=5,
+    )
+    displayed = redact_command_for_display(spec)
+    assert "secret" not in " ".join(displayed)

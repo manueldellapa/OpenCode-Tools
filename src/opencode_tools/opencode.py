@@ -33,6 +33,7 @@ from opencode_tools.domain import (
 )
 from opencode_tools.errors import PreflightError, ProtocolError
 from opencode_tools.ports import LogChannel, ProcessRunner
+from opencode_tools.process import sanitize_command
 
 CANDIDATE_OPENCODE_VERSION = "1.17.18"
 
@@ -52,6 +53,19 @@ _ROLE_TOKENS: dict[AgentRole, str] = {
     AgentRole.REVIEWER: "reviewer",
 }
 _REQUIRED_RUN_HELP_TOKENS: tuple[str, ...] = ("--agent", "--format json", "--dir")
+
+# Flags this adapter must never pass to `opencode run` (System Design
+# SS10.3): auto/share/model overrides and every form of session
+# continuation. Each invocation is its own independent OpenCode session.
+FORBIDDEN_RUN_FLAGS: tuple[str, ...] = (
+    "--auto",
+    "--share",
+    "--model",
+    "--continue",
+    "--session",
+    "--fork",
+    "--attach",
+)
 
 # The reviewed, exact-match permission baseline for each primary role: only
 # the coder may edit or run bash against the target; architect and reviewer
@@ -147,6 +161,84 @@ def resolve_executable() -> Path:
             "The 'opencode' executable was not found on PATH.",
         )
     return Path(found).resolve()
+
+
+def check_no_forbidden_flags(argv: tuple[str, ...]) -> None:
+    """Assert `argv` contains none of `FORBIDDEN_RUN_FLAGS`.
+
+    This is a self-verification of adapter-internal command construction,
+    not a fact about the user's environment: unlike `PreflightError`, its
+    trigger would be a bug in this module's own argv construction, never an
+    OpenCode incompatibility, so it raises the plain `AssertionError` a
+    genuinely impossible internal invariant deserves.
+    """
+
+    forbidden_present = tuple(flag for flag in FORBIDDEN_RUN_FLAGS if flag in argv)
+    if forbidden_present:
+        raise AssertionError(
+            f"opencode.py constructed a forbidden flag: {forbidden_present}"
+        )
+
+
+def build_run_spec(
+    executable: Path,
+    role: AgentRole,
+    prompt: str,
+    workspace: Workspace,
+    *,
+    timeout_seconds: float,
+    termination_grace_seconds: float,
+) -> ProcessSpec:
+    """Build the exact `opencode run` invocation for `role` (System Design
+    SS10.3).
+
+    Produces exactly `<executable> run --agent <role> --format json --dir
+    <workspace>` with one absolute executable path and no other flags.
+    `prompt` reaches the child only through stdin, so it can never appear in
+    argv, shell history, or a process listing; `cwd` is also set to
+    `workspace.root`, duplicating `--dir` deliberately so the invocation
+    never depends on the caller's own cwd. Every call therefore starts an
+    independent OpenCode session -- there is no `--continue`/`--session`
+    that could attach it to a prior one.
+    """
+
+    argv = (
+        str(executable),
+        "run",
+        "--agent",
+        _ROLE_TOKENS[role],
+        "--format",
+        "json",
+        "--dir",
+        str(workspace.root),
+    )
+    check_no_forbidden_flags(argv)
+
+    return ProcessSpec(
+        argv=argv,
+        cwd=workspace.root,
+        stdin=prompt,
+        timeout_seconds=timeout_seconds,
+        termination_grace_seconds=termination_grace_seconds,
+        environment_overrides=_ENVIRONMENT_OVERRIDES,
+    )
+
+
+def redact_command_for_display(spec: ProcessSpec) -> tuple[str, ...]:
+    """Return `spec.argv`, sanitized and with stdin marked, never shown.
+
+    The prompt never reaches argv -- it travels only on stdin -- but a
+    persisted command string that showed nothing for it would be
+    indistinguishable from a call with no stdin at all. Appending
+    `<PROMPT_REDACTED>` only when `spec.stdin` is non-empty keeps that
+    distinction explicit without ever exposing what was actually sent
+    (System Design SS18.3).
+    """
+
+    argv = sanitize_command(spec.argv)
+    if spec.stdin:
+        return (*argv, "<PROMPT_REDACTED>")
+    return argv
 
 
 def _strict_utf8(data: bytes) -> str | None:
@@ -509,13 +601,17 @@ def recheck_control_plane(
 
 __all__ = (
     "CANDIDATE_OPENCODE_VERSION",
+    "FORBIDDEN_RUN_FLAGS",
     "ControlPlaneEvidence",
+    "build_run_spec",
     "check_debug_agent",
     "check_debug_config",
+    "check_no_forbidden_flags",
     "check_run_help_capability",
     "check_version",
     "compute_control_plane_digest",
     "recheck_control_plane",
+    "redact_command_for_display",
     "resolve_executable",
     "run_preflight",
 )
