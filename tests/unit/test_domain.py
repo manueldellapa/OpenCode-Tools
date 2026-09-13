@@ -15,8 +15,11 @@ from opencode_tools.domain import (
     AgentResult,
     AgentRole,
     AgentStatus,
+    AppConfig,
     AttemptRecord,
+    ConfigSource,
     ErrorRecord,
+    ExecutionConfig,
     FinalStatus,
     FrozenJsonValue,
     GitCheckRecord,
@@ -33,6 +36,7 @@ from opencode_tools.domain import (
     ProcessResult,
     ProcessSpec,
     ProviderDiagnostic,
+    ProviderRetryConfig,
     RepositoryIdentity,
     ReviewStatus,
     RunOutcome,
@@ -64,6 +68,33 @@ def _target() -> TargetRepository:
 
 def _run_request() -> RunRequest:
     return RunRequest(issue_number=4, workspace=_workspace(), target_root=TARGET_ROOT)
+
+
+def _execution_config() -> ExecutionConfig:
+    return ExecutionConfig(
+        opencode_timeout_seconds=1800,
+        utility_timeout_seconds=30,
+        termination_grace_seconds=5,
+        max_review_cycles=3,
+    )
+
+
+def _provider_retry_config() -> ProviderRetryConfig:
+    return ProviderRetryConfig(
+        max_attempts=3,
+        initial_delay_seconds=2,
+        multiplier=2.0,
+        max_delay_seconds=30,
+    )
+
+
+def _app_config() -> AppConfig:
+    return AppConfig(
+        source=ConfigSource.DEFAULTS,
+        execution=_execution_config(),
+        provider_retry=_provider_retry_config(),
+        runtime_root=".opencode-tools",
+    )
 
 
 def _identity() -> RepositoryIdentity:
@@ -445,6 +476,102 @@ def test_run_request_requires_a_positive_issue_and_contained_target() -> None:
             issue_number=4,
             workspace=_workspace(),
             target_root=Path("/elsewhere/backend"),
+        )
+
+
+def test_execution_and_provider_retry_config_apply_v1_ranges() -> None:
+    execution = _execution_config()
+    assert is_dataclass(execution)
+    assert not hasattr(execution, "__dict__")
+    execution_field = "max_review_cycles"
+    with pytest.raises(FrozenInstanceError):
+        setattr(execution, execution_field, getattr(execution, execution_field))
+
+    with pytest.raises(TypeError, match="opencode_timeout_seconds must be a finite"):
+        ExecutionConfig(
+            opencode_timeout_seconds=cast(float, True),
+            utility_timeout_seconds=30,
+            termination_grace_seconds=5,
+            max_review_cycles=3,
+        )
+    with pytest.raises(ValueError, match="opencode_timeout_seconds must be <=7200"):
+        ExecutionConfig(
+            opencode_timeout_seconds=7201,
+            utility_timeout_seconds=30,
+            termination_grace_seconds=5,
+            max_review_cycles=3,
+        )
+    with pytest.raises(TypeError, match="max_review_cycles must be an integer"):
+        ExecutionConfig(
+            opencode_timeout_seconds=1800,
+            utility_timeout_seconds=30,
+            termination_grace_seconds=5,
+            max_review_cycles=cast(int, 3.0),
+        )
+    with pytest.raises(ValueError, match="max_review_cycles must be at most 20"):
+        ExecutionConfig(
+            opencode_timeout_seconds=1800,
+            utility_timeout_seconds=30,
+            termination_grace_seconds=5,
+            max_review_cycles=21,
+        )
+
+    provider_retry = _provider_retry_config()
+    assert is_dataclass(provider_retry)
+    assert not hasattr(provider_retry, "__dict__")
+    provider_retry_field = "max_attempts"
+    with pytest.raises(FrozenInstanceError):
+        setattr(
+            provider_retry,
+            provider_retry_field,
+            getattr(provider_retry, provider_retry_field),
+        )
+
+    with pytest.raises(ValueError, match=r"multiplier must be >1\.0"):
+        ProviderRetryConfig(
+            max_attempts=3,
+            initial_delay_seconds=2,
+            multiplier=1.0,
+            max_delay_seconds=30,
+        )
+    with pytest.raises(ValueError, match="max_delay_seconds must be >=10"):
+        ProviderRetryConfig(
+            max_attempts=3,
+            initial_delay_seconds=10,
+            multiplier=2.0,
+            max_delay_seconds=5,
+        )
+
+
+def test_app_config_requires_typed_sections_and_a_non_empty_runtime_root() -> None:
+    config = _app_config()
+    assert is_dataclass(config)
+    assert not hasattr(config, "__dict__")
+    assert config.source is ConfigSource.DEFAULTS
+    config_field = "runtime_root"
+    with pytest.raises(FrozenInstanceError):
+        setattr(config, config_field, getattr(config, config_field))
+
+    with pytest.raises(TypeError, match="execution must be ExecutionConfig"):
+        AppConfig(
+            source=ConfigSource.DEFAULTS,
+            execution=cast(ExecutionConfig, None),
+            provider_retry=_provider_retry_config(),
+            runtime_root=".opencode-tools",
+        )
+    with pytest.raises(TypeError, match="provider_retry must be ProviderRetryConfig"):
+        AppConfig(
+            source=ConfigSource.DEFAULTS,
+            execution=_execution_config(),
+            provider_retry=cast(ProviderRetryConfig, None),
+            runtime_root=".opencode-tools",
+        )
+    with pytest.raises(ValueError, match="runtime_root must not be empty"):
+        AppConfig(
+            source=ConfigSource.DEFAULTS,
+            execution=_execution_config(),
+            provider_retry=_provider_retry_config(),
+            runtime_root="  ",
         )
 
 

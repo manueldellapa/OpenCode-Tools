@@ -1,11 +1,10 @@
-"""Path resolution and config-file discovery, proven before any agent I/O.
+"""Path resolution and config validation, proven before any agent I/O.
 
-Only the workspace/target/issue-number shape of a `RunRequest`, and the
-file discovery/parsing/closed-schema shape of the TOML config, are resolved
-here. Field-level range/type validation and the typed `AppConfig` it
-produces, runtime-root canonicalization, GitHub target-override validation,
-Git top-level proof, clean-baseline checks, and artifact creation remain the
-responsibility of later milestones.
+Covers the workspace/target/issue-number shape of a `RunRequest`, and the
+discovery/parsing/closed-schema/range validation that produces `AppConfig`.
+Runtime-root canonicalization, Git-metadata rejection, GitHub target-override
+validation, Git top-level proof, clean-baseline checks, and artifact creation
+remain the responsibility of later milestones.
 """
 
 from __future__ import annotations
@@ -16,7 +15,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import cast
 
-from opencode_tools.domain import RunRequest, Workspace
+from opencode_tools.domain import (
+    AppConfig,
+    ConfigSource,
+    ExecutionConfig,
+    ProviderRetryConfig,
+    RunRequest,
+    Workspace,
+)
 from opencode_tools.errors import ConfigError
 
 CONVENTIONAL_CONFIG_FILENAME = "opencode-tools.toml"
@@ -39,6 +45,22 @@ _PROVIDER_RETRY_KEYS = frozenset(
 _RUNTIME_KEYS = frozenset({"root"})
 _GITHUB_KEYS = frozenset({"targets"})
 _GITHUB_TARGET_ENTRY_KEYS = frozenset({"remote", "repository"})
+
+_DEFAULT_OPENCODE_TIMEOUT_SECONDS = 1800
+_DEFAULT_UTILITY_TIMEOUT_SECONDS = 30
+_DEFAULT_TERMINATION_GRACE_SECONDS = 5
+_DEFAULT_MAX_REVIEW_CYCLES = 3
+_DEFAULT_MAX_ATTEMPTS = 3
+_DEFAULT_INITIAL_DELAY_SECONDS = 2
+_DEFAULT_MULTIPLIER = 2.0
+_DEFAULT_MAX_DELAY_SECONDS = 30
+_DEFAULT_RUNTIME_ROOT = ".opencode-tools"
+
+_CONFIG_SOURCE_BY_RAW = {
+    "explicit": ConfigSource.EXPLICIT,
+    "conventional": ConfigSource.CONVENTIONAL,
+    "defaults": ConfigSource.DEFAULTS,
+}
 
 
 def resolve_workspace(workspace: Path, *, cwd: Path) -> Workspace:
@@ -265,6 +287,90 @@ def load_raw_config(
     return RawConfig(source=source, path=resolved_path, data=data)
 
 
+def build_app_config(raw: RawConfig) -> AppConfig:
+    """Apply v1 defaults, ranges, and cross-field rules to produce `AppConfig`.
+
+    `raw.data` is already schema-shape-validated by `load_raw_config`; this
+    only fills in per-key defaults and enforces the scalar/cross-field rules
+    of `execution.*`, `provider_retry.*`, and `runtime.root`'s raw string.
+    """
+
+    execution_table = cast(Mapping[str, object], raw.data.get("execution", {}))
+    provider_retry_table = cast(
+        Mapping[str, object], raw.data.get("provider_retry", {})
+    )
+    runtime_table = cast(Mapping[str, object], raw.data.get("runtime", {}))
+
+    try:
+        execution = ExecutionConfig(
+            opencode_timeout_seconds=cast(
+                float,
+                execution_table.get(
+                    "opencode_timeout_seconds", _DEFAULT_OPENCODE_TIMEOUT_SECONDS
+                ),
+            ),
+            utility_timeout_seconds=cast(
+                float,
+                execution_table.get(
+                    "utility_timeout_seconds", _DEFAULT_UTILITY_TIMEOUT_SECONDS
+                ),
+            ),
+            termination_grace_seconds=cast(
+                float,
+                execution_table.get(
+                    "termination_grace_seconds", _DEFAULT_TERMINATION_GRACE_SECONDS
+                ),
+            ),
+            max_review_cycles=cast(
+                int,
+                execution_table.get("max_review_cycles", _DEFAULT_MAX_REVIEW_CYCLES),
+            ),
+        )
+        provider_retry = ProviderRetryConfig(
+            max_attempts=cast(
+                int, provider_retry_table.get("max_attempts", _DEFAULT_MAX_ATTEMPTS)
+            ),
+            initial_delay_seconds=cast(
+                float,
+                provider_retry_table.get(
+                    "initial_delay_seconds", _DEFAULT_INITIAL_DELAY_SECONDS
+                ),
+            ),
+            multiplier=cast(
+                float, provider_retry_table.get("multiplier", _DEFAULT_MULTIPLIER)
+            ),
+            max_delay_seconds=cast(
+                float,
+                provider_retry_table.get(
+                    "max_delay_seconds", _DEFAULT_MAX_DELAY_SECONDS
+                ),
+            ),
+        )
+        runtime_root = cast(str, runtime_table.get("root", _DEFAULT_RUNTIME_ROOT))
+        return AppConfig(
+            source=_CONFIG_SOURCE_BY_RAW[raw.source],
+            execution=execution,
+            provider_retry=provider_retry,
+            runtime_root=runtime_root,
+        )
+    except TypeError as error:
+        raise ConfigError("config.field_invalid_type", str(error)) from None
+    except ValueError as error:
+        raise ConfigError("config.field_invalid_value", str(error)) from None
+
+
+def load_app_config(
+    *,
+    config_path: Path | None,
+    workspace: Workspace,
+    cwd: Path,
+) -> AppConfig:
+    """Discover, parse, and fully validate the effective `AppConfig`."""
+
+    raw = load_raw_config(config_path=config_path, workspace=workspace, cwd=cwd)
+    return build_app_config(raw)
+
+
 def build_run_request(
     *,
     issue_number: int,
@@ -293,7 +399,9 @@ __all__ = (
     "CONVENTIONAL_CONFIG_FILENAME",
     "SUPPORTED_CONFIG_VERSION",
     "RawConfig",
+    "build_app_config",
     "build_run_request",
+    "load_app_config",
     "load_raw_config",
     "read_config_file",
     "resolve_config_source",

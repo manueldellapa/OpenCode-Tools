@@ -1,4 +1,4 @@
-"""Unit tests for config-file discovery, precedence, and closed-schema shape."""
+"""Unit tests for config discovery, precedence, schema shape, and validation."""
 
 from __future__ import annotations
 
@@ -9,11 +9,13 @@ import pytest
 from opencode_tools.config import (
     CONVENTIONAL_CONFIG_FILENAME,
     RawConfig,
+    build_app_config,
+    load_app_config,
     load_raw_config,
     read_config_file,
     resolve_config_source,
 )
-from opencode_tools.domain import Workspace
+from opencode_tools.domain import AppConfig, ConfigSource, Workspace
 from opencode_tools.errors import ConfigError
 
 FIXTURES_ROOT = Path(__file__).resolve().parents[1] / "fixtures" / "config"
@@ -27,6 +29,10 @@ def _make_workspace(tmp_path: Path) -> Workspace:
     workspace_dir = tmp_path / "workspace"
     workspace_dir.mkdir()
     return Workspace(root=workspace_dir.resolve())
+
+
+def _raw(data: dict[str, object], *, source: str = "defaults") -> RawConfig:
+    return RawConfig(source=source, path=None, data=data)
 
 
 # --- resolve_config_source: discovery and precedence ------------------------
@@ -262,3 +268,200 @@ def test_load_raw_config_is_reproducible_for_the_same_inputs(tmp_path: Path) -> 
     second = load_raw_config(config_path=None, workspace=workspace, cwd=tmp_path)
 
     assert first == second
+
+
+# --- build_app_config / load_app_config: defaults, ranges, cross-field -----
+
+
+def test_build_app_config_applies_all_v1_defaults() -> None:
+    config = build_app_config(_raw({"version": 1}))
+
+    assert config.source is ConfigSource.DEFAULTS
+    assert config.execution.opencode_timeout_seconds == 1800
+    assert config.execution.utility_timeout_seconds == 30
+    assert config.execution.termination_grace_seconds == 5
+    assert config.execution.max_review_cycles == 3
+    assert config.provider_retry.max_attempts == 3
+    assert config.provider_retry.initial_delay_seconds == 2
+    assert config.provider_retry.multiplier == 2.0
+    assert config.provider_retry.max_delay_seconds == 30
+    assert config.runtime_root == ".opencode-tools"
+
+
+def test_build_app_config_uses_explicit_values_from_data() -> None:
+    data: dict[str, object] = {
+        "version": 1,
+        "execution": {
+            "opencode_timeout_seconds": 900,
+            "utility_timeout_seconds": 15,
+            "termination_grace_seconds": 2,
+            "max_review_cycles": 5,
+        },
+        "provider_retry": {
+            "max_attempts": 4,
+            "initial_delay_seconds": 1,
+            "multiplier": 3.0,
+            "max_delay_seconds": 60,
+        },
+        "runtime": {"root": "custom-runtime"},
+    }
+
+    config = build_app_config(_raw(data, source="explicit"))
+
+    assert config.source is ConfigSource.EXPLICIT
+    assert config.execution.opencode_timeout_seconds == 900
+    assert config.execution.max_review_cycles == 5
+    assert config.provider_retry.max_attempts == 4
+    assert config.provider_retry.multiplier == 3.0
+    assert config.runtime_root == "custom-runtime"
+
+
+def test_load_app_config_applies_conventional_overrides_over_defaults(
+    tmp_path: Path,
+) -> None:
+    workspace = _make_workspace(tmp_path)
+    conventional = workspace.root / CONVENTIONAL_CONFIG_FILENAME
+    conventional.write_text(
+        "version = 1\n[execution]\nmax_review_cycles = 7\n",
+        encoding="utf-8",
+    )
+
+    config = load_app_config(config_path=None, workspace=workspace, cwd=tmp_path)
+
+    assert isinstance(config, AppConfig)
+    assert config.source is ConfigSource.CONVENTIONAL
+    assert config.execution.max_review_cycles == 7
+    assert config.execution.opencode_timeout_seconds == 1800
+
+
+@pytest.mark.parametrize(
+    ("section", "key", "value"),
+    [
+        ("execution", "opencode_timeout_seconds", True),
+        ("execution", "max_review_cycles", 3.0),
+        ("provider_retry", "max_attempts", 3.0),
+        ("provider_retry", "multiplier", True),
+    ],
+)
+def test_build_app_config_rejects_wrong_types(
+    section: str,
+    key: str,
+    value: object,
+) -> None:
+    data: dict[str, object] = {"version": 1, section: {key: value}}
+
+    with pytest.raises(ConfigError) as exc_info:
+        build_app_config(_raw(data))
+
+    assert exc_info.value.code == "config.field_invalid_type"
+
+
+@pytest.mark.parametrize(
+    ("section", "key", "value"),
+    [
+        ("execution", "opencode_timeout_seconds", 0),
+        ("execution", "opencode_timeout_seconds", 7201),
+        ("execution", "opencode_timeout_seconds", float("nan")),
+        ("execution", "opencode_timeout_seconds", float("inf")),
+        ("execution", "utility_timeout_seconds", 0),
+        ("execution", "utility_timeout_seconds", 301),
+        ("execution", "termination_grace_seconds", 0.05),
+        ("execution", "termination_grace_seconds", 60.1),
+        ("execution", "max_review_cycles", 0),
+        ("execution", "max_review_cycles", 21),
+        ("provider_retry", "max_attempts", 0),
+        ("provider_retry", "max_attempts", 11),
+        ("provider_retry", "initial_delay_seconds", 0.05),
+        ("provider_retry", "initial_delay_seconds", 300.1),
+        ("provider_retry", "multiplier", 1.0),
+        ("provider_retry", "multiplier", 10.0001),
+    ],
+)
+def test_build_app_config_rejects_out_of_range_values(
+    section: str,
+    key: str,
+    value: object,
+) -> None:
+    data: dict[str, object] = {"version": 1, section: {key: value}}
+
+    with pytest.raises(ConfigError) as exc_info:
+        build_app_config(_raw(data))
+
+    assert exc_info.value.code == "config.field_invalid_value"
+
+
+@pytest.mark.parametrize(
+    ("section", "key", "value"),
+    [
+        ("execution", "opencode_timeout_seconds", 1),
+        ("execution", "opencode_timeout_seconds", 7200),
+        ("execution", "max_review_cycles", 1),
+        ("execution", "max_review_cycles", 20),
+        ("provider_retry", "max_attempts", 1),
+        ("provider_retry", "max_attempts", 10),
+        ("provider_retry", "multiplier", 10.0),
+    ],
+)
+def test_build_app_config_accepts_boundary_values(
+    section: str,
+    key: str,
+    value: object,
+) -> None:
+    data: dict[str, object] = {"version": 1, section: {key: value}}
+
+    config = build_app_config(_raw(data))
+
+    assert getattr(getattr(config, section), key) == value
+
+
+def test_build_app_config_rejects_max_delay_below_initial_delay() -> None:
+    data: dict[str, object] = {
+        "version": 1,
+        "provider_retry": {"initial_delay_seconds": 10, "max_delay_seconds": 5},
+    }
+
+    with pytest.raises(ConfigError) as exc_info:
+        build_app_config(_raw(data))
+
+    assert exc_info.value.code == "config.field_invalid_value"
+
+
+def test_build_app_config_accepts_max_delay_equal_to_initial_delay() -> None:
+    data: dict[str, object] = {
+        "version": 1,
+        "provider_retry": {"initial_delay_seconds": 10, "max_delay_seconds": 10},
+    }
+
+    config = build_app_config(_raw(data))
+
+    assert config.provider_retry.max_delay_seconds == 10
+
+
+def test_build_app_config_rejects_max_delay_above_1800() -> None:
+    data: dict[str, object] = {
+        "version": 1,
+        "provider_retry": {"initial_delay_seconds": 0.1, "max_delay_seconds": 1800.1},
+    }
+
+    with pytest.raises(ConfigError) as exc_info:
+        build_app_config(_raw(data))
+
+    assert exc_info.value.code == "config.field_invalid_value"
+
+
+def test_build_app_config_rejects_an_empty_runtime_root() -> None:
+    data: dict[str, object] = {"version": 1, "runtime": {"root": "   "}}
+
+    with pytest.raises(ConfigError) as exc_info:
+        build_app_config(_raw(data))
+
+    assert exc_info.value.code == "config.field_invalid_value"
+
+
+def test_build_app_config_rejects_a_non_string_runtime_root() -> None:
+    data: dict[str, object] = {"version": 1, "runtime": {"root": 5}}
+
+    with pytest.raises(ConfigError) as exc_info:
+        build_app_config(_raw(data))
+
+    assert exc_info.value.code == "config.field_invalid_type"

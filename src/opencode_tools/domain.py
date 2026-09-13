@@ -93,6 +93,14 @@ class PersistenceStatus(StrEnum):
     INCOMPLETE = "INCOMPLETE"
 
 
+class ConfigSource(StrEnum):
+    """Where the effective v1 configuration came from."""
+
+    EXPLICIT = "EXPLICIT"
+    CONVENTIONAL = "CONVENTIONAL"
+    DEFAULTS = "DEFAULTS"
+
+
 _PROCESS_RESULT_OUTCOMES = frozenset(
     {
         RunOutcome.SUCCEEDED,
@@ -153,6 +161,18 @@ def _require_int(value: object, field_name: str, *, minimum: int) -> None:
         raise ValueError(f"{field_name} must be at least {minimum}")
 
 
+def _require_int_range(
+    value: object,
+    field_name: str,
+    *,
+    minimum: int,
+    maximum: int,
+) -> None:
+    _require_int(value, field_name, minimum=minimum)
+    if cast(int, value) > maximum:
+        raise ValueError(f"{field_name} must be at most {maximum}")
+
+
 def _require_optional_int(
     value: object,
     field_name: str,
@@ -181,6 +201,30 @@ def _finite_number(value: object, field_name: str, *, positive: bool) -> float:
         raise ValueError(f"{field_name} must be finite")
     if positive and normalized <= 0:
         raise ValueError(f"{field_name} must be greater than zero")
+    return normalized
+
+
+def _finite_range(
+    value: object,
+    field_name: str,
+    *,
+    minimum: float,
+    maximum: float,
+    minimum_exclusive: bool = False,
+) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise TypeError(f"{field_name} must be a finite number")
+    normalized = float(value)
+    if not isfinite(normalized):
+        raise ValueError(f"{field_name} must be finite")
+    lower_bound_ok = (
+        normalized > minimum if minimum_exclusive else normalized >= minimum
+    )
+    if not lower_bound_ok:
+        bound = f">{minimum}" if minimum_exclusive else f">={minimum}"
+        raise ValueError(f"{field_name} must be {bound}")
+    if normalized > maximum:
+        raise ValueError(f"{field_name} must be <={maximum}")
     return normalized
 
 
@@ -340,6 +384,118 @@ class RunRequest:
         _require_path(self.target_root, "target_root", absolute=True)
         if not self.target_root.is_relative_to(self.workspace.root):
             raise ValueError("target_root must be contained in workspace")
+
+
+@dataclass(frozen=True, slots=True)
+class ExecutionConfig:
+    """Bounded execution timing frozen by the v1 schema (System Design SS14.2)."""
+
+    opencode_timeout_seconds: float
+    utility_timeout_seconds: float
+    termination_grace_seconds: float
+    max_review_cycles: int
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "opencode_timeout_seconds",
+            _finite_range(
+                self.opencode_timeout_seconds,
+                "opencode_timeout_seconds",
+                minimum=1,
+                maximum=7200,
+            ),
+        )
+        object.__setattr__(
+            self,
+            "utility_timeout_seconds",
+            _finite_range(
+                self.utility_timeout_seconds,
+                "utility_timeout_seconds",
+                minimum=1,
+                maximum=300,
+            ),
+        )
+        object.__setattr__(
+            self,
+            "termination_grace_seconds",
+            _finite_range(
+                self.termination_grace_seconds,
+                "termination_grace_seconds",
+                minimum=0.1,
+                maximum=60,
+            ),
+        )
+        _require_int_range(
+            self.max_review_cycles,
+            "max_review_cycles",
+            minimum=1,
+            maximum=20,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class ProviderRetryConfig:
+    """Provider retry policy frozen by the v1 schema (System Design SS14.2)."""
+
+    max_attempts: int
+    initial_delay_seconds: float
+    multiplier: float
+    max_delay_seconds: float
+
+    def __post_init__(self) -> None:
+        _require_int_range(self.max_attempts, "max_attempts", minimum=1, maximum=10)
+        initial_delay = _finite_range(
+            self.initial_delay_seconds,
+            "initial_delay_seconds",
+            minimum=0.1,
+            maximum=300,
+        )
+        object.__setattr__(self, "initial_delay_seconds", initial_delay)
+        object.__setattr__(
+            self,
+            "multiplier",
+            _finite_range(
+                self.multiplier,
+                "multiplier",
+                minimum=1.0,
+                maximum=10.0,
+                minimum_exclusive=True,
+            ),
+        )
+        object.__setattr__(
+            self,
+            "max_delay_seconds",
+            _finite_range(
+                self.max_delay_seconds,
+                "max_delay_seconds",
+                minimum=initial_delay,
+                maximum=1800,
+            ),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class AppConfig:
+    """The fully validated, typed effective configuration for one run.
+
+    `github_targets` overrides and the canonical, Git-metadata-checked
+    `runtime.root` remain the responsibility of a later milestone;
+    `runtime_root` here is only the raw, non-empty schema string.
+    """
+
+    source: ConfigSource
+    execution: ExecutionConfig
+    provider_retry: ProviderRetryConfig
+    runtime_root: str
+
+    def __post_init__(self) -> None:
+        _require_exact_enum(self.source, ConfigSource, "source")
+        if not isinstance(self.execution, ExecutionConfig):
+            raise TypeError("execution must be ExecutionConfig")
+        if not isinstance(self.provider_retry, ProviderRetryConfig):
+            raise TypeError("provider_retry must be ProviderRetryConfig")
+        _require_non_empty(self.runtime_root, "runtime_root")
 
 
 @dataclass(frozen=True, slots=True)
@@ -1023,9 +1179,12 @@ __all__ = (
     "AgentResult",
     "AgentRole",
     "AgentStatus",
+    "AppConfig",
     "AttemptRecord",
+    "ConfigSource",
     "DomainRecord",
     "ErrorRecord",
+    "ExecutionConfig",
     "FinalStatus",
     "FrozenJsonValue",
     "GitCheckRecord",
@@ -1044,6 +1203,7 @@ __all__ = (
     "ProcessResult",
     "ProcessSpec",
     "ProviderDiagnostic",
+    "ProviderRetryConfig",
     "RepositoryIdentity",
     "ReviewStatus",
     "RunOutcome",
