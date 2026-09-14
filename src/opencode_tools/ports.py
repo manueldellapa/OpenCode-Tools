@@ -203,7 +203,14 @@ class RunStorePort(Protocol):
 
 
 class TargetLease(Protocol):
-    """A held, non-blocking lock on one canonical target, released on exit."""
+    """A held, non-blocking lock on one canonical target, released on exit.
+
+    Held from before the baseline until after finalization (System Design
+    SS16.2; ADR-006; M10-02). `__exit__` releases the underlying OS lock
+    unconditionally; the lock file itself is left on disk -- its presence
+    never implies an active lock, and nothing here ever guesses a lease
+    stale by PID or age.
+    """
 
     def __enter__(self) -> Self: ...
 
@@ -224,7 +231,20 @@ class TargetLeaseFactory(Protocol):
         runtime_root: Path,
         run_id: str,
     ) -> TargetLease:
-        """Acquire the lease for `target_root`, failing closed if held."""
+        """Acquire the lease for `target_root`, failing closed if held.
+
+        The lease's key is derived from `target_root`'s own absolute Git
+        directory, never from `runtime_root`: two checkouts or worktrees
+        with distinct Git directories get distinct leases and may proceed
+        in parallel, while different `runtime_root` values for the same
+        physical checkout never bypass the exclusion (System Design
+        SS16.2; ADR-006). A lease already held raises `PreflightError`
+        (`locking.target_locked`) before any agent runs, with whatever
+        diagnostic holder metadata is available; a filesystem without a
+        reliable advisory lock raises distinctly
+        (`locking.advisory_lock_unavailable`) instead of proceeding
+        unlocked.
+        """
         ...
 
 

@@ -50,6 +50,11 @@ itself and a `.probe` sentinel child covered by `git check-ignore
 --no-index` -- this module never edits `.gitignore` to make that true. A
 runtime root outside any Git working tree entirely needs no ignore check.
 
+`resolve_absolute_git_dir` (M10-02) is a thin, standalone wrapper around
+the same allowlisted `--absolute-git-dir` probe `resolve_target` already
+uses internally, exposed so `locking.py` can derive a target's lock
+coordination directory without repeating the full target preflight.
+
 This module never mutates Git state, never retries beyond the one bounded
 resample, and knows nothing about OpenCode.
 """
@@ -1563,6 +1568,52 @@ def check_runtime_location(
     )
 
 
+# =============================================================================
+# M10-02: absolute Git directory resolution for the target-scoped lock
+# =============================================================================
+
+
+def resolve_absolute_git_dir(
+    process_runner: ProcessRunner,
+    *,
+    git_executable: Path,
+    target_root: Path,
+    utility_timeout_seconds: float,
+    termination_grace_seconds: float,
+) -> Path:
+    """Resolve `target_root`'s absolute Git directory via
+    `git rev-parse --absolute-git-dir` (System Design SS16.2; ADR-006),
+    independent of the full target preflight in `resolve_target`.
+
+    `locking.py` calls this to derive the coordination directory
+    (`<git-dir>/opencode-tools/`) a target-scoped lease and quarantine
+    marker live under: two checkouts or worktrees with distinct Git
+    directories -- including a linked worktree, whose own `--absolute-
+    git-dir` differs from its main checkout's -- get distinct
+    coordination directories, so distinct leases (M10-02). A probe
+    failure fails closed with `PreflightError`, never guessed.
+    """
+
+    result, sink = _run_git_probe(
+        process_runner,
+        git_executable,
+        target_root,
+        _CMD_ABSOLUTE_GIT_DIR,
+        log_name="git-lock-git-dir.log",
+        cwd=target_root,
+        timeout_seconds=utility_timeout_seconds,
+        termination_grace_seconds=termination_grace_seconds,
+    )
+    _require_probe_succeeded(
+        result,
+        code="git_safety.lock_git_dir_probe_failed",
+        message="git rev-parse --absolute-git-dir did not complete successfully.",
+    )
+    return parse_git_common_dir(
+        _decode_probe_stdout(sink, code="git_safety.lock_git_dir_probe_failed")
+    )
+
+
 __all__ = (
     "ALLOWED_GIT_ARGV_TAILS",
     "GIT_STATE_FINGERPRINT_VERSION",
@@ -1591,6 +1642,7 @@ __all__ = (
     "parse_git_common_dir",
     "parse_index_manifest",
     "parse_porcelain_inventory",
+    "resolve_absolute_git_dir",
     "resolve_git_executable",
     "resolve_target",
     "split_null_terminated_records",
