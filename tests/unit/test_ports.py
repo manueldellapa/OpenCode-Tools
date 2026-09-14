@@ -253,7 +253,9 @@ class RecordingGitSafetyPort:
         self._target = target
         self._check = check
         self.resolve_calls: list[tuple[Workspace, Path]] = []
-        self.check_calls: list[tuple[TargetRepository, int, str, GitState | None]] = []
+        self.check_calls: list[
+            tuple[TargetRepository, int, str, AgentRole | None, GitState | None]
+        ] = []
 
     def resolve_target(
         self,
@@ -269,9 +271,10 @@ class RecordingGitSafetyPort:
         *,
         sequence: int,
         purpose: str,
+        role: AgentRole | None = None,
         baseline: GitState | None = None,
     ) -> GitCheckRecord:
-        self.check_calls.append((target, sequence, purpose, baseline))
+        self.check_calls.append((target, sequence, purpose, role, baseline))
         return self._check
 
 
@@ -446,7 +449,7 @@ def test_git_safety_port_resolves_targets_and_reports_checkpoints() -> None:
     assert resolved is target
     assert reported is check
     assert fake.resolve_calls == [(workspace, TARGET_ROOT)]
-    assert fake.check_calls == [(target, 0, "baseline", None)]
+    assert fake.check_calls == [(target, 0, "baseline", None, None)]
 
 
 def test_issue_resolver_port_resolves_repository_then_locates_the_issue() -> None:

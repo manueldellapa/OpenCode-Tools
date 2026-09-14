@@ -25,10 +25,16 @@ instability, permission error, escaping path, unsupported file type, or
 probe failure/ambiguity is classified `GitSafetyStatus.INDETERMINATE`
 rather than ever guessed `SAFE`.
 
-Per-attempt checkpoints, role mutation policy, change inventory, and
-postflight are out of scope here (M09-04/M09-05); this module never
-mutates Git state, never retries beyond the one bounded resample, and
-knows nothing about OpenCode.
+`check_git_state` (`GitSafetyPort.check`) compares one such capture against
+the last accepted checkpoint and applies the role mutation policy (M09-04):
+branch/HEAD drift is unsafe for any role; a fingerprint delta is expected
+and safe for the coder but unsafe for every other role. It also reports
+whether the target changed at all, the separate signal `retry.decide_retry`
+uses to suppress a coder's provider retry.
+
+Change inventory and postflight are out of scope here (M09-05); this
+module never mutates Git state, never retries beyond the one bounded
+resample, and knows nothing about OpenCode.
 """
 
 from __future__ import annotations
@@ -42,6 +48,8 @@ from datetime import datetime
 from pathlib import Path
 
 from opencode_tools.domain import (
+    AgentRole,
+    GitCheckRecord,
     GitSafetyStatus,
     GitState,
     ProcessResult,
@@ -1027,6 +1035,129 @@ def capture_git_state(
     )
 
 
+# =============================================================================
+# M09-04: checkpoint before/after and role mutation policy
+# =============================================================================
+
+
+def check_git_state(
+    process_runner: ProcessRunner,
+    *,
+    git_executable: Path,
+    target: TargetRepository,
+    clock: Clock,
+    sequence: int,
+    purpose: str,
+    role: AgentRole | None = None,
+    baseline: GitState | None = None,
+    utility_timeout_seconds: float,
+    termination_grace_seconds: float,
+) -> GitCheckRecord:
+    """Capture a checkpoint for `purpose` and compare it against `baseline`.
+
+    This is the concrete implementation of `GitSafetyPort.check` (System
+    Design SS11.3): call it immediately before and after every provider
+    attempt -- even one that fails to spawn, times out, or fails protocol
+    parsing. The verdict, in order:
+
+    - the underlying capture (`capture_git_state`, M09-03) was itself
+      `INDETERMINATE` (an unresolved race, a permission/escape/unsupported-
+      type error, or a probe failure) -> `INDETERMINATE`;
+    - `baseline` is `None` (nothing to compare against) but the capture is
+      incomplete (a detached `HEAD` or an unresolvable commit on what
+      should be a fresh baseline) -> `INDETERMINATE`, never guessed `SAFE`;
+    - `baseline` is `None` and the capture is complete -> `SAFE`;
+    - `branch`/`HEAD` differs from `baseline` -> `UNSAFE`, regardless of
+      `role` -- this is a bootstrap-level invariant, not a mutation the
+      coder is ever permitted;
+    - the fingerprint differs from `baseline` and `role` is not
+      `AgentRole.CODER` -> `UNSAFE`;
+    - the fingerprint differs and `role` is `AgentRole.CODER` -> `SAFE`,
+      the expected and inventoried outcome of a successful edit;
+    - otherwise (no drift, no delta) -> `SAFE`.
+
+    CRITICAL for callers: `role`'s tolerance must be scoped to comparing a
+    provider attempt's own `after` against that *same* attempt's own
+    `before` -- never to a `before` checkpoint compared against the *last
+    accepted* checkpoint (System Design SS11.3: "Un delta apparso fra due
+    attempt/fasi ... è GIT_SAFETY_ERROR prima dello spawn e non viene
+    attribuito al ruolo successivo"). Pass `role=None` for every `before`/
+    continuity check, no matter which role is about to run -- only that
+    role's own later `after` check, compared against its own `before`, may
+    pass its `AgentRole`. Passing the *upcoming* role to a continuity check
+    would incorrectly excuse an external mutation that happened between
+    phases (during backoff or a control-plane recheck, say) as if it were
+    that role's own doing.
+
+    `record.compared_to` is set to `baseline.fingerprint` (or `None` for
+    the first checkpoint); pass the result to `target_fingerprint_changed`
+    for the separate signal `retry.decide_retry` needs to suppress a
+    coder's provider retry.
+    """
+
+    capture = capture_git_state(
+        process_runner,
+        git_executable=git_executable,
+        target=target,
+        clock=clock,
+        utility_timeout_seconds=utility_timeout_seconds,
+        termination_grace_seconds=termination_grace_seconds,
+    )
+
+    compared_to = baseline.fingerprint if baseline is not None else None
+    safety_status: GitSafetyStatus
+
+    if capture.safety_status is GitSafetyStatus.INDETERMINATE:
+        safety_status = GitSafetyStatus.INDETERMINATE
+    elif baseline is None:
+        incomplete = capture.state.branch is None or capture.state.head is None
+        safety_status = (
+            GitSafetyStatus.INDETERMINATE if incomplete else GitSafetyStatus.SAFE
+        )
+    else:
+        branch_or_head_drifted = (
+            capture.state.branch != baseline.branch
+            or capture.state.head != baseline.head
+        )
+        fingerprint_delta_unsafe = (
+            capture.state.fingerprint != baseline.fingerprint
+            and role is not AgentRole.CODER
+        )
+        if branch_or_head_drifted or fingerprint_delta_unsafe:
+            safety_status = GitSafetyStatus.UNSAFE
+        else:
+            safety_status = GitSafetyStatus.SAFE
+
+    return GitCheckRecord(
+        sequence=sequence,
+        purpose=purpose,
+        process_results=capture.process_results,
+        state=capture.state,
+        safety_status=safety_status,
+        compared_to=compared_to,
+    )
+
+
+def target_fingerprint_changed(record: GitCheckRecord) -> bool:
+    """Return whether `record`'s fingerprint differs from what it was
+    compared against (`record.compared_to`, set by `check_git_state` to the
+    baseline's fingerprint).
+
+    Always `False` for a checkpoint with nothing to compare against (the
+    first-ever checkpoint, `compared_to is None`) and whenever `record`
+    is not itself `SAFE` -- an `UNSAFE`/`INDETERMINATE` checkpoint's own
+    fingerprint is not a trustworthy content signal, and every case where
+    it would matter (an architect/reviewer delta) is already `UNSAFE`
+    regardless of this signal. Feed the result to `retry.decide_retry`'s
+    `target_changed` parameter, which itself only acts on it for
+    `AgentRole.CODER`.
+    """
+
+    if record.compared_to is None or record.safety_status is not GitSafetyStatus.SAFE:
+        return False
+    return record.state.fingerprint != record.compared_to
+
+
 def resolve_target(
     process_runner: ProcessRunner,
     *,
@@ -1174,6 +1305,7 @@ __all__ = (
     "check_branch_attached",
     "check_clean_worktree",
     "check_git_argv_is_allowlisted",
+    "check_git_state",
     "check_not_bare",
     "check_top_level",
     "classify_lstat_mode",
@@ -1183,4 +1315,5 @@ __all__ = (
     "resolve_git_executable",
     "resolve_target",
     "split_null_terminated_records",
+    "target_fingerprint_changed",
 )
