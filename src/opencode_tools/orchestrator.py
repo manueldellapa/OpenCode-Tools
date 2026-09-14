@@ -14,11 +14,22 @@ continuous Git "before" checkpoint against the last *accepted* checkpoint
 (System Design line 689 -- a delta detected here is `GIT_SAFETY_ERROR`
 *before the spawn* and blocks invoking the agent at all), invoke the agent,
 capture the Git "after" checkpoint unconditionally (even on a technical
-failure), classify the attempt's technical outcome, decide -- but never
-act on -- a provider retry (`retry.decide_retry`, M12-04's own sleep/retry
-loop stays out of scope), and atomically persist a distinct, never
-overwritten `AttemptRecord` for the completed attempt (System Design SS8.3
-steps 8-9, SS15.4; M12-03).
+failure), classify the attempt's technical outcome, decide a provider retry
+(`retry.decide_retry`), and atomically persist a distinct, never overwritten
+`AttemptRecord` for the completed attempt (System Design SS8.3 steps 8-9,
+SS15.4; M12-03). `run_provider_attempts` is the thin loop around it that
+*acts* on that verdict (System Design SS12.2; M12-04): it sleeps the exact,
+already-capped backoff via the injected `Sleeper` and re-invokes with the
+next `provider_attempt` only while `decide_retry` keeps authorizing it,
+stopping -- with `provider_attempt`'s budget spent exactly, never over- or
+under-shot, and the review cycle untouched -- the moment it does not,
+whatever the reason (a non-`PROVIDER_ERROR` outcome, an untrusted or
+non-retryable diagnostic, attempt-budget exhaustion, unconfirmed
+termination, `UNSAFE`/`INDETERMINATE` Git, a coder's own target fingerprint
+having changed, a persistence failure, or a cancellation request). Which
+phase to transition to next, whether a review cycle should advance, and
+final status/gate decisions are still not this module's concern (System
+Design SS8.1/SS8.4, SS13.3; M13).
 
 `AgentRunner.run()` cannot itself call `protocol.parse_agent_response` --
 its Protocol carries no `IssueLocator`, and `AgentResult`/`ProcessResult`
@@ -40,14 +51,16 @@ available on the persisted `agent_result.process.outcome`.
 Cancellation (SH-001) and a `RunStorePort.persist` failure are both handled
 fail-closed and orthogonally to the technical outcome (System Design SS7.1):
 once either is observed, every subsequent `run_logical_invocation` call
-raises immediately, before opening a new sink, and a still-authorized
-provider retry is separately suppressed by `retry.decide_retry`'s own
-`cancellation_requested`/`persistence_status` guards -- so no retry is ever
-authorized, and therefore no backoff sleep is ever scheduled, once
-cancellation or a persistence failure has been observed. A logging failure
-inside the attempt's own log sink is detected via the resulting
-`AgentResult`; the affected child is already terminated by the lower-level
-`ProcessRunner` (System Design SS15.5) before this module ever sees it.
+raises immediately, before opening a new sink -- so `run_provider_attempts`
+never sleeps and never starts a next attempt either, the exception simply
+propagating out of its loop -- and a still-authorized provider retry is
+separately suppressed by `retry.decide_retry`'s own
+`cancellation_requested`/`persistence_status` guards for a cancellation or
+write fault observed *during* an attempt that itself still completed and
+persisted normally. A logging failure inside the attempt's own log sink is
+detected via the resulting `AgentResult`; the affected child is already
+terminated by the lower-level `ProcessRunner` (System Design SS15.5) before
+this module ever sees it.
 
 Full pipeline composition, the review rework loop, bootstrap (creating the
 run directory and the first `RunRecord`), and the `cli.py` composition root
@@ -71,12 +84,19 @@ from opencode_tools.domain import (
     PersistenceStatus,
     PipelinePhase,
     ProviderRetryConfig,
+    RetryDecision,
     RunOutcome,
     RunRecord,
     Workspace,
 )
 from opencode_tools.errors import LoggingError, RunInterruptedError
-from opencode_tools.ports import AgentRunner, Clock, GitSafetyPort, RunStorePort
+from opencode_tools.ports import (
+    AgentRunner,
+    Clock,
+    GitSafetyPort,
+    RunStorePort,
+    Sleeper,
+)
 from opencode_tools.retry import decide_retry
 from opencode_tools.state_machine import (
     AttemptPrecedence,
@@ -163,10 +183,12 @@ class LogicalInvocationResult:
     `git_after`, `precedence`, and `retry_decision` are all `None`;
     otherwise all four are present. `precedence` is this module's own
     technical classification (System Design SS13.2) and `retry_decision` is
-    `retry.decide_retry`'s verdict for this attempt -- both independent of,
-    and never silently reconciled with, `git_before`/`git_after`'s Git
-    safety status: every dimension is reported side by side, never
-    collapsed into one value (System Design SS7.1).
+    `retry.decide_retry`'s full verdict for this attempt -- including the
+    exact, already-capped `planned_delay_seconds` `run_provider_attempts`
+    sleeps before the next attempt -- both independent of, and never
+    silently reconciled with, `git_before`/`git_after`'s Git safety status:
+    every dimension is reported side by side, never collapsed into one
+    value (System Design SS7.1).
     """
 
     logical_invocation_id: str
@@ -177,7 +199,7 @@ class LogicalInvocationResult:
     agent_result: AgentResult | None
     git_after: GitCheckRecord | None
     precedence: AttemptPrecedence | None
-    retry_decision: bool | None
+    retry_decision: RetryDecision | None
     events: tuple[InvocationEvent, ...]
 
     def __post_init__(self) -> None:
@@ -220,8 +242,8 @@ class LogicalInvocationResult:
                 raise TypeError("git_after must be GitCheckRecord")
             if type(self.precedence) is not AttemptPrecedence:
                 raise TypeError("precedence must be AttemptPrecedence")
-            if type(self.retry_decision) is not bool:
-                raise TypeError("retry_decision must be a bool")
+            if type(self.retry_decision) is not RetryDecision:
+                raise TypeError("retry_decision must be RetryDecision")
 
         events = tuple(self.events)
         if not events:
@@ -325,6 +347,9 @@ class IssueOrchestrator:
     a way to signal the same fail-closed behavior; an `AgentResult` whose
     `process.outcome` is `INTERRUPTED` sets the same flag as a matter of
     course, since a child only reports `INTERRUPTED` after a caught signal.
+    `sleeper` is only ever driven by `run_provider_attempts`, with the exact
+    `planned_delay_seconds` `retry.decide_retry` already computed -- never a
+    real sleep in this module's own tests.
     """
 
     def __init__(
@@ -335,6 +360,7 @@ class IssueOrchestrator:
         run_store: RunStorePort,
         git_safety: GitSafetyPort,
         clock: Clock,
+        sleeper: Sleeper,
         provider_retry: ProviderRetryConfig,
     ) -> None:
         if type(initial_record) is not RunRecord:
@@ -349,6 +375,7 @@ class IssueOrchestrator:
         self._run_store = run_store
         self._git_safety = git_safety
         self._clock = clock
+        self._sleeper = sleeper
         self._provider_retry = provider_retry
         self._last_accepted_git_state: GitState | None = initial_record.git_baseline
         used_sequences = [check.sequence for check in initial_record.git_checks]
@@ -555,9 +582,67 @@ class IssueOrchestrator:
             agent_result=agent_result,
             git_after=after,
             precedence=precedence,
-            retry_decision=retry_decision.should_retry,
+            retry_decision=retry_decision,
             events=tuple(events),
         )
+
+    def run_provider_attempts(
+        self,
+        *,
+        role: AgentRole,
+        review_cycle: int | None,
+        prompt: str,
+        workspace: Workspace,
+    ) -> tuple[LogicalInvocationResult, ...]:
+        """Run every provider attempt of one logical invocation (SS12.2).
+
+        Starts at `provider_attempt=1` and repeatedly calls
+        `run_logical_invocation`, sleeping via the injected `Sleeper` for
+        exactly `retry_decision.planned_delay_seconds` between attempts, for
+        as long as -- and only as long as -- each attempt's own
+        `retry_decision.should_retry` authorizes another one. That verdict
+        already applies every guard (System Design SS12.2): a trusted,
+        still-budgeted `PROVIDER_ERROR`, confirmed termination, `SAFE` Git,
+        `OK` persistence, no cancellation, and -- for a coder -- an
+        unchanged target fingerprint. Attempt-budget exhaustion needs no
+        special handling here: `retry.decide_retry` simply stops authorizing
+        once `provider_attempt` reaches `provider_retry.max_attempts`, so
+        the loop ends having spent exactly that budget, the attempt's own
+        `PROVIDER_ERROR` precedence unchanged, and `review_cycle` never
+        touched (a provider retry never advances it; ADR-004). A blocked
+        invocation (git-before unsafe) or a raised `LoggingError`/
+        `RunInterruptedError` also ends the loop -- the latter two simply by
+        propagating, before any sleep. Returns every attempt actually run,
+        in order; deciding what happens next (a phase transition, a new
+        review cycle, final status) is still not this module's concern
+        (M13).
+        """
+
+        results: list[LogicalInvocationResult] = []
+        provider_attempt = 1
+        while True:
+            result = self.run_logical_invocation(
+                role=role,
+                review_cycle=review_cycle,
+                provider_attempt=provider_attempt,
+                prompt=prompt,
+                workspace=workspace,
+            )
+            results.append(result)
+
+            decision = result.retry_decision
+            if decision is None or not decision.should_retry:
+                return tuple(results)
+
+            next_attempt = decision.next_provider_attempt
+            delay = decision.planned_delay_seconds
+            if next_attempt is None or delay is None:
+                raise AssertionError(
+                    "RetryDecision.should_retry implies both "
+                    "next_provider_attempt and planned_delay_seconds are set"
+                )
+            self._sleeper.sleep(delay)
+            provider_attempt = next_attempt
 
 
 __all__ = (

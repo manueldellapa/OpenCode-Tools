@@ -1,21 +1,30 @@
-"""Unit tests for the attempt sequence, precedence, and persistence (M12-03).
+"""Unit tests for the attempt sequence, precedence, persistence, and provider
+retry (M12-04).
 
 Exercises `orchestrator.IssueOrchestrator` purely against `Fake`/`Recording`
 doubles written directly against `ports.py` `Protocol`s -- no subprocess, no
-real clock, no real Git or filesystem. Covers M12-02's acceptance criteria
-(the observable, invariant order of operations; every failure still
-performing its Git check; a higher-precedence outcome never being replaced
-while concurrent diagnostics are preserved; Git control-plane/branch/HEAD
-drift blocking before the next role) plus M12-03's: a distinct, never
-overwritten `AttemptRecord` persisted after every completed attempt; a
-`RunStorePort.persist` failure or a sink-open `LoggingError` blocking every
-subsequent invocation; a `process.outcome` of `LOGGING_ERROR`/`INTERRUPTED`
-folding into the same non-retryable precedence as `PROCESS_ERROR`; explicit
-and process-driven cancellation blocking subsequent invocations and
-suppressing an otherwise-authorized provider retry; and the persisted
-`RunRecord` never carrying the raw prompt. Resume, raw-log reconstruction,
-retention, CLI rendering, and the full retry/backoff loop remain out of
-scope (M12-04/M13).
+real clock, no real Git, filesystem, or sleep. Covers M12-02's acceptance
+criteria (the observable, invariant order of operations; every failure
+still performing its Git check; a higher-precedence outcome never being
+replaced while concurrent diagnostics are preserved; Git control-plane/
+branch/HEAD drift blocking before the next role), M12-03's (a distinct,
+never overwritten `AttemptRecord` persisted after every completed attempt;
+a `RunStorePort.persist` failure or a sink-open `LoggingError` blocking
+every subsequent invocation; a `process.outcome` of
+`LOGGING_ERROR`/`INTERRUPTED` folding into the same non-retryable precedence
+as `PROCESS_ERROR`; explicit and process-driven cancellation blocking
+subsequent invocations; and the persisted `RunRecord` never carrying the
+raw prompt), and M12-04's: `run_provider_attempts`'s guard matrix (a
+trusted, budgeted `PROVIDER_ERROR` retries; an untrusted or non-retryable
+diagnostic, unconfirmed termination, `UNSAFE` Git, or cancellation does
+not); recovery after a transient failure; exhaustion spending exactly the
+configured attempt budget without ever touching `review_cycle`; a coder's
+own target-fingerprint change suppressing retry while preserving its
+mutation; the exact, already-capped backoff delay passed to a fake
+`Sleeper`; and a persistence write failure or cancellation preventing both
+the sleep and the next attempt. Resume, raw-log reconstruction, retention,
+CLI rendering, review rework, and full pipeline composition remain out of
+scope (M13).
 """
 
 from __future__ import annotations
@@ -41,6 +50,7 @@ from opencode_tools.domain import (
     ProcessResult,
     ProviderDiagnostic,
     ProviderRetryConfig,
+    RetryDecision,
     ReviewStatus,
     RunOutcome,
     RunRecord,
@@ -269,6 +279,15 @@ def _pipeline_state(*, role: AgentRole, review_cycle: int | None) -> PipelineSta
     return PipelineState(phase=_PHASE_BY_ROLE[role], review_cycle=review_cycle)
 
 
+def _no_retry_decision() -> RetryDecision:
+    return RetryDecision(
+        should_retry=False,
+        next_provider_attempt=None,
+        planned_delay_seconds=None,
+        retry_suppressed_due_to_target_change=False,
+    )
+
+
 class RecordingAttemptLogSink:
     """A minimal `AttemptLogSink` fake that records writes and closing."""
 
@@ -365,6 +384,38 @@ class ScriptedAgentRunner:
         return self._result
 
 
+class QueuedAgentRunner:
+    """An `AgentRunner` fake returning one scripted result per call, in order.
+
+    Unlike `ScriptedAgentRunner`, whose single `_result` only changes when a
+    test explicitly calls `queue_result` between two of its own calls, this
+    fake is for `IssueOrchestrator.run_provider_attempts`'s own internal
+    multi-attempt loop, where no test code runs between calls to inject the
+    next result.
+    """
+
+    def __init__(self, results: list[AgentResult]) -> None:
+        self._results = list(results)
+        self.calls: list[
+            tuple[AgentRole, str, Workspace, int | None, int, AttemptLogSink]
+        ] = []
+
+    def run(
+        self,
+        role: AgentRole,
+        prompt: str,
+        workspace: Workspace,
+        *,
+        review_cycle: int | None,
+        provider_attempt: int,
+        sink: AttemptLogSink,
+    ) -> AgentResult:
+        self.calls.append(
+            (role, prompt, workspace, review_cycle, provider_attempt, sink)
+        )
+        return self._results.pop(0)
+
+
 class CancellingAgentRunner:
     """An `AgentRunner` fake that requests cancellation as a side effect.
 
@@ -447,6 +498,16 @@ class SteppingClock:
         raise AssertionError("not exercised by this issue's orchestrator scope")
 
 
+class RecordingSleeper:
+    """A `Sleeper` fake that records requested delays without ever sleeping."""
+
+    def __init__(self) -> None:
+        self.calls: list[float] = []
+
+    def sleep(self, seconds: float) -> None:
+        self.calls.append(seconds)
+
+
 def _orchestrator(
     *,
     call_log: list[str],
@@ -458,6 +519,8 @@ def _orchestrator(
     target: TargetRepository | None = None,
     persist_results: list[PersistenceStatus] | None = None,
     fail_open: bool = False,
+    sleeper: RecordingSleeper | None = None,
+    provider_retry: ProviderRetryConfig | None = None,
 ) -> tuple[
     IssueOrchestrator,
     RecordingRunStorePort,
@@ -476,7 +539,10 @@ def _orchestrator(
         run_store=run_store,
         git_safety=git_safety,
         clock=clock,
-        provider_retry=_provider_retry_config(),
+        sleeper=sleeper if sleeper is not None else RecordingSleeper(),
+        provider_retry=(
+            provider_retry if provider_retry is not None else _provider_retry_config()
+        ),
     )
     return orchestrator, run_store, agent_runner, git_safety
 
@@ -589,6 +655,7 @@ def test_orchestrator_rejects_an_initial_record_of_the_wrong_type() -> None:
             run_store=RecordingRunStorePort([], sink=RecordingAttemptLogSink()),
             git_safety=RecordingGitSafetyPort([], []),
             clock=SteppingClock(start=NOW),
+            sleeper=RecordingSleeper(),
             provider_retry=_provider_retry_config(),
         )
 
@@ -606,6 +673,7 @@ def test_orchestrator_rejects_a_provider_retry_of_the_wrong_type() -> None:
             run_store=RecordingRunStorePort([], sink=RecordingAttemptLogSink()),
             git_safety=RecordingGitSafetyPort([], []),
             clock=SteppingClock(start=NOW),
+            sleeper=RecordingSleeper(),
             provider_retry=cast(ProviderRetryConfig, object()),
         )
 
@@ -662,7 +730,8 @@ def test_run_logical_invocation_follows_the_canonical_order_when_safe() -> None:
     assert result.git_before is git_results[0]
     assert result.git_after is git_results[1]
     assert result.agent_result is agent_result
-    assert result.retry_decision is False
+    assert result.retry_decision is not None
+    assert result.retry_decision.should_retry is False
     assert [event.kind for event in result.events] == [
         InvocationEventKind.INVOCATION_STARTED,
         InvocationEventKind.ATTEMPT_SINK_OPENED,
@@ -933,8 +1002,10 @@ def test_run_logical_invocation_assigns_the_same_identity_across_provider_attemp
     assert first.logical_invocation_id == second.logical_invocation_id
     assert first.provider_attempt == 1
     assert second.provider_attempt == 2
-    assert first.retry_decision is True  # a retryable provider error, budget left
-    assert second.retry_decision is False  # a clean success
+    assert first.retry_decision is not None
+    assert first.retry_decision.should_retry is True  # retryable, budget left
+    assert second.retry_decision is not None
+    assert second.retry_decision.should_retry is False  # a clean success
 
 
 def test_run_logical_invocation_rejects_architect_with_a_review_cycle() -> None:
@@ -1648,6 +1719,7 @@ def test_cancellation_requested_during_the_attempt_suppresses_an_otherwise_autho
         run_store=run_store,
         git_safety=git_safety,
         clock=SteppingClock(start=NOW),
+        sleeper=RecordingSleeper(),
         provider_retry=_provider_retry_config(),
     )
     orchestrator_box.append(orchestrator)
@@ -1663,7 +1735,400 @@ def test_cancellation_requested_during_the_attempt_suppresses_an_otherwise_autho
     assert cancelling_runner.calls == 1
     assert result.precedence is not None
     assert result.precedence.outcome is RunOutcome.PROVIDER_ERROR  # retryable in itself
-    assert result.retry_decision is False  # ... yet suppressed by cancellation
+    assert result.retry_decision is not None
+    assert result.retry_decision.should_retry is False  # ... suppressed by cancellation
+
+
+# --- Provider retry loop: guard matrix, recovery, exhaustion (M12-04) -------
+
+
+def test_run_provider_attempts_retries_a_trusted_error_then_recovers() -> None:
+    diagnostic = _provider_diagnostic(retryable=True)
+    first_attempt = _agent_result(
+        role=AgentRole.CODER,
+        review_cycle=1,
+        provider_attempt=1,
+        outcome=RunOutcome.PROVIDER_ERROR,
+        provider_diagnostic=diagnostic,
+    )
+    second_attempt = _agent_result(
+        role=AgentRole.CODER,
+        review_cycle=1,
+        provider_attempt=2,
+        terminal_response=_success_response(AgentRole.CODER),
+    )
+    sleeper = RecordingSleeper()
+    run_store = RecordingRunStorePort([], sink=RecordingAttemptLogSink())
+    git_safety = RecordingGitSafetyPort(
+        [], [*_safe_pair_unchanged(), *_safe_pair_unchanged()]
+    )
+    agent_runner = QueuedAgentRunner([first_attempt, second_attempt])
+    orchestrator = IssueOrchestrator(
+        initial_record=_initial_record(run_id="run-001", target=_target()),
+        agent_runner=agent_runner,
+        run_store=run_store,
+        git_safety=git_safety,
+        clock=SteppingClock(start=NOW),
+        sleeper=sleeper,
+        provider_retry=_provider_retry_config(),
+    )
+
+    results = orchestrator.run_provider_attempts(
+        role=AgentRole.CODER,
+        review_cycle=1,
+        prompt="Implement the fix.",
+        workspace=_workspace(),
+    )
+
+    assert [result.provider_attempt for result in results] == [1, 2]
+    assert len(agent_runner.calls) == 2
+    assert sleeper.calls == [1.0]  # compute_backoff_delay_seconds(1, config)
+    assert results[0].retry_decision is not None
+    assert results[0].retry_decision.should_retry is True
+    assert results[1].retry_decision is not None
+    assert results[1].retry_decision.should_retry is False
+    assert len(run_store.persist_calls) == 2
+
+    # source/signature stay intact on the persisted attempt that carried them.
+    first_persisted_attempt = run_store.persist_calls[0].attempts[0]
+    assert first_persisted_attempt.agent_result.provider_diagnostic is not None
+    assert first_persisted_attempt.agent_result.provider_diagnostic.source == (
+        diagnostic.source
+    )
+    assert first_persisted_attempt.agent_result.provider_diagnostic.signature == (
+        diagnostic.signature
+    )
+
+
+def test_run_provider_attempts_does_not_retry_an_untrusted_lookalike_diagnostic() -> (
+    None
+):
+    """AC: "Lookalike non trusted non ritenta" -- a diagnostic is present
+    (the attempt still classifies as `PROVIDER_ERROR`) but is not itself
+    marked retryable, so no retry is authorized."""
+
+    sleeper = RecordingSleeper()
+    orchestrator, _run_store, agent_runner, _git_safety = _orchestrator(
+        call_log=[],
+        sink=RecordingAttemptLogSink(),
+        agent_result=_agent_result(
+            role=AgentRole.CODER,
+            review_cycle=1,
+            provider_attempt=1,
+            outcome=RunOutcome.PROVIDER_ERROR,
+            provider_diagnostic=_provider_diagnostic(retryable=False),
+        ),
+        git_results=_safe_pair_unchanged(),
+        clock=SteppingClock(start=NOW),
+        sleeper=sleeper,
+    )
+
+    results = orchestrator.run_provider_attempts(
+        role=AgentRole.CODER,
+        review_cycle=1,
+        prompt="Implement the fix.",
+        workspace=_workspace(),
+    )
+
+    assert len(results) == 1
+    assert len(agent_runner.calls) == 1
+    assert sleeper.calls == []
+    assert results[0].precedence is not None
+    assert results[0].precedence.outcome is RunOutcome.PROVIDER_ERROR
+    assert results[0].retry_decision is not None
+    assert results[0].retry_decision.should_retry is False
+
+
+def test_run_provider_attempts_stops_after_unconfirmed_termination() -> None:
+    """`termination_confirmed` is read straight from the process result,
+    independent of the classified outcome: a `PROVIDER_ERROR` precedence
+    (the diagnostic's own presence outranks a concurrent `PROCESS_ERROR`
+    signal, System Design SS13.2) still respects an unconfirmed process
+    join as its own, separate retry guard."""
+
+    sleeper = RecordingSleeper()
+    orchestrator, _run_store, agent_runner, _git_safety = _orchestrator(
+        call_log=[],
+        sink=RecordingAttemptLogSink(),
+        agent_result=_agent_result(
+            role=AgentRole.CODER,
+            review_cycle=1,
+            provider_attempt=1,
+            outcome=RunOutcome.PROVIDER_ERROR,
+            provider_diagnostic=_provider_diagnostic(retryable=True),
+            process=_agent_process_result(
+                outcome=RunOutcome.PROCESS_ERROR,
+                return_code=1,
+                termination_confirmed=False,
+            ),
+        ),
+        git_results=_safe_pair_unchanged(),
+        clock=SteppingClock(start=NOW),
+        sleeper=sleeper,
+    )
+
+    results = orchestrator.run_provider_attempts(
+        role=AgentRole.CODER,
+        review_cycle=1,
+        prompt="Implement the fix.",
+        workspace=_workspace(),
+    )
+
+    assert len(results) == 1
+    assert len(agent_runner.calls) == 1
+    assert sleeper.calls == []
+    assert results[0].retry_decision is not None
+    assert results[0].retry_decision.should_retry is False
+
+
+def test_run_provider_attempts_stops_after_an_unsafe_git_after() -> None:
+    sleeper = RecordingSleeper()
+    unsafe_after_pair = [
+        _git_check(
+            sequence=0, purpose="before", state=_git_state(fingerprint="fp-unchanged")
+        ),
+        _git_check(
+            sequence=1,
+            purpose="after",
+            safety_status=GitSafetyStatus.UNSAFE,
+            state=_git_state(fingerprint="fp-unchanged"),
+        ),
+    ]
+    orchestrator, _run_store, agent_runner, _git_safety = _orchestrator(
+        call_log=[],
+        sink=RecordingAttemptLogSink(),
+        agent_result=_agent_result(
+            role=AgentRole.CODER,
+            review_cycle=1,
+            provider_attempt=1,
+            outcome=RunOutcome.PROVIDER_ERROR,
+            provider_diagnostic=_provider_diagnostic(retryable=True),
+        ),
+        git_results=unsafe_after_pair,
+        clock=SteppingClock(start=NOW),
+        sleeper=sleeper,
+    )
+
+    results = orchestrator.run_provider_attempts(
+        role=AgentRole.CODER,
+        review_cycle=1,
+        prompt="Implement the fix.",
+        workspace=_workspace(),
+    )
+
+    assert len(results) == 1
+    assert len(agent_runner.calls) == 1
+    assert sleeper.calls == []
+    assert results[0].retry_decision is not None
+    assert results[0].retry_decision.should_retry is False
+
+
+def test_run_provider_attempts_stops_and_preserves_output_on_a_coder_mutation() -> None:
+    """AC: "Coder mutation sopprime retry e preserva modifiche" -- a changed
+    target fingerprint on a coder attempt suppresses the retry outright
+    (`retry_suppressed_due_to_target_change`), rather than letting a fresh
+    attempt overwrite the coder's own partial work."""
+
+    sleeper = RecordingSleeper()
+    orchestrator, _run_store, agent_runner, _git_safety = _orchestrator(
+        call_log=[],
+        sink=RecordingAttemptLogSink(),
+        agent_result=_agent_result(
+            role=AgentRole.CODER,
+            review_cycle=1,
+            provider_attempt=1,
+            outcome=RunOutcome.PROVIDER_ERROR,
+            provider_diagnostic=_provider_diagnostic(retryable=True),
+        ),
+        git_results=_safe_pair(),  # before/after fingerprints differ
+        clock=SteppingClock(start=NOW),
+        sleeper=sleeper,
+    )
+
+    results = orchestrator.run_provider_attempts(
+        role=AgentRole.CODER,
+        review_cycle=1,
+        prompt="Implement the fix.",
+        workspace=_workspace(),
+    )
+
+    assert len(results) == 1
+    assert len(agent_runner.calls) == 1
+    assert sleeper.calls == []
+    assert results[0].retry_decision is not None
+    assert results[0].retry_decision.should_retry is False
+    assert results[0].retry_decision.retry_suppressed_due_to_target_change is True
+
+
+def test_run_provider_attempts_exhausts_the_budget_without_touching_review_cycle() -> (
+    None
+):
+    config = ProviderRetryConfig(
+        max_attempts=3,
+        initial_delay_seconds=1.0,
+        multiplier=2.0,
+        max_delay_seconds=30.0,
+    )
+    diagnostic = _provider_diagnostic(retryable=True)
+    agent_results = [
+        _agent_result(
+            role=AgentRole.CODER,
+            review_cycle=1,
+            provider_attempt=attempt,
+            outcome=RunOutcome.PROVIDER_ERROR,
+            provider_diagnostic=diagnostic,
+        )
+        for attempt in (1, 2, 3)
+    ]
+    sleeper = RecordingSleeper()
+    run_store = RecordingRunStorePort([], sink=RecordingAttemptLogSink())
+    git_safety = RecordingGitSafetyPort(
+        [],
+        [*_safe_pair_unchanged(), *_safe_pair_unchanged(), *_safe_pair_unchanged()],
+    )
+    agent_runner = QueuedAgentRunner(agent_results)
+    orchestrator = IssueOrchestrator(
+        initial_record=_initial_record(run_id="run-001", target=_target()),
+        agent_runner=agent_runner,
+        run_store=run_store,
+        git_safety=git_safety,
+        clock=SteppingClock(start=NOW),
+        sleeper=sleeper,
+        provider_retry=config,
+    )
+
+    results = orchestrator.run_provider_attempts(
+        role=AgentRole.CODER,
+        review_cycle=1,
+        prompt="Implement the fix.",
+        workspace=_workspace(),
+    )
+
+    assert [result.provider_attempt for result in results] == [1, 2, 3]
+    assert len(agent_runner.calls) == 3  # exactly the configured budget, no more
+    assert sleeper.calls == [1.0, 2.0]  # two sleeps between three attempts
+    assert [result.state.review_cycle for result in results] == [1, 1, 1]
+    assert results[-1].retry_decision is not None
+    assert results[-1].retry_decision.should_retry is False  # budget exhausted
+    assert results[-1].precedence is not None
+    assert results[-1].precedence.outcome is RunOutcome.PROVIDER_ERROR
+    assert len(run_store.persist_calls) == 3
+
+
+def test_run_provider_attempts_uses_the_exact_capped_backoff_delay() -> None:
+    config = ProviderRetryConfig(
+        max_attempts=4,
+        initial_delay_seconds=1.0,
+        multiplier=3.0,
+        max_delay_seconds=5.0,
+    )
+    diagnostic = _provider_diagnostic(retryable=True)
+    agent_results = [
+        _agent_result(
+            role=AgentRole.CODER,
+            review_cycle=1,
+            provider_attempt=attempt,
+            outcome=RunOutcome.PROVIDER_ERROR,
+            provider_diagnostic=diagnostic,
+        )
+        for attempt in (1, 2, 3, 4)
+    ]
+    sleeper = RecordingSleeper()
+    run_store = RecordingRunStorePort([], sink=RecordingAttemptLogSink())
+    git_safety = RecordingGitSafetyPort([], [*_safe_pair_unchanged()] * 4)
+    agent_runner = QueuedAgentRunner(agent_results)
+    orchestrator = IssueOrchestrator(
+        initial_record=_initial_record(run_id="run-001", target=_target()),
+        agent_runner=agent_runner,
+        run_store=run_store,
+        git_safety=git_safety,
+        clock=SteppingClock(start=NOW),
+        sleeper=sleeper,
+        provider_retry=config,
+    )
+
+    orchestrator.run_provider_attempts(
+        role=AgentRole.CODER,
+        review_cycle=1,
+        prompt="Implement the fix.",
+        workspace=_workspace(),
+    )
+
+    # delay(1)=1.0, delay(2)=3.0, delay(3)=9.0 capped to max_delay_seconds=5.0
+    assert sleeper.calls == [1.0, 3.0, 5.0]
+
+
+def test_run_provider_attempts_raises_and_never_sleeps_on_a_persist_failure() -> None:
+    sleeper = RecordingSleeper()
+    orchestrator, run_store, agent_runner, _git_safety = _orchestrator(
+        call_log=[],
+        sink=RecordingAttemptLogSink(),
+        agent_result=_agent_result(
+            role=AgentRole.CODER,
+            review_cycle=1,
+            provider_attempt=1,
+            outcome=RunOutcome.PROVIDER_ERROR,
+            provider_diagnostic=_provider_diagnostic(retryable=True),
+        ),
+        git_results=_safe_pair_unchanged(),
+        clock=SteppingClock(start=NOW),
+        sleeper=sleeper,
+        persist_results=[PersistenceStatus.FAILED],
+    )
+
+    with pytest.raises(LoggingError):
+        orchestrator.run_provider_attempts(
+            role=AgentRole.CODER,
+            review_cycle=1,
+            prompt="Implement the fix.",
+            workspace=_workspace(),
+        )
+
+    assert len(agent_runner.calls) == 1
+    assert sleeper.calls == []
+    assert len(run_store.persist_calls) == 1
+
+
+def test_run_provider_attempts_stops_after_cancellation_observed_mid_attempt() -> None:
+    sleeper = RecordingSleeper()
+    agent_result = _agent_result(
+        role=AgentRole.CODER,
+        review_cycle=1,
+        provider_attempt=1,
+        outcome=RunOutcome.PROVIDER_ERROR,
+        provider_diagnostic=_provider_diagnostic(retryable=True),
+    )
+    call_log: list[str] = []
+    run_store = RecordingRunStorePort(call_log, sink=RecordingAttemptLogSink())
+    git_safety = RecordingGitSafetyPort(call_log, _safe_pair_unchanged())
+    orchestrator_box: list[IssueOrchestrator] = []
+    cancelling_runner = CancellingAgentRunner(
+        result=agent_result,
+        on_run=lambda: orchestrator_box[0].request_cancellation(),
+    )
+    orchestrator = IssueOrchestrator(
+        initial_record=_initial_record(run_id="run-001", target=_target()),
+        agent_runner=cancelling_runner,
+        run_store=run_store,
+        git_safety=git_safety,
+        clock=SteppingClock(start=NOW),
+        sleeper=sleeper,
+        provider_retry=_provider_retry_config(),
+    )
+    orchestrator_box.append(orchestrator)
+
+    results = orchestrator.run_provider_attempts(
+        role=AgentRole.CODER,
+        review_cycle=1,
+        prompt="Implement the fix.",
+        workspace=_workspace(),
+    )
+
+    assert len(results) == 1
+    assert cancelling_runner.calls == 1
+    assert sleeper.calls == []
+    assert results[0].retry_decision is not None
+    assert results[0].retry_decision.should_retry is False
 
 
 # --- Typed result construction with orthogonal fields -----------------------
@@ -1685,7 +2150,7 @@ def test_logical_invocation_result_requires_matching_phase_for_role() -> None:
             precedence=AttemptPrecedence(
                 outcome=RunOutcome.SUCCEEDED, concurrent_signals=(RunOutcome.SUCCEEDED,)
             ),
-            retry_decision=False,
+            retry_decision=_no_retry_decision(),
             events=(
                 InvocationEvent(
                     sequence=0,
@@ -1741,7 +2206,7 @@ def test_logical_invocation_result_requires_a_blocked_result_to_have_no_retry_de
             agent_result=None,
             git_after=None,
             precedence=None,
-            retry_decision=False,
+            retry_decision=_no_retry_decision(),
             events=(
                 InvocationEvent(
                     sequence=0,
@@ -1781,7 +2246,7 @@ def test_logical_invocation_result_requires_an_unblocked_result_to_have_a_retry_
     None
 ):
     safe_before = _git_check(sequence=0, purpose="before")
-    with pytest.raises(TypeError, match="retry_decision must be a bool"):
+    with pytest.raises(TypeError, match="retry_decision must be RetryDecision"):
         LogicalInvocationResult(
             logical_invocation_id="run-001:CODER:1",
             role=AgentRole.CODER,
@@ -1821,7 +2286,7 @@ def test_logical_invocation_result_requires_agent_result_role_to_match() -> None
             precedence=AttemptPrecedence(
                 outcome=RunOutcome.SUCCEEDED, concurrent_signals=(RunOutcome.SUCCEEDED,)
             ),
-            retry_decision=False,
+            retry_decision=_no_retry_decision(),
             events=(
                 InvocationEvent(
                     sequence=0,
@@ -1847,7 +2312,7 @@ def test_logical_invocation_result_rejects_empty_events() -> None:
             precedence=AttemptPrecedence(
                 outcome=RunOutcome.SUCCEEDED, concurrent_signals=(RunOutcome.SUCCEEDED,)
             ),
-            retry_decision=False,
+            retry_decision=_no_retry_decision(),
             events=(),
         )
 
@@ -1867,7 +2332,7 @@ def test_logical_invocation_result_rejects_non_sequential_events() -> None:
             precedence=AttemptPrecedence(
                 outcome=RunOutcome.SUCCEEDED, concurrent_signals=(RunOutcome.SUCCEEDED,)
             ),
-            retry_decision=False,
+            retry_decision=_no_retry_decision(),
             events=(
                 InvocationEvent(
                     sequence=1,
@@ -1905,7 +2370,7 @@ def test_logical_invocation_result_keeps_git_and_technical_dimensions_orthogonal
         precedence=AttemptPrecedence(
             outcome=RunOutcome.SUCCEEDED, concurrent_signals=(RunOutcome.SUCCEEDED,)
         ),
-        retry_decision=False,
+        retry_decision=_no_retry_decision(),
         events=(
             InvocationEvent(
                 sequence=0, kind=InvocationEventKind.INVOCATION_STARTED, timestamp=NOW
