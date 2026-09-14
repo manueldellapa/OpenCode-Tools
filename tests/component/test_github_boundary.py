@@ -53,6 +53,7 @@ TERMINATION_GRACE_SECONDS = 1.0
 
 GIT_EXECUTABLE = resolve_git_executable()
 FAKE_GH = Path(__file__).resolve().parent / "helpers" / "fake_gh.py"
+AGENT_DEFINITIONS_DIR = Path(__file__).resolve().parents[2] / ".opencode" / "agents"
 
 # A short bound for the deliberate-timeout scenario, so that test stays
 # fast; `FAKE_GH_AUTH_SLEEP_SECONDS` is set well above this in that test.
@@ -184,6 +185,54 @@ def test_zero_remotes_and_no_override_fails_closed(tmp_path: Path) -> None:
         _resolve_identity(workspace, repo)
 
     assert exc_info.value.code == "github.no_unique_identity"
+
+
+def test_a_populated_opencode_agents_directory_does_not_interfere_with_identity(
+    tmp_path: Path,
+) -> None:
+    """A real target repository using this tool -- once M11-04 ships --
+    carries a committed `.opencode/agents/` directory alongside its normal
+    `origin` remote. Identity resolution reads Git remotes only (System
+    Design SS17.1); it must succeed exactly as it does for any other
+    tracked, committed content (M11-04, integration point named by the
+    issue breakdown's own "File/componenti previsti" line for this
+    milestone).
+    """
+
+    workspace = _workspace(tmp_path / "workspace")
+    repo = _init_repo(workspace.root / "repo")
+    _add_remote(repo, "origin", "https://github.com/owner/repo.git")
+
+    agents_dir = repo / ".opencode" / "agents"
+    agents_dir.mkdir(parents=True)
+    for definition in sorted(AGENT_DEFINITIONS_DIR.glob("*.md")):
+        (agents_dir / definition.name).write_text(
+            definition.read_text(encoding="utf-8"), encoding="utf-8"
+        )
+    _git(["add", "-A"], cwd=repo)
+    _git(
+        [
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.com",
+            "commit",
+            "--quiet",
+            "-m",
+            "add opencode agent definitions",
+        ],
+        cwd=repo,
+    )
+
+    identity = _resolve_identity(workspace, repo)
+
+    assert identity == RepositoryIdentity(
+        host="github.com",
+        owner="owner",
+        repository="repo",
+        source="origin",
+        remote_name="origin",
+    )
 
 
 # =============================================================================
