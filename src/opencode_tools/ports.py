@@ -133,9 +133,23 @@ class GitSafetyPort(Protocol):
         *,
         sequence: int,
         purpose: str,
+        role: AgentRole | None = None,
         baseline: GitState | None = None,
     ) -> GitCheckRecord:
-        """Capture a checkpoint for `purpose`, comparing against `baseline`."""
+        """Capture a checkpoint for `purpose`, comparing against `baseline`.
+
+        Branch/HEAD drift is unsafe regardless of `role`; a fingerprint
+        delta is expected and safe for `AgentRole.CODER` while unsafe for
+        every other role (System Design SS11.3). `role`'s tolerance must be
+        scoped to a provider attempt's own `after` compared against that
+        *same* attempt's own `before` -- pass `role=None` for every
+        `before`/continuity check against the *last accepted* checkpoint,
+        no matter which role is about to run, or an external mutation
+        between phases (during backoff or a control-plane recheck, say)
+        would be incorrectly excused as that role's own doing. `role` is
+        unused for the first-ever checkpoint (`baseline=None`), which has
+        nothing to compare against.
+        """
         ...
 
 
