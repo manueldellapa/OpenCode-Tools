@@ -1,18 +1,21 @@
-"""Unit tests for GitHub repository identity resolution in `github.py`
-(M11-01; ADR-007; System Design SS17.1).
+"""Unit tests for GitHub repository identity resolution and `gh` preflight
+in `github.py` (M11-01, M11-02; ADR-007; System Design SS17.1/SS17.2).
 
 Every test here is pure: no subprocess is spawned and no real Git
 repository is touched. URL parsing and `git remote -v` output parsing are
 tested directly against literal strings; the full precedence/ambiguity
 decision logic is tested directly against `RemoteFetchUrl` tuples built in
 memory, via `resolve_repository_identity_from_remotes` -- never through a
-`ProcessRunner`. Component-level, real-repository wiring for
-`resolve_repository_identity` itself lives in
-`tests/component/test_github_boundary.py`.
+`ProcessRunner`. `parse_gh_version` and `GhPreflightEvidence`'s shape are
+likewise pure. Component-level, real-process wiring for
+`resolve_repository_identity`, `run_gh_preflight`, and `locate_issue` lives
+in `tests/component/test_github_boundary.py`.
 """
 
 from __future__ import annotations
 
+import dataclasses
+import shutil
 from pathlib import Path
 
 import pytest
@@ -20,13 +23,16 @@ import pytest
 from opencode_tools.domain import GithubTargetOverride, RepositoryIdentity
 from opencode_tools.errors import PreflightError
 from opencode_tools.github import (
+    GhPreflightEvidence,
     ParsedGithubUrl,
     RemoteFetchUrl,
+    parse_gh_version,
     parse_github_fetch_url,
     parse_https_fetch_url,
     parse_remote_v_fetch_urls,
     parse_scp_like_fetch_url,
     parse_ssh_scheme_fetch_url,
+    resolve_gh_executable,
     resolve_repository_identity_from_remotes,
 )
 
@@ -586,3 +592,125 @@ def test_override_only_applies_to_the_matching_workspace_relative_target() -> No
     )
     assert (identity.owner, identity.repository) == ("right", "right")
     assert identity.source == "origin"
+
+
+# =============================================================================
+# gh --version parsing (M11-02; System Design SS17.2)
+# =============================================================================
+
+
+def test_parse_gh_version_extracts_the_token_from_a_multi_line_banner() -> None:
+    raw = (
+        "gh version 2.40.1 (2023-12-13)\n"
+        "https://github.com/cli/cli/releases/tag/v2.40.1\n"
+    )
+    assert parse_gh_version(raw) == "2.40.1"
+
+
+def test_parse_gh_version_extracts_the_token_from_a_single_line() -> None:
+    assert parse_gh_version("gh version 2.4.0\n") == "2.4.0"
+
+
+def test_parse_gh_version_accepts_any_parsable_version_no_exact_pin() -> None:
+    """Unlike OpenCode's exact-match `1.17.18` policy, any semver-shaped
+    token is accepted -- there is no candidate `gh` version to pin against.
+    """
+
+    assert parse_gh_version("gh version 99.0.0\n") == "99.0.0"
+    assert parse_gh_version("gh version 0.1.2\n") == "0.1.2"
+
+
+def test_parse_gh_version_matches_the_leading_three_segments_of_a_longer_token() -> (
+    None
+):
+    assert parse_gh_version("gh version 2.40.1.9000\n") == "2.40.1"
+
+
+def test_parse_gh_version_ignores_leading_whitespace_on_the_first_line() -> None:
+    assert parse_gh_version("   gh version 2.40.1\n") == "2.40.1"
+
+
+def test_parse_gh_version_rejects_a_missing_patch_segment() -> None:
+    assert parse_gh_version("gh version 2.40\n") is None
+
+
+def test_parse_gh_version_rejects_garbled_output() -> None:
+    assert parse_gh_version("command not found: gh\n") is None
+
+
+def test_parse_gh_version_rejects_empty_output() -> None:
+    assert parse_gh_version("") is None
+
+
+def test_parse_gh_version_only_ever_inspects_the_first_line() -> None:
+    """A version token on a later line must never be found -- SS17.2 fixes
+    the parse to `gh --version`'s first line only.
+    """
+
+    raw = "gh cli, no version here\n2.40.1\n"
+    assert parse_gh_version(raw) is None
+
+
+# =============================================================================
+# GhPreflightEvidence shape (M11-02; System Design SS17.2)
+# =============================================================================
+
+
+def test_gh_preflight_evidence_exposes_host_version_and_digest() -> None:
+    evidence = GhPreflightEvidence(
+        host="github.com", gh_version="2.40.1", auth_status_digest="a" * 64
+    )
+    assert evidence.host == "github.com"
+    assert evidence.gh_version == "2.40.1"
+    assert evidence.auth_status_digest == "a" * 64
+
+
+def test_gh_preflight_evidence_supports_enterprise_hosts_too() -> None:
+    evidence = GhPreflightEvidence(
+        host="ghe.example.com", gh_version="2.40.1", auth_status_digest="b" * 64
+    )
+    assert evidence.host == "ghe.example.com"
+
+
+def test_gh_preflight_evidence_equality_is_by_value() -> None:
+    first = GhPreflightEvidence(
+        host="github.com", gh_version="2.40.1", auth_status_digest="c" * 64
+    )
+    second = GhPreflightEvidence(
+        host="github.com", gh_version="2.40.1", auth_status_digest="c" * 64
+    )
+    assert first == second
+
+
+def test_gh_preflight_evidence_is_frozen() -> None:
+    evidence = GhPreflightEvidence(
+        host="github.com", gh_version="2.40.1", auth_status_digest="d" * 64
+    )
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        evidence.host = "attacker.example.com"  # type: ignore[misc]
+
+
+# =============================================================================
+# resolve_gh_executable (M11-02)
+# =============================================================================
+
+
+def test_resolve_gh_executable_returns_the_resolved_which_path(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    fake = tmp_path / "gh"
+    fake.write_text("#!/bin/sh\n", encoding="utf-8")
+    fake.chmod(0o755)
+    monkeypatch.setattr(
+        shutil, "which", lambda name: str(fake) if name == "gh" else None
+    )
+    assert resolve_gh_executable() == fake.resolve()
+
+
+def test_resolve_gh_executable_fails_closed_when_not_on_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(shutil, "which", lambda name: None)
+    with pytest.raises(PreflightError) as exc_info:
+        resolve_gh_executable()
+    assert exc_info.value.code == "github.gh_executable_not_found"

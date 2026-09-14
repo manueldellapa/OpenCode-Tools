@@ -27,17 +27,31 @@ display spelling. `github.com` and any GitHub Enterprise host are accepted
 equally here -- `gh` auth/host verification is a later work package.
 
 This module does not read issue title or body, does not call any GitHub
-API, does not select a repository from `cwd` or the workspace, and does not
-perform `gh` preflight or auth (M11-02). It depends only on `domain`,
-`ports`, and `errors` -- never `git_safety` -- and duplicates its own small,
-read-only `git remote -v` probe in the same shape `git_safety.py` uses for
-its probes, rather than importing that module (System Design SS6's module
-table keeps the two independent).
+API, and does not select a repository from `cwd` or the workspace. It
+depends only on `domain`, `ports`, and `errors` -- never `git_safety` or
+`opencode` -- and duplicates its own small, read-only probe-running
+helpers in the same shape `git_safety.py` and `opencode.py` use for theirs,
+rather than importing either module (System Design SS6's module table
+keeps them independent).
+
+M11-02 adds this module's other half (System Design SS17.2/SS17.3;
+ADR-007; ADR-010): a bounded, fail-closed `gh` preflight -- `gh --version`
+then `gh auth status --hostname <host>`, both read-only utility calls --
+that must succeed before any `IssueLocator` can exist, and `locate_issue`,
+which runs that preflight and only then pairs a resolved
+`RepositoryIdentity` with a requested issue number. Neither this module nor
+`locate_issue` ever fetches an issue's title or body, calls a native GitHub
+API, or performs a second verifying fetch; `gh auth status`'s raw
+stdout/stderr is never decoded, logged, or placed in any error -- only its
+parsed `gh` version, resolved host, and a sanitized digest survive, in
+`GhPreflightEvidence`, for a later milestone to log.
 """
 
 from __future__ import annotations
 
+import hashlib
 import re
+import shutil
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -45,13 +59,15 @@ from urllib.parse import urlsplit
 
 from opencode_tools.domain import (
     GithubTargetOverride,
+    IssueLocator,
+    ProcessResult,
     ProcessSpec,
     RepositoryIdentity,
     RunOutcome,
     TargetRepository,
 )
 from opencode_tools.errors import PreflightError
-from opencode_tools.ports import LogChannel, ProcessRunner
+from opencode_tools.ports import AttemptLogSink, LogChannel, ProcessRunner
 
 # Mirrors git_safety.py's own defensive stdout bound for one utility probe;
 # not shared with it -- this module must not import git_safety (System
@@ -505,6 +521,37 @@ def _requires_remote_probe(override: GithubTargetOverride | None) -> bool:
     return override is None or override.remote is not None
 
 
+def _run_utility(
+    process_runner: ProcessRunner,
+    *,
+    executable: Path,
+    argv_tail: tuple[str, ...],
+    cwd: Path,
+    utility_timeout_seconds: float,
+    termination_grace_seconds: float,
+    sink: AttemptLogSink,
+) -> ProcessResult:
+    """Run one bounded, read-only utility probe and return its `ProcessResult`.
+
+    Generalizes M11-01's original `git remote -v`-only invocation to an
+    arbitrary executable/argv/cwd/sink, so the `git remote -v`, `gh
+    --version`, and `gh auth status` probes below all share one small
+    `ProcessSpec`-construction helper instead of each duplicating it. This
+    is this module's own private helper -- `opencode.py`'s `_run_utility`
+    is a different module's private helper for a different executable and
+    is never imported here (System Design SS6's module table).
+    """
+
+    spec = ProcessSpec(
+        argv=(str(executable), *argv_tail),
+        cwd=cwd,
+        stdin=None,
+        timeout_seconds=utility_timeout_seconds,
+        termination_grace_seconds=termination_grace_seconds,
+    )
+    return process_runner.run(spec, sink=sink)
+
+
 def _run_remote_v(
     process_runner: ProcessRunner,
     *,
@@ -521,17 +568,18 @@ def _run_remote_v(
     "no remotes" (NFR-008).
     """
 
-    spec = ProcessSpec(
-        argv=(str(git_executable), "-C", str(target_root), "remote", "-v"),
-        cwd=target_root,
-        stdin=None,
-        timeout_seconds=utility_timeout_seconds,
-        termination_grace_seconds=termination_grace_seconds,
-    )
     sink = _CapturingSink(
         path=Path("git-remote-v.log"), max_bytes=_UTILITY_OUTPUT_LIMIT_BYTES
     )
-    result = process_runner.run(spec, sink=sink)
+    result = _run_utility(
+        process_runner,
+        executable=git_executable,
+        argv_tail=("-C", str(target_root), "remote", "-v"),
+        cwd=target_root,
+        utility_timeout_seconds=utility_timeout_seconds,
+        termination_grace_seconds=termination_grace_seconds,
+        sink=sink,
+    )
     if result.outcome is not RunOutcome.SUCCEEDED:
         raise PreflightError(
             "github.remote_probe_failed",
@@ -594,14 +642,317 @@ def resolve_repository_identity(
     )
 
 
+# =============================================================================
+# gh preflight (M11-02; System Design SS17.2/SS17.3; ADR-007; ADR-010)
+# =============================================================================
+
+# Both `gh` probes below are host/auth-level checks, never tied to any
+# repository target, so they are spawned from a fixed, always-present POSIX
+# directory rather than ever reading the caller's actual `cwd` -- the same
+# invariant this module already keeps for identity resolution itself (this
+# module's own docstring; ADR-007).
+_HOST_LEVEL_PROBE_CWD = Path("/")
+
+# `gh version 2.40.1 (2023-12-13)` -> `2.40.1`; matched only against the
+# first line of `gh --version`'s output. Any parsable `digits.digits.digits`
+# token is accepted -- unlike OpenCode's exact-match `1.17.18` policy
+# (`opencode.check_version`), there is no pinned `gh` version.
+_GH_VERSION_PATTERN = re.compile(r"\d+\.\d+\.\d+")
+
+
+@dataclass(frozen=True, slots=True)
+class GhPreflightEvidence:
+    """Sanitized evidence from one successful `gh` preflight (SS17.2).
+
+    Deliberately small and local to this module rather than added to
+    `domain.py`: nothing downstream persists it yet in M11-02, it merely
+    gives a later milestone something ready to log. `host` and `gh_version`
+    are already-known-safe facts (the resolved host and the parsed version
+    string); `auth_status_digest` is a SHA-256 digest -- never the raw
+    `gh auth status` stdout/stderr this module never decodes or keeps.
+    """
+
+    host: str
+    gh_version: str
+    auth_status_digest: str
+
+
+class _DiscardingSink:
+    """An `AttemptLogSink` that discards every write immediately.
+
+    Used only for `gh auth status`: System Design SS17.2 requires that its
+    raw stdout/stderr is "non persistito" -- never persisted -- and this
+    sink guarantees this module never even holds a transient in-memory copy
+    of it (unlike `_CapturingSink`, there is no buffer to read back).
+    `ProcessResult.outcome`/`return_code`/`stdout_sha256`/`stderr_sha256`
+    (computed by `SubprocessRunner` directly off the raw bytes, independent
+    of whatever sink is attached) remain the only surviving evidence of
+    what the call produced.
+    """
+
+    def __init__(self, *, path: Path) -> None:
+        self._path = path
+
+    @property
+    def path(self) -> Path:
+        return self._path
+
+    def write(self, channel: LogChannel, payload: bytes, timestamp: datetime) -> None:
+        del channel, payload, timestamp
+
+    def close(self) -> None:
+        return None
+
+
+def resolve_gh_executable() -> Path:
+    """Resolve the `gh` executable once via `PATH`.
+
+    Mirrors `git_safety.resolve_git_executable`/`opencode.resolve_executable`
+    in shape; `gh` is a different executable than `git`, so this module
+    resolves its own rather than importing either sibling. Never tries an
+    alias or an automatic install; a missing executable fails closed
+    immediately, before any `gh` call and before any `IssueLocator` can
+    exist.
+    """
+
+    found = shutil.which("gh")
+    if found is None:
+        raise PreflightError(
+            "github.gh_executable_not_found",
+            "The 'gh' executable was not found on PATH.",
+        )
+    return Path(found).resolve()
+
+
+def parse_gh_version(raw_output: str) -> str | None:
+    """Extract the semver-shaped token from `gh --version`'s first line.
+
+    `gh --version` is typically multi-line (a version line followed by a
+    release URL); only the first line is ever inspected. Returns `None`,
+    never raises, when no `digits.digits.digits` token is present there --
+    the "version not parsable" preflight failure (SS17.2).
+    """
+
+    lines = raw_output.splitlines()
+    first_line = lines[0] if lines else ""
+    match = _GH_VERSION_PATTERN.search(first_line)
+    if match is None:
+        return None
+    return match.group(0)
+
+
+def _run_gh_version(
+    process_runner: ProcessRunner,
+    *,
+    gh_executable: Path,
+    utility_timeout_seconds: float,
+    termination_grace_seconds: float,
+) -> str:
+    """Run `gh --version` and return its decoded stdout.
+
+    Bounded and read-only, mirroring `_run_remote_v`'s own discipline: a
+    timeout, non-zero exit, oversized, or non-UTF-8 capture all fail closed
+    with `PreflightError` rather than being treated as "no version"
+    (NFR-008). Unlike `gh auth status`, this call's own output is not the
+    "raw auth output" SS17.2 forbids persisting -- it must be read to parse
+    the version, and only the parsed token, never this raw text, survives
+    into `GhPreflightEvidence`.
+    """
+
+    sink = _CapturingSink(
+        path=Path("gh-version.log"), max_bytes=_UTILITY_OUTPUT_LIMIT_BYTES
+    )
+    result = _run_utility(
+        process_runner,
+        executable=gh_executable,
+        argv_tail=("--version",),
+        cwd=_HOST_LEVEL_PROBE_CWD,
+        utility_timeout_seconds=utility_timeout_seconds,
+        termination_grace_seconds=termination_grace_seconds,
+        sink=sink,
+    )
+    if result.outcome is not RunOutcome.SUCCEEDED:
+        raise PreflightError(
+            "github.gh_version_probe_failed",
+            "gh --version did not complete successfully.",
+            technical_detail=(
+                f"outcome={result.outcome.value} return_code={result.return_code}"
+            ),
+        )
+    if sink.overflowed_stdout:
+        raise PreflightError(
+            "github.gh_version_probe_failed",
+            "gh --version output exceeded the defensive size limit.",
+        )
+    try:
+        return sink.stdout_bytes().decode("utf-8", errors="strict")
+    except UnicodeDecodeError:
+        raise PreflightError(
+            "github.gh_version_probe_failed",
+            "gh --version output was not valid UTF-8.",
+        ) from None
+
+
+def _run_gh_auth_status(
+    process_runner: ProcessRunner,
+    *,
+    gh_executable: Path,
+    host: str,
+    utility_timeout_seconds: float,
+    termination_grace_seconds: float,
+) -> ProcessResult:
+    """Run `gh auth status --hostname <host>` and return its raw
+    `ProcessResult` only -- never its stdout/stderr text.
+
+    `_DiscardingSink` guarantees this module never buffers a copy of what
+    the call printed; `ProcessResult.outcome`/`return_code` alone is the
+    fail-closed signal, exactly like `git_safety._require_probe_succeeded`
+    and `opencode._require_process_succeeded` treat "not a clean success"
+    as the single condition for their own bounded probes -- `gh`'s
+    human-readable auth text (e.g. "not logged in") is never parsed for
+    specific phrases.
+    """
+
+    sink = _DiscardingSink(path=Path("gh-auth-status.log"))
+    return _run_utility(
+        process_runner,
+        executable=gh_executable,
+        argv_tail=("auth", "status", "--hostname", host),
+        cwd=_HOST_LEVEL_PROBE_CWD,
+        utility_timeout_seconds=utility_timeout_seconds,
+        termination_grace_seconds=termination_grace_seconds,
+        sink=sink,
+    )
+
+
+def _compute_auth_status_digest(result: ProcessResult) -> str:
+    """Compute a sanitized digest for one `gh auth status` call (SS17.2).
+
+    Hashes only an already-known-safe fact set -- `ProcessResult`'s own
+    `stdout_sha256`/`stderr_sha256` (SHA-256 digests `SubprocessRunner`
+    derives directly from the raw bytes streamed off the child, independent
+    of `_DiscardingSink`) and its `return_code` -- never the raw auth text
+    itself, which this module never decodes. Mirrors
+    `opencode.compute_control_plane_digest`'s `hashlib.sha256(...).hexdigest()`
+    style, adapted to plain values instead of parsed JSON structures.
+    """
+
+    canonical = (
+        f"stdout_sha256={result.stdout_sha256} "
+        f"stderr_sha256={result.stderr_sha256} "
+        f"return_code={result.return_code}"
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def run_gh_preflight(
+    process_runner: ProcessRunner,
+    *,
+    gh_executable: Path,
+    host: str,
+    utility_timeout_seconds: float,
+    termination_grace_seconds: float,
+) -> GhPreflightEvidence:
+    """Run both bounded `gh` preflight probes (System Design SS17.2) and
+    return sanitized evidence, or fail closed before any `IssueLocator` can
+    exist.
+
+    `gh --version` runs first; an unparsable version fails closed without
+    ever attempting `gh auth status`. `gh auth status --hostname host` must
+    then complete as a clean, confirmed, zero-exit success -- the only
+    accepted "authenticated for this host" signal (ADR-010's cooperative,
+    assumed-uncompromised local `gh`; `github.com` and any GitHub
+    Enterprise host are treated identically here). Only `host`, the parsed
+    `gh_version`, and a sanitized digest of the auth call survive into the
+    returned `GhPreflightEvidence`; its raw stdout/stderr never does.
+    """
+
+    raw_version_output = _run_gh_version(
+        process_runner,
+        gh_executable=gh_executable,
+        utility_timeout_seconds=utility_timeout_seconds,
+        termination_grace_seconds=termination_grace_seconds,
+    )
+    gh_version = parse_gh_version(raw_version_output)
+    if gh_version is None:
+        raise PreflightError(
+            "github.gh_version_unparseable",
+            "gh --version output did not contain a parsable version.",
+        )
+
+    auth_result = _run_gh_auth_status(
+        process_runner,
+        gh_executable=gh_executable,
+        host=host,
+        utility_timeout_seconds=utility_timeout_seconds,
+        termination_grace_seconds=termination_grace_seconds,
+    )
+    if auth_result.outcome is not RunOutcome.SUCCEEDED:
+        raise PreflightError(
+            "github.gh_auth_failed",
+            f"gh auth status did not confirm authentication for host {host!r}.",
+            technical_detail=(
+                f"outcome={auth_result.outcome.value} "
+                f"return_code={auth_result.return_code}"
+            ),
+        )
+
+    return GhPreflightEvidence(
+        host=host,
+        gh_version=gh_version,
+        auth_status_digest=_compute_auth_status_digest(auth_result),
+    )
+
+
+def locate_issue(
+    repository_identity: RepositoryIdentity,
+    issue_number: int,
+    *,
+    process_runner: ProcessRunner,
+    gh_executable: Path,
+    utility_timeout_seconds: float,
+    termination_grace_seconds: float,
+) -> IssueLocator:
+    """Pair a resolved `RepositoryIdentity` with `issue_number`, but only
+    after a fresh `gh` preflight against `repository_identity.host`
+    succeeds (System Design SS17.2/SS17.3; ADR-007).
+
+    No `IssueLocator` is ever constructed when the preflight fails --
+    `run_gh_preflight` raises `PreflightError` first, before this function
+    so much as looks at `issue_number`. Mirrors the eventual
+    `ports.IssueResolver.locate_issue` shape as a free function, the same
+    discipline `resolve_repository_identity` already follows for
+    `IssueResolver.resolve_repository` -- not a class satisfying the full
+    Protocol. `issue_number`'s own positivity is entirely
+    `IssueLocator.__post_init__`'s concern: an invalid `issue_number` is
+    this function's own caller's contract violation, not an external-world
+    preflight fact, so its `ValueError` is left to propagate unmodified
+    rather than being re-wrapped as a `PreflightError`.
+    """
+
+    run_gh_preflight(
+        process_runner,
+        gh_executable=gh_executable,
+        host=repository_identity.host,
+        utility_timeout_seconds=utility_timeout_seconds,
+        termination_grace_seconds=termination_grace_seconds,
+    )
+    return IssueLocator(repository_identity=repository_identity, number=issue_number)
+
+
 __all__ = (
+    "GhPreflightEvidence",
     "ParsedGithubUrl",
     "RemoteFetchUrl",
+    "locate_issue",
+    "parse_gh_version",
     "parse_github_fetch_url",
     "parse_https_fetch_url",
     "parse_remote_v_fetch_urls",
     "parse_scp_like_fetch_url",
     "parse_ssh_scheme_fetch_url",
+    "resolve_gh_executable",
     "resolve_repository_identity",
     "resolve_repository_identity_from_remotes",
+    "run_gh_preflight",
 )
