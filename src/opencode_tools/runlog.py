@@ -13,8 +13,19 @@ exclusive same-directory temp file plus `flush`/`fsync`/`os.replace()`, and
 M02) that `ProcessRunner` (`process.py`, M05) can drain into completely
 unmodified. The schema itself -- every group and canonical field System
 Design SS15.3 lists -- is `domain.RunRecord` and `domain.to_primitive()`
-(M02). The runtime root's own ignore/ownership preflight is `M10`'s
-bootstrap and is assumed already valid here.
+(M02).
+
+`check_platform_baseline` and `bootstrap_runtime_root` are M10-01's
+runtime bootstrap: the former fails closed off the ADR-009 macOS/Linux
+POSIX baseline, the latter creates the runtime root (mode `0700`) if
+missing or, for an already-existing one, verifies it is a real,
+non-symlink directory owned by the current effective user with no
+group/other bits -- never repairing mode or ownership itself. Both raise
+`PreflightError`, not `LoggingError`: this is a before-any-artifact
+compatibility gate (System Design SS13.1's "runtime incompatibile"), not
+an artifact I/O fault. The runtime root's own Git ignore/metadata
+preflight is `git_safety.check_runtime_location`, a separate module so
+this one never needs to know about Git.
 """
 
 from __future__ import annotations
@@ -25,12 +36,13 @@ import os
 import re
 import secrets
 import stat
+import sys
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import IO, Final
 
 from opencode_tools.domain import AgentRole, RunOutcome, RunRecord, to_primitive
-from opencode_tools.errors import LoggingError
+from opencode_tools.errors import LoggingError, PreflightError
 from opencode_tools.ports import Clock, LogChannel
 
 DIRECTORY_MODE: Final = 0o700
@@ -120,6 +132,98 @@ def _verify_private_directory(path: Path) -> None:
             "runlog.directory_mode_too_permissive",
             f"directory mode exceeds {oct(DIRECTORY_MODE)}: {path}",
         )
+
+
+_SUPPORTED_PLATFORMS: Final = frozenset({"darwin", "linux"})
+
+
+def check_platform_baseline(
+    *, platform: str = sys.platform, os_name: str = os.name
+) -> None:
+    """Fail closed unless running on the ADR-009 POSIX baseline: macOS or
+    Linux on a local POSIX filesystem (System Design SS19; M10-01).
+
+    `platform`/`os_name` are injectable only so a unit test can simulate
+    an unsupported environment deterministically; production callers rely
+    on the defaults (the real `sys.platform`/`os.name`).
+    """
+
+    if platform not in _SUPPORTED_PLATFORMS or os_name != "posix":
+        raise PreflightError(
+            "runlog.unsupported_platform",
+            "This platform is outside the supported macOS/Linux POSIX baseline.",
+            technical_detail=f"platform={platform!r} os_name={os_name!r}",
+        )
+
+
+def _require_current_owner(path: Path, info: os.stat_result) -> None:
+    current_uid = os.geteuid()
+    if info.st_uid != current_uid:
+        raise PreflightError(
+            "runlog.runtime_root_wrong_owner",
+            f"runtime root is not owned by the current user: {path}",
+        )
+
+
+def _verify_existing_runtime_root(path: Path) -> None:
+    """Fail closed unless an already-existing `path` is safe to reuse as
+    the runtime root (ADR-008 SS15.6; M10-01): a real, non-symlink
+    directory, owned by the current effective user, with mode not
+    exceeding `DIRECTORY_MODE`. Mode and ownership are never repaired
+    automatically -- a violation always raises instead.
+    """
+
+    try:
+        info = os.lstat(path)
+    except OSError as error:
+        raise PreflightError(
+            "runlog.runtime_root_unverifiable",
+            f"could not verify runtime root: {path}",
+            technical_detail=type(error).__name__,
+        ) from None
+    if stat.S_ISLNK(info.st_mode):
+        raise PreflightError(
+            "runlog.runtime_root_is_symlink",
+            f"refusing a symlinked runtime root: {path}",
+        )
+    if not stat.S_ISDIR(info.st_mode):
+        raise PreflightError(
+            "runlog.runtime_root_not_a_directory",
+            f"expected a directory but found something else: {path}",
+        )
+    _require_current_owner(path, info)
+    if stat.S_IMODE(info.st_mode) & ~DIRECTORY_MODE:
+        raise PreflightError(
+            "runlog.runtime_root_mode_too_permissive",
+            f"runtime root mode exceeds {oct(DIRECTORY_MODE)}: {path}",
+        )
+
+
+def bootstrap_runtime_root(runtime_root: Path) -> None:
+    """Create `runtime_root` if missing, or validate it if it already
+    exists, before any run artifact is created under it (System Design
+    SS15.1, SS15.6; ADR-008; M10-01).
+
+    A fresh root is created directly with mode `0700`
+    (`DIRECTORY_MODE`). Either way, `_verify_existing_runtime_root` runs
+    afterward -- the same anti-symlink-race defense in depth
+    `_verify_private_directory` already applies to `runs/` and the run
+    directory -- so a freshly created root is re-checked too, not just an
+    inherited one.
+    """
+
+    _require_absolute_path(runtime_root, "runtime_root")
+    try:
+        os.mkdir(runtime_root, DIRECTORY_MODE)
+    except FileExistsError:
+        pass
+    except OSError as error:
+        raise PreflightError(
+            "runlog.runtime_root_create_failed",
+            f"failed to create runtime root: {runtime_root}",
+            technical_detail=type(error).__name__,
+        ) from None
+    _verify_existing_runtime_root(runtime_root)
 
 
 def _ensure_runs_root(runtime_root: Path) -> Path:
@@ -317,6 +421,47 @@ def _fsync_directory_best_effort(path: Path) -> None:
         os.close(directory_fd)
 
 
+def write_private_file_atomically(path: Path, payload: bytes) -> None:
+    """Atomically replace `path` with `payload` (System Design SS15.4;
+    ADR-008; M10-03).
+
+    The same mechanism `persist_run_record` uses inline for `run.json`,
+    factored out so another artifact -- `locking.py`'s persistent
+    quarantine marker -- gets the identical atomicity and failure-cleanup
+    guarantee without duplicating it: a fresh, unpredictable, exclusive,
+    mode-`0600` temp file in the same directory (`open_private_exclusive`),
+    `flush` and `fsync`, `os.replace()` onto `path`, then a best-effort
+    directory `fsync`. A previously persisted file at `path` is left
+    untouched on any failure -- only this call's own temp file is
+    best-effort removed. Raises `OSError` unwrapped so each caller maps
+    it onto its own error taxonomy and code; `persist_run_record` keeps
+    its own inline sequence rather than calling this, to preserve its two
+    already-shipped, separately coded write-phase and replace-phase
+    failures unchanged.
+    """
+
+    directory = path.parent
+    temp_path = directory / _temp_document_name()
+
+    file_descriptor = open_private_exclusive(temp_path)
+    try:
+        with os.fdopen(file_descriptor, "wb") as stream:
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+    except OSError:
+        _best_effort_unlink(temp_path)
+        raise
+
+    try:
+        os.replace(temp_path, path)
+    except OSError:
+        _best_effort_unlink(temp_path)
+        raise
+
+    _fsync_directory_best_effort(directory)
+
+
 def persist_run_record(record: RunRecord) -> None:
     """Atomically replace `record.artifact_path` (`run.json`) on disk.
 
@@ -503,10 +648,13 @@ __all__ = (
     "AttemptLogFileSink",
     "allocate_run_directory",
     "attempt_log_filename",
+    "bootstrap_runtime_root",
+    "check_platform_baseline",
     "create_run_directory",
     "format_run_id",
     "generate_run_id",
     "open_private_exclusive",
     "persist_run_record",
     "serialize_run_record",
+    "write_private_file_atomically",
 )

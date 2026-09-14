@@ -253,9 +253,13 @@ class RecordingGitSafetyPort:
         self._target = target
         self._check = check
         self.resolve_calls: list[tuple[Workspace, Path]] = []
+        self.runtime_location_calls: list[Path] = []
         self.check_calls: list[
             tuple[TargetRepository, int, str, AgentRole | None, GitState | None]
         ] = []
+
+    def check_runtime_location(self, runtime_root: Path) -> None:
+        self.runtime_location_calls.append(runtime_root)
 
     def resolve_target(
         self,
@@ -335,6 +339,7 @@ class FakeTargetLease:
         self.entered = False
         self.exited_with: BaseException | None = None
         self.exit_called = False
+        self.quarantine_calls: list[str] = []
 
     def __enter__(self) -> Self:
         self.entered = True
@@ -348,6 +353,9 @@ class FakeTargetLease:
     ) -> None:
         self.exit_called = True
         self.exited_with = exc
+
+    def quarantine(self, reason: str) -> None:
+        self.quarantine_calls.append(reason)
 
 
 class FakeTargetLeaseFactory:
@@ -443,11 +451,13 @@ def test_git_safety_port_resolves_targets_and_reports_checkpoints() -> None:
     fake = RecordingGitSafetyPort(target, check)
     git_safety: GitSafetyPort = fake
 
+    git_safety.check_runtime_location(RUNTIME_ROOT)
     resolved = git_safety.resolve_target(workspace, TARGET_ROOT)
     reported = git_safety.check(target, sequence=0, purpose="baseline")
 
     assert resolved is target
     assert reported is check
+    assert fake.runtime_location_calls == [RUNTIME_ROOT]
     assert fake.resolve_calls == [(workspace, TARGET_ROOT)]
     assert fake.check_calls == [(target, 0, "baseline", None, None)]
 
@@ -492,10 +502,12 @@ def test_target_lease_factory_port_acquires_a_context_managed_lease() -> None:
     fake = FakeTargetLeaseFactory(lease)
     factory: TargetLeaseFactory = fake
 
-    with factory.acquire(TARGET_ROOT, RUNTIME_ROOT, "run-001"):
+    with factory.acquire(TARGET_ROOT, RUNTIME_ROOT, "run-001") as acquired:
         assert lease.entered is True
         assert lease.exit_called is False
+        acquired.quarantine("unconfirmed termination")
 
     assert fake.calls == [(TARGET_ROOT, RUNTIME_ROOT, "run-001")]
     assert lease.exit_called is True
     assert lease.exited_with is None
+    assert lease.quarantine_calls == ["unconfirmed termination"]

@@ -119,6 +119,18 @@ class AgentRunner(Protocol):
 class GitSafetyPort(Protocol):
     """Target resolution and content-sensitive Git safety checkpoints."""
 
+    def check_runtime_location(self, runtime_root: Path) -> None:
+        """Fail closed unless `runtime_root` is safe to hold run artifacts.
+
+        A `runtime_root` under Git metadata is always rejected outright.
+        One inside some other Git working tree must already have itself
+        and a sentinel child covered by `git check-ignore`; this is never
+        fixed by editing `.gitignore`. One outside any Git working tree
+        entirely is accepted without an ignore check (System Design
+        SS15.1; ADR-008; M10-01).
+        """
+        ...
+
     def resolve_target(
         self,
         workspace: Workspace,
@@ -191,7 +203,14 @@ class RunStorePort(Protocol):
 
 
 class TargetLease(Protocol):
-    """A held, non-blocking lock on one canonical target, released on exit."""
+    """A held, non-blocking lock on one canonical target, released on exit.
+
+    Held from before the baseline until after finalization (System Design
+    SS16.2; ADR-006; M10-02). `__exit__` releases the underlying OS lock
+    unconditionally; the lock file itself is left on disk -- its presence
+    never implies an active lock, and nothing here ever guesses a lease
+    stale by PID or age.
+    """
 
     def __enter__(self) -> Self: ...
 
@@ -201,6 +220,22 @@ class TargetLease(Protocol):
         exc: BaseException | None,
         traceback: TracebackType | None,
     ) -> None: ...
+
+    def quarantine(self, reason: str) -> None:
+        """Atomically write the persistent quarantine marker for this
+        lease's target, before it is released, because a process group's
+        termination could not be confirmed (System Design SS16.3;
+        ADR-006; M10-03).
+
+        Call from inside the `with` block when `termination_confirmed`
+        is false; this never substitutes for exiting the context, which
+        still releases the OS lock normally afterward. Never removed
+        automatically. A write failure raises `LoggingError` instead of
+        being swallowed, so the caller can preserve it as an additional
+        cause and warn that future exclusion on this target is no longer
+        guaranteed.
+        """
+        ...
 
 
 class TargetLeaseFactory(Protocol):
@@ -212,7 +247,24 @@ class TargetLeaseFactory(Protocol):
         runtime_root: Path,
         run_id: str,
     ) -> TargetLease:
-        """Acquire the lease for `target_root`, failing closed if held."""
+        """Acquire the lease for `target_root`, failing closed if held.
+
+        The lease's key is derived from `target_root`'s own absolute Git
+        directory, never from `runtime_root`: two checkouts or worktrees
+        with distinct Git directories get distinct leases and may proceed
+        in parallel, while different `runtime_root` values for the same
+        physical checkout never bypass the exclusion (System Design
+        SS16.2; ADR-006). A lease already held raises `PreflightError`
+        (`locking.target_locked`) before any agent runs, with whatever
+        diagnostic holder metadata is available; a filesystem without a
+        reliable advisory lock raises distinctly
+        (`locking.advisory_lock_unavailable`) instead of proceeding
+        unlocked. A target still carrying a quarantine marker from a
+        prior unconfirmed termination (`TargetLease.quarantine`, M10-03)
+        raises `PreflightError` (`locking.target_quarantined`) before
+        even attempting the lock -- the block applies whether or not the
+        OS lock happens to be free, and is never lifted automatically.
+        """
         ...
 
 
