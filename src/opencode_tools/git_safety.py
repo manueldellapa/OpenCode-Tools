@@ -17,10 +17,18 @@ disk, not from Git's own object database -- each path's type, executable
 bit, and content/symlink-target hash, so a second edit to an already-`M`
 file changes the digest even though the porcelain line does not (M09-02).
 
-Race/instability handling, resampling, and mapping a failure to
-`GitSafetyStatus` are out of scope here (M09-03), as are per-attempt
-checkpoints and postflight (M09-04/M09-05); this module never mutates Git
-state, never retries, and knows nothing about OpenCode.
+`capture_git_state` wraps that fingerprint acquisition to be bounded and
+fail-closed under concurrent or incomplete reads (M09-03): every per-path
+read is lstat-bracketed, the whole snapshot is resampled once at the end,
+a single instability triggers at most one bounded retry, and a repeated
+instability, permission error, escaping path, unsupported file type, or
+probe failure/ambiguity is classified `GitSafetyStatus.INDETERMINATE`
+rather than ever guessed `SAFE`.
+
+Per-attempt checkpoints, role mutation policy, change inventory, and
+postflight are out of scope here (M09-04/M09-05); this module never
+mutates Git state, never retries beyond the one bounded resample, and
+knows nothing about OpenCode.
 """
 
 from __future__ import annotations
@@ -34,6 +42,8 @@ from datetime import datetime
 from pathlib import Path
 
 from opencode_tools.domain import (
+    GitSafetyStatus,
+    GitState,
     ProcessResult,
     ProcessSpec,
     RunOutcome,
@@ -41,7 +51,8 @@ from opencode_tools.domain import (
     Workspace,
 )
 from opencode_tools.errors import PreflightError
-from opencode_tools.ports import LogChannel, ProcessRunner
+from opencode_tools.ports import Clock, LogChannel, ProcessRunner
+from opencode_tools.process import deadline_ns
 
 # Versioned defensive buffer for one Git utility call's stdout; mirrors
 # opencode.py's own bound (System Design SS10.1) but is not shared with it --
@@ -512,13 +523,23 @@ def build_fingerprint_path_entry(
 
     `raw_path` is `target_root`-relative, exactly as Git printed it;
     `os.fsdecode` round-trips it byte-for-byte via `surrogateescape`, so a
-    non-UTF-8 path is handled without ever raising a decode error. The
-    result is `"missing"` if nothing exists there, `"regular"`/`"symlink"`
-    with a content/target hash and (for `"regular"`) the Git-significant
-    executable bit, or `"other"` for anything else (System Design SS11.2).
+    non-UTF-8 path is handled without ever raising a decode error. A path
+    escaping `target_root` (a `..` component -- Git itself never emits one,
+    but this is checked defensively) raises `PreflightError` rather than
+    being joined and inspected. Otherwise the result is `"missing"` if
+    nothing exists there, `"regular"`/`"symlink"` with a content/target
+    hash and (for `"regular"`) the Git-significant executable bit, or
+    `"other"` for anything else (System Design SS11.2).
     """
 
-    absolute = target_root / os.fsdecode(raw_path)
+    relative = os.fsdecode(raw_path)
+    if ".." in Path(relative).parts:
+        raise PreflightError(
+            "git_safety.fingerprint_path_escapes_target",
+            "A tracked or untracked path escapes the target.",
+            technical_detail=f"path={raw_path!r}",
+        )
+    absolute = target_root / relative
     lstat_result = _lstat_or_none(absolute)
     if lstat_result is None:
         return FingerprintPathEntry(
@@ -654,6 +675,355 @@ def compute_git_state_fingerprint(
         untracked_raw=untracked_raw,
         path_entries=path_entries,
         gitlink_entries=gitlink_entries,
+    )
+
+
+# =============================================================================
+# M09-03: bounded, fail-closed sampling stability and `GitSafetyStatus`
+# =============================================================================
+
+
+@dataclass(frozen=True, slots=True)
+class GitStateCapture:
+    """One classified Git state snapshot.
+
+    `safety_status` here means only "was this capture itself acquired
+    reliably" -- `SAFE` for a stable, complete sample, `INDETERMINATE` for
+    anything unstable, erroring, or ambiguous. It is never `UNSAFE`: that
+    verdict requires comparing this capture against a baseline or a prior
+    checkpoint (branch/HEAD drift, an unexpected fingerprint delta), which
+    is M09-04's job, not this module's acquisition primitive. A `SAFE`
+    capture can still report a detached `HEAD` (`state.branch is None`) --
+    that is itself meaningful drift evidence for M09-04 to compare, not an
+    acquisition failure.
+    """
+
+    state: GitState
+    safety_status: GitSafetyStatus
+    process_results: tuple[ProcessResult, ...]
+
+
+# Codes from this module's own probes/reads that represent a condition a
+# retry might resolve (an unstable read) or that always fails closed to
+# INDETERMINATE (a permission error, an escaping path, an unsupported
+# type, or a probe outright failing) -- never a bug in this module's own
+# command construction, which raises AssertionError instead.
+_INDETERMINATE_CAPTURE_CODES = frozenset(
+    {
+        "git_safety.state_branch_probe_failed",
+        "git_safety.state_head_probe_failed",
+        "git_safety.state_status_probe_failed",
+        "git_safety.state_index_probe_failed",
+        "git_safety.state_tracked_probe_failed",
+        "git_safety.state_untracked_probe_failed",
+        "git_safety.fingerprint_path_unreadable",
+        "git_safety.fingerprint_path_escapes_target",
+        "git_safety.fingerprint_index_malformed",
+        "git_safety.fingerprint_unsupported_type",
+    }
+)
+
+
+class _SnapshotUnstable(Exception):
+    """Internal signal: this sampling pass raced (System Design SS11.2);
+    the caller retries once, provided the shared deadline allows it."""
+
+    def __init__(self, process_results: tuple[ProcessResult, ...]) -> None:
+        super().__init__("git state snapshot was unstable")
+        self.process_results = process_results
+
+
+def capture_branch(raw_output: str) -> str | None:
+    """Return the current branch name, or `None` for a detached `HEAD`.
+
+    Unlike `check_branch_attached` (M09-01's bootstrap gate, which rejects a
+    detached `HEAD` outright), this never raises: a detached `HEAD`
+    captured mid-run is meaningful drift evidence for M09-04's baseline
+    comparison, not by itself a capture failure.
+    """
+
+    return raw_output.removesuffix("\n") or None
+
+
+def capture_head(raw_output: str) -> str:
+    """Return the resolved `HEAD` commit SHA from a successful probe."""
+
+    sha = raw_output.removesuffix("\n")
+    if not sha:
+        raise PreflightError(
+            "git_safety.state_head_probe_failed",
+            "git rev-parse --verify HEAD^{commit} succeeded but printed no output.",
+        )
+    return sha
+
+
+def _display_safe_text(raw: bytes) -> str:
+    """Decode `raw` for display/storage, never raising on non-UTF-8 bytes.
+
+    Uses `backslashreplace`, not `surrogateescape`: the result must be
+    valid Unicode -- it becomes a `GitState` `str` field that crosses the
+    JSON boundary -- not merely round-trippable (System Design SS11.2's
+    "forma display-safe").
+    """
+
+    return raw.decode("utf-8", errors="backslashreplace")
+
+
+def _lstat_signature(path: Path) -> tuple[int, int, int] | None:
+    try:
+        result = os.lstat(path)
+    except OSError:
+        return None
+    return (result.st_ino, result.st_mtime_ns, result.st_size)
+
+
+def _capture_path_entry(
+    target_root: Path, raw_path: bytes
+) -> tuple[FingerprintPathEntry, bool]:
+    """Classify and hash one path, `lstat`-bracketed before and after.
+
+    Returns `(entry, stable)`; `stable` is `False` if the path's identity
+    (inode, mtime, size) changed during the read -- the per-read race
+    signal System Design SS11.2 says to retry on rather than trust.
+    """
+
+    absolute = target_root / os.fsdecode(raw_path)
+    before = _lstat_signature(absolute)
+    entry = build_fingerprint_path_entry(target_root, raw_path)
+    after = _lstat_signature(absolute)
+    return entry, before == after
+
+
+def _probe_raw(
+    process_runner: ProcessRunner,
+    git_executable: Path,
+    target_root: Path,
+    argv_tail: tuple[str, ...],
+    *,
+    log_name: str,
+    code: str,
+    utility_timeout_seconds: float,
+    termination_grace_seconds: float,
+) -> tuple[bytes, ProcessResult]:
+    result, sink = _run_git_probe(
+        process_runner,
+        git_executable,
+        target_root,
+        argv_tail,
+        log_name=log_name,
+        cwd=target_root,
+        timeout_seconds=utility_timeout_seconds,
+        termination_grace_seconds=termination_grace_seconds,
+    )
+    _require_probe_succeeded(
+        result,
+        code=code,
+        message=f"git {' '.join(argv_tail)} did not complete successfully.",
+    )
+    return _raw_probe_stdout(sink, code=code), result
+
+
+_STATE_PROBES: tuple[tuple[str, tuple[str, ...], str], ...] = (
+    ("branch", _CMD_BRANCH_SHOW_CURRENT, "git_safety.state_branch_probe_failed"),
+    ("head", _CMD_HEAD_VERIFY, "git_safety.state_head_probe_failed"),
+    ("status", _CMD_STATUS, "git_safety.state_status_probe_failed"),
+    ("index", _CMD_LS_FILES_STAGE, "git_safety.state_index_probe_failed"),
+    ("tracked", _CMD_LS_FILES, "git_safety.state_tracked_probe_failed"),
+    ("untracked", _CMD_LS_FILES_OTHERS, "git_safety.state_untracked_probe_failed"),
+)
+
+
+def _sample_six_raw_probes(
+    process_runner: ProcessRunner,
+    git_executable: Path,
+    target_root: Path,
+    *,
+    log_prefix: str,
+    utility_timeout_seconds: float,
+    termination_grace_seconds: float,
+) -> tuple[dict[str, bytes], tuple[ProcessResult, ...]]:
+    raw: dict[str, bytes] = {}
+    results: list[ProcessResult] = []
+    for key, argv_tail, code in _STATE_PROBES:
+        raw[key], result = _probe_raw(
+            process_runner,
+            git_executable,
+            target_root,
+            argv_tail,
+            log_name=f"{log_prefix}-{key}.log",
+            code=code,
+            utility_timeout_seconds=utility_timeout_seconds,
+            termination_grace_seconds=termination_grace_seconds,
+        )
+        results.append(result)
+    return raw, tuple(results)
+
+
+def _sample_git_state_once(
+    process_runner: ProcessRunner,
+    *,
+    git_executable: Path,
+    target: TargetRepository,
+    utility_timeout_seconds: float,
+    termination_grace_seconds: float,
+    attempt_index: int,
+) -> tuple[GitState, tuple[ProcessResult, ...]]:
+    """One full sample-then-resample pass.
+
+    Raises `PreflightError` (a probe failure, an escaping path, an
+    unreadable file, or an unsupported file type -- none of which a retry
+    would resolve) or `_SnapshotUnstable` (an `lstat` or resample mismatch,
+    which a retry might). Returns the completed `GitState` only when every
+    signal -- every per-path `lstat` bracket and the whole-snapshot
+    resample -- agrees.
+    """
+
+    log_prefix = f"git-state-{attempt_index}"
+    first, first_results = _sample_six_raw_probes(
+        process_runner,
+        git_executable,
+        target.root,
+        log_prefix=f"{log_prefix}-a",
+        utility_timeout_seconds=utility_timeout_seconds,
+        termination_grace_seconds=termination_grace_seconds,
+    )
+
+    index_entries = parse_index_manifest(first["index"])
+    gitlink_paths = frozenset(
+        entry.path for entry in index_entries if entry.mode == _GITLINK_MODE
+    )
+    gitlink_entries = tuple(
+        FingerprintGitlinkEntry(path=entry.path, object_id=entry.object_id)
+        for entry in index_entries
+        if entry.mode == _GITLINK_MODE
+    )
+    all_paths = frozenset(split_null_terminated_records(first["tracked"])) | frozenset(
+        split_null_terminated_records(first["untracked"])
+    )
+
+    path_entries: list[FingerprintPathEntry] = []
+    per_path_stable = True
+    for raw_path in all_paths:
+        if raw_path in gitlink_paths:
+            continue
+        entry, stable = _capture_path_entry(target.root, raw_path)
+        if entry.type == "other":
+            raise PreflightError(
+                "git_safety.fingerprint_unsupported_type",
+                "A tracked or untracked path is not a regular file or symlink.",
+                technical_detail=f"path={raw_path!r}",
+            )
+        if entry.type == "missing" or not stable:
+            per_path_stable = False
+        path_entries.append(entry)
+
+    second, second_results = _sample_six_raw_probes(
+        process_runner,
+        git_executable,
+        target.root,
+        log_prefix=f"{log_prefix}-b",
+        utility_timeout_seconds=utility_timeout_seconds,
+        termination_grace_seconds=termination_grace_seconds,
+    )
+    all_results = first_results + second_results
+
+    if not per_path_stable or first != second:
+        raise _SnapshotUnstable(all_results)
+
+    fingerprint = build_git_state_fingerprint(
+        porcelain_raw=first["status"],
+        index_manifest_raw=first["index"],
+        tracked_raw=first["tracked"],
+        untracked_raw=first["untracked"],
+        path_entries=tuple(path_entries),
+        gitlink_entries=gitlink_entries,
+    )
+    state = GitState(
+        root=target.root,
+        branch=capture_branch(_display_safe_text(first["branch"])),
+        head=capture_head(_display_safe_text(first["head"])),
+        porcelain_summary=_display_safe_text(first["status"]),
+        staged=(),
+        unstaged=(),
+        untracked=(),
+        fingerprint=fingerprint,
+    )
+    return state, all_results
+
+
+def _indeterminate_git_state(target_root: Path) -> GitState:
+    return GitState(
+        root=target_root,
+        branch=None,
+        head=None,
+        porcelain_summary="",
+        staged=(),
+        unstaged=(),
+        untracked=(),
+        fingerprint=None,
+    )
+
+
+def capture_git_state(
+    process_runner: ProcessRunner,
+    *,
+    git_executable: Path,
+    target: TargetRepository,
+    clock: Clock,
+    utility_timeout_seconds: float,
+    termination_grace_seconds: float,
+) -> GitStateCapture:
+    """Capture one bounded, fail-closed `git-state-v1` snapshot.
+
+    At most two sampling passes share one `utility_timeout_seconds`
+    deadline (System Design SS11.2, M09-03): a first instability -- a race
+    detected via `lstat` bracketing or a manifest/status/branch/HEAD
+    resample mismatch -- triggers exactly one retry, provided the deadline
+    has not already passed; a second instability, a probe failure, a
+    permission error, an escaping path, or an unsupported file type is
+    classified `GitSafetyStatus.INDETERMINATE` rather than ever guessed
+    `SAFE`. This never compares against a baseline or a prior checkpoint --
+    that comparison, and any `UNSAFE` verdict it can produce, is M09-04's
+    job.
+    """
+
+    start_ns = clock.monotonic_ns()
+    deadline = deadline_ns(start_ns, utility_timeout_seconds)
+    accumulated: tuple[ProcessResult, ...] = ()
+
+    for attempt_index in range(2):
+        if attempt_index > 0 and clock.monotonic_ns() >= deadline:
+            break
+        try:
+            state, results = _sample_git_state_once(
+                process_runner,
+                git_executable=git_executable,
+                target=target,
+                utility_timeout_seconds=utility_timeout_seconds,
+                termination_grace_seconds=termination_grace_seconds,
+                attempt_index=attempt_index,
+            )
+        except _SnapshotUnstable as unstable:
+            accumulated = accumulated + unstable.process_results
+            continue
+        except PreflightError as error:
+            if error.code not in _INDETERMINATE_CAPTURE_CODES:
+                raise
+            return GitStateCapture(
+                state=_indeterminate_git_state(target.root),
+                safety_status=GitSafetyStatus.INDETERMINATE,
+                process_results=accumulated,
+            )
+        return GitStateCapture(
+            state=state,
+            safety_status=GitSafetyStatus.SAFE,
+            process_results=accumulated + results,
+        )
+
+    return GitStateCapture(
+        state=_indeterminate_git_state(target.root),
+        safety_status=GitSafetyStatus.INDETERMINATE,
+        process_results=accumulated,
     )
 
 
@@ -793,10 +1163,14 @@ __all__ = (
     "GIT_STATE_FINGERPRINT_VERSION",
     "FingerprintGitlinkEntry",
     "FingerprintPathEntry",
+    "GitStateCapture",
     "IndexEntry",
     "build_fingerprint_path_entry",
     "build_git_argv",
     "build_git_state_fingerprint",
+    "capture_branch",
+    "capture_git_state",
+    "capture_head",
     "check_branch_attached",
     "check_clean_worktree",
     "check_git_argv_is_allowlisted",

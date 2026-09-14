@@ -1,16 +1,20 @@
-"""Unit tests for the `git-state-v1` content-sensitive fingerprint (M09-02).
+"""Unit tests for the `git-state-v1` content-sensitive fingerprint (M09-02)
+and its bounded, fail-closed sampling primitives (M09-03).
 
 Covers framing/hash/version, ordering independence, raw path handling,
 regular/symlink/missing/other classification, the Git-significant
 executable bit, index and untracked parsing, a second edit to an
-already-`M` file, and gitlink/submodule records.
+already-`M` file, gitlink/submodule records, path-escape rejection, and
+the non-raising branch/HEAD capture helpers M09-03 uses instead of the
+M09-01 bootstrap gate's.
 
 Everything here is either a pure function (`build_git_state_fingerprint`,
 `parse_index_manifest`, `split_null_terminated_records`,
-`classify_lstat_mode`) or `build_fingerprint_path_entry` against real files
-under `tmp_path` -- no subprocess and no real Git repository is needed;
-end-to-end coverage against a real repository lives in
-`tests/component/test_git_repository.py` (M09-03+).
+`classify_lstat_mode`, `capture_branch`, `capture_head`) or
+`build_fingerprint_path_entry` against real files under `tmp_path` -- no
+subprocess and no real Git repository is needed; end-to-end coverage
+against a real repository, including race/deadline scenarios, lives in
+`tests/component/test_git_repository.py`.
 """
 
 from __future__ import annotations
@@ -31,6 +35,8 @@ from opencode_tools.git_safety import (
     FingerprintPathEntry,
     build_fingerprint_path_entry,
     build_git_state_fingerprint,
+    capture_branch,
+    capture_head,
     classify_lstat_mode,
     parse_index_manifest,
     split_null_terminated_records,
@@ -191,6 +197,36 @@ def test_build_fingerprint_path_entry_raises_on_an_unreadable_file(
         assert exc_info.value.code == "git_safety.fingerprint_path_unreadable"
     finally:
         unreadable.chmod(0o644)
+
+
+def test_build_fingerprint_path_entry_rejects_a_path_escaping_the_target(
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(PreflightError) as exc_info:
+        build_fingerprint_path_entry(tmp_path, b"../outside.txt")
+    assert exc_info.value.code == "git_safety.fingerprint_path_escapes_target"
+
+
+# --- capture_branch / capture_head (M09-03's non-raising captures) ---------
+
+
+def test_capture_branch_returns_the_branch_name() -> None:
+    assert capture_branch("main\n") == "main"
+
+
+def test_capture_branch_returns_none_for_a_detached_head() -> None:
+    assert capture_branch("") is None
+
+
+def test_capture_head_returns_the_stripped_sha() -> None:
+    sha = "a" * 40
+    assert capture_head(f"{sha}\n") == sha
+
+
+def test_capture_head_raises_on_empty_output() -> None:
+    with pytest.raises(PreflightError) as exc_info:
+        capture_head("")
+    assert exc_info.value.code == "git_safety.state_head_probe_failed"
 
 
 # --- build_git_state_fingerprint: framing, hash, version, ordering ---------

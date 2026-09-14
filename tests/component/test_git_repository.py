@@ -1,12 +1,19 @@
-"""Component tests for the read-only Git target preflight (M09-01).
+"""Component tests for the read-only Git target preflight (M09-01), the
+`git-state-v1` fingerprint's real-repository wiring, and bounded,
+fail-closed sampling stability (M09-03).
 
-Builds real temporary Git repositories and drives `resolve_target` through
-the real `SubprocessRunner` and a real `git` executable -- never a fixture
-or mock of `ProcessRunner` itself -- to prove AC-004 (path safety), AC-005
-(dirty preflight), AC-006 (Git shape), and AC-036 (a Git probe failure fails
-closed). `tests/component/helpers/fake_git.py` stands in for `git` only in
+Builds real temporary Git repositories and drives `resolve_target`/
+`capture_git_state` through the real `SubprocessRunner` and a real `git`
+executable -- never a fixture or mock of `ProcessRunner` itself -- to prove
+AC-004 (path safety), AC-005 (dirty preflight), AC-006 (Git shape), AC-036
+(a Git probe failure fails closed), and M09-03's race/error/deadline
+handling. `tests/component/helpers/fake_git.py` stands in for `git` only in
 the AC-036 cases, where a real hung or corrupted repository cannot be
-constructed deterministically.
+constructed deterministically; M09-03's own race and deadline scenarios use
+a real repository with `monkeypatch` forcing the specific internal signal
+(an unstable `lstat` bracket) that a real concurrent writer would produce,
+since a genuine timing race would make the test flaky rather than
+deterministic.
 """
 
 from __future__ import annotations
@@ -15,14 +22,20 @@ import os
 import subprocess
 import time
 from collections.abc import Callable
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
 
-from opencode_tools.domain import TargetRepository, Workspace
+from opencode_tools import git_safety
+from opencode_tools.domain import GitSafetyStatus, TargetRepository, Workspace
 from opencode_tools.errors import PreflightError
-from opencode_tools.git_safety import resolve_git_executable, resolve_target
+from opencode_tools.git_safety import (
+    capture_git_state,
+    resolve_git_executable,
+    resolve_target,
+)
 from opencode_tools.process import SubprocessRunner
 
 FAKE_GIT = Path(__file__).resolve().parent / "helpers" / "fake_git.py"
@@ -89,6 +102,21 @@ def _resolve(
         workspace=workspace,
         target_root=target_root,
         utility_timeout_seconds=UTILITY_TIMEOUT_SECONDS,
+        termination_grace_seconds=TERMINATION_GRACE_SECONDS,
+    )
+
+
+def _capture(
+    target: TargetRepository,
+    *,
+    utility_timeout_seconds: float = UTILITY_TIMEOUT_SECONDS,
+) -> git_safety.GitStateCapture:
+    return capture_git_state(
+        SubprocessRunner(RealClock()),
+        git_executable=GIT_EXECUTABLE,
+        target=target,
+        clock=RealClock(),
+        utility_timeout_seconds=utility_timeout_seconds,
         termination_grace_seconds=TERMINATION_GRACE_SECONDS,
     )
 
@@ -282,3 +310,213 @@ def test_ac_036_git_probe_failure_is_indeterminate(
     with pytest.raises(PreflightError) as ambiguous_error:
         _resolve(workspace, target, git_executable=FAKE_GIT)
     assert ambiguous_error.value.code == "git_safety.top_level_probe_failed"
+
+
+# =============================================================================
+# M09-03: capture_git_state -- bounded, fail-closed sampling stability
+# =============================================================================
+
+
+def test_capture_git_state_returns_safe_for_a_stable_clean_repository(
+    tmp_path: Path,
+) -> None:
+    workspace = _workspace(tmp_path / "workspace")
+    repo = _clean_repo(workspace.root / "repo")
+    target = _resolve(workspace, repo)
+
+    capture = _capture(target)
+
+    assert capture.safety_status is GitSafetyStatus.SAFE
+    assert capture.state.branch == "main"
+    assert capture.state.head
+    assert capture.state.fingerprint is not None
+    # Inventory extraction is M09-05's scope; M09-03 only classifies and
+    # fingerprints the snapshot.
+    assert capture.state.staged == ()
+    assert capture.state.unstaged == ()
+    assert capture.state.untracked == ()
+
+
+def test_capture_git_state_is_deterministic_across_repeated_calls(
+    tmp_path: Path,
+) -> None:
+    workspace = _workspace(tmp_path / "workspace")
+    repo = _clean_repo(workspace.root / "repo")
+    target = _resolve(workspace, repo)
+
+    first = _capture(target)
+    second = _capture(target)
+
+    assert first.state.fingerprint == second.state.fingerprint
+
+
+def test_capture_git_state_retries_once_on_a_first_instability_and_recovers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    workspace = _workspace(tmp_path / "workspace")
+    repo = _clean_repo(workspace.root / "repo")
+    target = _resolve(workspace, repo)
+
+    real_capture = git_safety._capture_path_entry
+    calls = {"n": 0}
+
+    def flaky_capture(
+        target_root: Path, raw_path: bytes
+    ) -> tuple[git_safety.FingerprintPathEntry, bool]:
+        calls["n"] += 1
+        entry, stable = real_capture(target_root, raw_path)
+        if calls["n"] == 1:
+            return entry, False
+        return entry, stable
+
+    monkeypatch.setattr(git_safety, "_capture_path_entry", flaky_capture)
+
+    capture = _capture(target)
+
+    assert capture.safety_status is GitSafetyStatus.SAFE
+    assert capture.state.fingerprint is not None
+    assert calls["n"] == 2
+
+
+def test_capture_git_state_returns_indeterminate_after_a_second_instability(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    workspace = _workspace(tmp_path / "workspace")
+    repo = _clean_repo(workspace.root / "repo")
+    target = _resolve(workspace, repo)
+
+    real_capture = git_safety._capture_path_entry
+
+    def always_unstable(
+        target_root: Path, raw_path: bytes
+    ) -> tuple[git_safety.FingerprintPathEntry, bool]:
+        entry, _stable = real_capture(target_root, raw_path)
+        return entry, False
+
+    monkeypatch.setattr(git_safety, "_capture_path_entry", always_unstable)
+
+    capture = _capture(target)
+
+    assert capture.safety_status is GitSafetyStatus.INDETERMINATE
+    assert capture.state.fingerprint is None
+    assert capture.state.branch is None
+    assert capture.state.head is None
+
+
+def test_capture_git_state_returns_indeterminate_on_a_permission_failure(
+    tmp_path: Path,
+) -> None:
+    workspace = _workspace(tmp_path / "workspace")
+    repo = workspace.root / "repo"
+    _init_repo(repo)
+    secret = repo / "secret.txt"
+    secret.write_text("shh\n", encoding="utf-8")
+    _commit_all(repo, "add secret")
+    target = _resolve(workspace, repo)
+
+    secret.chmod(0o000)
+    try:
+        capture = _capture(target)
+        assert capture.safety_status is GitSafetyStatus.INDETERMINATE
+    finally:
+        secret.chmod(0o644)
+
+
+def test_capture_git_state_returns_indeterminate_on_a_special_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Git's own working-tree scan silently skips FIFOs, sockets, and
+    device files -- neither `ls-files --others` nor `status` ever lists
+    one (verified directly against real `git`), so this path can only be
+    reached via a race that replaces an already-listed file with a special
+    one. `_capture_path_entry` is forced to report `"other"` directly,
+    exactly the outcome such a race would produce.
+    """
+
+    workspace = _workspace(tmp_path / "workspace")
+    repo = _clean_repo(workspace.root / "repo")
+    target = _resolve(workspace, repo)
+
+    real_capture = git_safety._capture_path_entry
+
+    def special_file_capture(
+        target_root: Path, raw_path: bytes
+    ) -> tuple[git_safety.FingerprintPathEntry, bool]:
+        entry, stable = real_capture(target_root, raw_path)
+        return replace(entry, type="other", content_hash=None), stable
+
+    monkeypatch.setattr(git_safety, "_capture_path_entry", special_file_capture)
+
+    capture = _capture(target)
+
+    assert capture.safety_status is GitSafetyStatus.INDETERMINATE
+
+
+def test_capture_git_state_returns_indeterminate_on_a_path_escape(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    workspace = _workspace(tmp_path / "workspace")
+    repo = _clean_repo(workspace.root / "repo")
+    target = _resolve(workspace, repo)
+
+    def escaping_capture(
+        target_root: Path, raw_path: bytes
+    ) -> tuple[git_safety.FingerprintPathEntry, bool]:
+        raise PreflightError(
+            "git_safety.fingerprint_path_escapes_target", "forced for test"
+        )
+
+    monkeypatch.setattr(git_safety, "_capture_path_entry", escaping_capture)
+
+    capture = _capture(target)
+
+    assert capture.safety_status is GitSafetyStatus.INDETERMINATE
+
+
+class _FakeDeadlineClock:
+    """A `Clock` whose second `monotonic_ns()` call reports far past any
+    deadline, so `capture_git_state`'s retry-gate deterministically skips
+    the retry -- real wall-clock timing would make this flaky."""
+
+    def __init__(self) -> None:
+        self._calls = 0
+
+    def now(self) -> datetime:
+        return datetime.now(UTC)
+
+    def monotonic_ns(self) -> int:
+        self._calls += 1
+        return 0 if self._calls == 1 else 10**18
+
+
+def test_capture_git_state_does_not_retry_past_the_deadline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    workspace = _workspace(tmp_path / "workspace")
+    repo = _clean_repo(workspace.root / "repo")
+    target = _resolve(workspace, repo)
+
+    real_capture = git_safety._capture_path_entry
+
+    def always_unstable(
+        target_root: Path, raw_path: bytes
+    ) -> tuple[git_safety.FingerprintPathEntry, bool]:
+        entry, _stable = real_capture(target_root, raw_path)
+        return entry, False
+
+    monkeypatch.setattr(git_safety, "_capture_path_entry", always_unstable)
+
+    capture = capture_git_state(
+        SubprocessRunner(RealClock()),
+        git_executable=GIT_EXECUTABLE,
+        target=target,
+        clock=_FakeDeadlineClock(),
+        utility_timeout_seconds=UTILITY_TIMEOUT_SECONDS,
+        termination_grace_seconds=TERMINATION_GRACE_SECONDS,
+    )
+
+    assert capture.safety_status is GitSafetyStatus.INDETERMINATE
+    # Only the first attempt's twelve probes (six initial + six resample)
+    # ran; the deadline had already passed before a second attempt could be
+    # considered.
+    assert len(capture.process_results) == 12
