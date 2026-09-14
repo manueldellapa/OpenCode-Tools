@@ -1,20 +1,26 @@
-"""Component tests for the attempt sequence and technical precedence (M12-02).
+"""Component tests for the attempt sequence, precedence, and persistence
+(M12-03).
 
-Drives `orchestrator.IssueOrchestrator` across a short, realistic sequence of
+Drives `orchestrator.IssueOrchestrator` across short, realistic sequences of
 logical invocations (architect, a coder/reviewer cycle, a rework cycle, and a
 retried provider attempt) using real `tmp_path`-derived absolute paths for
 `Workspace`/`TargetRepository`, exactly as a composed run would see them,
-while every port stays a fake: M12-02 explicitly excludes concrete adapters
-and a real retry/rework loop. This file proves the Git checkpoint continuity
-chain (each attempt's "before" equals the last *accepted* "after") and the
-attempt classification hold across more than one invocation, including a
-drifted checkpoint that must never become the new trusted baseline.
+while every port stays a fake: this module explicitly excludes concrete
+adapters and a real retry/rework loop. It proves the Git checkpoint
+continuity chain (each attempt's "before" equals the last *accepted*
+"after"), the attempt classification, and -- for M12-03 -- that a distinct
+`AttemptRecord` is persisted after every completed attempt without ever
+overwriting an earlier one, that a `RunStorePort.persist` failure blocks
+every later invocation while leaving the run's identity/counters intact, and
+that a cancellation observed mid-invocation blocks the next one too.
 """
 
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+
+import pytest
 
 from opencode_tools.domain import (
     AgentResult,
@@ -27,12 +33,14 @@ from opencode_tools.domain import (
     PersistenceStatus,
     PipelinePhase,
     ProcessResult,
+    ProviderRetryConfig,
     ReviewStatus,
     RunOutcome,
     RunRecord,
     TargetRepository,
     Workspace,
 )
+from opencode_tools.errors import LoggingError, RunInterruptedError
 from opencode_tools.orchestrator import (
     InvocationEventKind,
     IssueOrchestrator,
@@ -49,14 +57,16 @@ _PHASE_BY_ROLE: dict[AgentRole, PipelinePhase] = {
 NOW = datetime(2026, 9, 14, 9, 0, 0, tzinfo=UTC)
 
 
-def _agent_process_result(*, workspace_root: Path) -> ProcessResult:
+def _agent_process_result(
+    *, workspace_root: Path, outcome: RunOutcome = RunOutcome.SUCCEEDED
+) -> ProcessResult:
     return ProcessResult(
         command=("/usr/bin/opencode", "run"),
         cwd=workspace_root,
         started_at=NOW,
         finished_at=NOW + timedelta(seconds=5),
         duration_ns=5_000_000_000,
-        return_code=0,
+        return_code=0 if outcome is RunOutcome.SUCCEEDED else None,
         timed_out=False,
         termination_confirmed=True,
         log_path=Path("attempt.log"),
@@ -64,7 +74,7 @@ def _agent_process_result(*, workspace_root: Path) -> ProcessResult:
         stdout_sha256="stdout-digest",
         stderr_byte_count=0,
         stderr_sha256="stderr-digest",
-        outcome=RunOutcome.SUCCEEDED,
+        outcome=outcome,
     )
 
 
@@ -88,18 +98,22 @@ def _agent_result(
     review_cycle: int | None,
     provider_attempt: int,
     workspace_root: Path,
+    process_outcome: RunOutcome = RunOutcome.SUCCEEDED,
 ) -> AgentResult:
+    interrupted_or_failed = process_outcome is not RunOutcome.SUCCEEDED
     return AgentResult(
         role=role,
         phase=_PHASE_BY_ROLE[role],
         review_cycle=review_cycle,
         provider_attempt=provider_attempt,
-        process=_agent_process_result(workspace_root=workspace_root),
-        terminal_response=_success_response(role),
+        process=_agent_process_result(
+            workspace_root=workspace_root, outcome=process_outcome
+        ),
+        terminal_response=None if interrupted_or_failed else _success_response(role),
         session_id=f"session-{role.value.lower()}-{review_cycle or 0}-{provider_attempt}",
         verified_agent=role.value.lower(),
         provider_diagnostic=None,
-        outcome=RunOutcome.SUCCEEDED,
+        outcome=process_outcome,
     )
 
 
@@ -142,14 +156,21 @@ class RecordingAttemptLogSink:
 
 
 class SequencedRunStorePort:
-    """A `RunStorePort` fake that opens one fresh sink per attempt."""
+    """A `RunStorePort` fake that opens one fresh sink per attempt and
+    records every `persist` call, optionally scripted to fail."""
 
-    def __init__(self) -> None:
+    def __init__(
+        self, *, persist_results: list[PersistenceStatus] | None = None
+    ) -> None:
         self.sink_calls: list[tuple[AgentRole, int | None, int]] = []
         self.opened_sinks: list[RecordingAttemptLogSink] = []
+        self.persist_calls: list[RunRecord] = []
+        self._persist_results = (
+            list(persist_results) if persist_results is not None else None
+        )
 
     def initialize(self, workspace: Workspace, run_id: str) -> Path:
-        raise AssertionError("not exercised by the M12-02 skeleton")
+        raise AssertionError("bootstrap concern, not exercised here")
 
     def open_attempt_sink(
         self,
@@ -166,7 +187,10 @@ class SequencedRunStorePort:
         return sink
 
     def persist(self, record: RunRecord) -> PersistenceStatus:
-        raise AssertionError("not exercised by the M12-02 skeleton")
+        self.persist_calls.append(record)
+        if self._persist_results is not None:
+            return self._persist_results.pop(0)
+        return PersistenceStatus.OK
 
 
 class SequencedAgentRunner:
@@ -200,12 +224,12 @@ class SequencedGitSafetyPort:
         ] = []
 
     def check_runtime_location(self, runtime_root: Path) -> None:
-        raise AssertionError("not exercised by the M12-02 skeleton")
+        raise AssertionError("not exercised by this issue's orchestrator scope")
 
     def resolve_target(
         self, workspace: Workspace, target_root: Path
     ) -> TargetRepository:
-        raise AssertionError("not exercised by the M12-02 skeleton")
+        raise AssertionError("not exercised by this issue's orchestrator scope")
 
     def check(
         self,
@@ -232,7 +256,7 @@ class SteppingClock:
         return current
 
     def monotonic_ns(self) -> int:
-        raise AssertionError("not exercised by the M12-02 skeleton")
+        raise AssertionError("not exercised by this issue's orchestrator scope")
 
 
 def _git_state(*, target_root: Path, fingerprint: str) -> GitState:
@@ -265,20 +289,34 @@ def _git_check(
     )
 
 
-def test_logical_invocations_across_a_rework_cycle_keep_checkpoint_continuity(
-    tmp_path: Path,
-) -> None:
-    """A skeleton architect -> coder -> reviewer -> coder rework sequence.
+def _provider_retry_config() -> ProviderRetryConfig:
+    return ProviderRetryConfig(
+        max_attempts=3,
+        initial_delay_seconds=1.0,
+        multiplier=2.0,
+        max_delay_seconds=30.0,
+    )
 
-    No adapter or subprocess is ever constructed; every side effect goes
-    through the injected `AgentRunner`/`RunStorePort`/`GitSafetyPort`/`Clock`
-    fakes. Proves each logical invocation's Git "before" checkpoint is
-    continuous with the previous one's "after" (never a fresh, isolated
-    snapshot), that a drifted checkpoint is detected but never becomes the
-    next trusted baseline, and that identity/counters remain unambiguous
-    across a provider retry.
-    """
 
+def _initial_record(
+    *, run_id: str, workspace: Workspace, target: TargetRepository
+) -> RunRecord:
+    return RunRecord(
+        schema_version=1,
+        run_id=run_id,
+        artifact_path=workspace.root / ".opencode-tools" / "runs" / run_id / "run.json",
+        workspace=workspace,
+        target=target,
+        issue_number=1,
+        config={},
+        environment={},
+        started_at=NOW,
+        current_phase=PipelinePhase.PREFLIGHT,
+        persistence_status=PersistenceStatus.OK,
+    )
+
+
+def _workspace_and_target(tmp_path: Path) -> tuple[Workspace, TargetRepository]:
     workspace_root = tmp_path / "workspace"
     workspace_root.mkdir()
     workspace = Workspace(root=workspace_root)
@@ -289,6 +327,27 @@ def test_logical_invocations_across_a_rework_cycle_keep_checkpoint_continuity(
         workspace_relative=Path("target"),
         git_common_dir=target_root / ".git",
     )
+    return workspace, target
+
+
+def test_logical_invocations_across_a_rework_cycle_keep_checkpoint_continuity(
+    tmp_path: Path,
+) -> None:
+    """A skeleton architect -> coder -> reviewer -> coder rework sequence.
+
+    No adapter or subprocess is ever constructed; every side effect goes
+    through the injected `AgentRunner`/`RunStorePort`/`GitSafetyPort`/`Clock`
+    fakes. Proves each logical invocation's Git "before" checkpoint is
+    continuous with the previous one's "after" (never a fresh, isolated
+    snapshot), that a drifted checkpoint is detected but never becomes the
+    next trusted baseline, that identity/counters remain unambiguous across
+    a provider retry, and that every completed attempt is persisted as a
+    distinct, accumulating `AttemptRecord` (M12-03).
+    """
+
+    workspace, target = _workspace_and_target(tmp_path)
+    workspace_root = workspace.root
+    target_root = target.root
 
     plan = [
         (AgentRole.ARCHITECT, None, 1),
@@ -342,12 +401,14 @@ def test_logical_invocations_across_a_rework_cycle_keep_checkpoint_continuity(
     agent_runner = SequencedAgentRunner(agent_results)
     git_safety = SequencedGitSafetyPort(git_results)
     orchestrator = IssueOrchestrator(
-        run_id="run-2026-09-14-abcd",
-        target=target,
+        initial_record=_initial_record(
+            run_id="run-2026-09-14-abcd", workspace=workspace, target=target
+        ),
         agent_runner=agent_runner,
         run_store=run_store,
         git_safety=git_safety,
         clock=SteppingClock(start=NOW),
+        provider_retry=_provider_retry_config(),
     )
 
     outcomes: list[LogicalInvocationResult] = [
@@ -448,20 +509,28 @@ def test_logical_invocations_across_a_rework_cycle_keep_checkpoint_continuity(
         timestamps = [event.timestamp for event in outcome.events]
         assert timestamps == sorted(timestamps)
 
+    # M12-03: every completed attempt is persisted, once each, as a distinct
+    # record that accumulates without ever overwriting an earlier one.
+    assert len(run_store.persist_calls) == 5
+    for count, persisted in enumerate(run_store.persist_calls, start=1):
+        assert len(persisted.attempts) == count
+    final_snapshot = run_store.persist_calls[-1]
+    assert [attempt.role for attempt in final_snapshot.attempts] == [
+        role for role, _c, _a in plan
+    ]
+    assert [attempt.provider_attempt for attempt in final_snapshot.attempts] == [
+        attempt for _r, _c, attempt in plan
+    ]
+    # Earlier snapshots are prefixes of the final one: nothing was rewritten.
+    for count, persisted in enumerate(run_store.persist_calls, start=1):
+        assert persisted.attempts == final_snapshot.attempts[:count]
+
 
 def test_a_git_before_drift_blocks_the_agent_and_the_run_store_still_opened_a_sink(
     tmp_path: Path,
 ) -> None:
-    workspace_root = tmp_path / "workspace"
-    workspace_root.mkdir()
-    workspace = Workspace(root=workspace_root)
-    target_root = workspace_root / "target"
-    target_root.mkdir()
-    target = TargetRepository(
-        root=target_root,
-        workspace_relative=Path("target"),
-        git_common_dir=target_root / ".git",
-    )
+    workspace, target = _workspace_and_target(tmp_path)
+    target_root = target.root
 
     drifted_before = _git_check(
         target_root=target_root,
@@ -474,12 +543,14 @@ def test_a_git_before_drift_blocks_the_agent_and_the_run_store_still_opened_a_si
     agent_runner = SequencedAgentRunner([])
     git_safety = SequencedGitSafetyPort([drifted_before])
     orchestrator = IssueOrchestrator(
-        run_id="run-2026-09-14-efgh",
-        target=target,
+        initial_record=_initial_record(
+            run_id="run-2026-09-14-efgh", workspace=workspace, target=target
+        ),
         agent_runner=agent_runner,
         run_store=run_store,
         git_safety=git_safety,
         clock=SteppingClock(start=NOW),
+        provider_retry=_provider_retry_config(),
     )
 
     result = orchestrator.run_logical_invocation(
@@ -493,10 +564,12 @@ def test_a_git_before_drift_blocks_the_agent_and_the_run_store_still_opened_a_si
     assert agent_runner.calls == []
     assert run_store.sink_calls == [(AgentRole.CODER, 1, 1)]
     assert run_store.opened_sinks[0].closed is True
+    assert run_store.persist_calls == []  # a blocked attempt is never persisted
     assert result.git_before is drifted_before
     assert result.agent_result is None
     assert result.git_after is None
     assert result.precedence is None
+    assert result.retry_decision is None
     assert [event.kind for event in result.events] == [
         InvocationEventKind.INVOCATION_STARTED,
         InvocationEventKind.ATTEMPT_SINK_OPENED,
@@ -504,3 +577,185 @@ def test_a_git_before_drift_blocks_the_agent_and_the_run_store_still_opened_a_si
         InvocationEventKind.ATTEMPT_SINK_CLOSED,
         InvocationEventKind.BLOCKED_BY_GIT_SAFETY,
     ]
+
+
+def test_a_run_store_persist_failure_blocks_every_later_invocation(
+    tmp_path: Path,
+) -> None:
+    """M12-03: a `run.json` persist fault -- disk full, fsync/replace
+    failure, whatever the concrete adapter reports as non-`OK` -- must
+    interrupt new invocations (System Design SS15.4) while leaving the
+    already-completed attempt's own identity/counters authoritative."""
+
+    workspace, target = _workspace_and_target(tmp_path)
+    workspace_root = workspace.root
+    target_root = target.root
+
+    plan = [
+        (AgentRole.ARCHITECT, None, 1),
+        (AgentRole.CODER, 1, 1),
+    ]
+    agent_results = [
+        _agent_result(
+            role=role,
+            review_cycle=review_cycle,
+            provider_attempt=provider_attempt,
+            workspace_root=workspace_root,
+        )
+        for role, review_cycle, provider_attempt in plan
+    ]
+    git_results = [
+        _git_check(
+            target_root=target_root,
+            sequence=0,
+            purpose="architect:0:1:before",
+            fingerprint="fp-0",
+        ),
+        _git_check(
+            target_root=target_root,
+            sequence=1,
+            purpose="architect:0:1:after",
+            fingerprint="fp-1",
+        ),
+        _git_check(
+            target_root=target_root,
+            sequence=2,
+            purpose="coder:1:1:before",
+            fingerprint="fp-1",
+        ),
+        _git_check(
+            target_root=target_root,
+            sequence=3,
+            purpose="coder:1:1:after",
+            fingerprint="fp-2",
+        ),
+    ]
+
+    run_store = SequencedRunStorePort(
+        persist_results=[PersistenceStatus.OK, PersistenceStatus.FAILED]
+    )
+    agent_runner = SequencedAgentRunner(agent_results)
+    git_safety = SequencedGitSafetyPort(git_results)
+    orchestrator = IssueOrchestrator(
+        initial_record=_initial_record(
+            run_id="run-2026-09-14-ijkl", workspace=workspace, target=target
+        ),
+        agent_runner=agent_runner,
+        run_store=run_store,
+        git_safety=git_safety,
+        clock=SteppingClock(start=NOW),
+        provider_retry=_provider_retry_config(),
+    )
+
+    architect_result = orchestrator.run_logical_invocation(
+        role=AgentRole.ARCHITECT,
+        review_cycle=None,
+        provider_attempt=1,
+        prompt="Design the fix.",
+        workspace=workspace,
+    )
+    assert architect_result.precedence is not None
+    assert architect_result.precedence.outcome is RunOutcome.SUCCEEDED
+
+    with pytest.raises(LoggingError, match="persist"):
+        orchestrator.run_logical_invocation(
+            role=AgentRole.CODER,
+            review_cycle=1,
+            provider_attempt=1,
+            prompt="Implement the fix.",
+            workspace=workspace,
+        )
+
+    assert len(run_store.persist_calls) == 2
+    assert len(run_store.persist_calls[0].attempts) == 1  # the architect's, OK
+    assert len(run_store.persist_calls[1].attempts) == 2  # the coder's, FAILED
+
+    with pytest.raises(LoggingError, match="persistence"):
+        orchestrator.run_logical_invocation(
+            role=AgentRole.CODER,
+            review_cycle=1,
+            provider_attempt=2,
+            prompt="Implement the fix, retried.",
+            workspace=workspace,
+        )
+
+    # The blocked retry never opened a third sink and never touched Git or
+    # the agent runner again: it failed fast, before anything else.
+    assert run_store.sink_calls == [
+        (AgentRole.ARCHITECT, None, 1),
+        (AgentRole.CODER, 1, 1),
+    ]
+    assert len(agent_runner.calls) == 2
+    assert len(git_safety.calls) == 4
+    assert len(run_store.persist_calls) == 2
+
+
+def test_cancellation_observed_during_an_attempt_blocks_the_next_invocation(
+    tmp_path: Path,
+) -> None:
+    """The "durante" (active) cancellation case with real paths: the child
+    itself reports `INTERRUPTED`; this attempt still completes and is still
+    persisted, but the following invocation is blocked (System Design
+    SH-001)."""
+
+    workspace, target = _workspace_and_target(tmp_path)
+    workspace_root = workspace.root
+    target_root = target.root
+
+    interrupted_result = _agent_result(
+        role=AgentRole.CODER,
+        review_cycle=1,
+        provider_attempt=1,
+        workspace_root=workspace_root,
+        process_outcome=RunOutcome.INTERRUPTED,
+    )
+    git_results = [
+        _git_check(
+            target_root=target_root,
+            sequence=0,
+            purpose="coder:1:1:before",
+            fingerprint="fp-0",
+        ),
+        _git_check(
+            target_root=target_root,
+            sequence=1,
+            purpose="coder:1:1:after",
+            fingerprint="fp-1",
+        ),
+    ]
+
+    run_store = SequencedRunStorePort()
+    agent_runner = SequencedAgentRunner([interrupted_result])
+    git_safety = SequencedGitSafetyPort(git_results)
+    orchestrator = IssueOrchestrator(
+        initial_record=_initial_record(
+            run_id="run-2026-09-14-mnop", workspace=workspace, target=target
+        ),
+        agent_runner=agent_runner,
+        run_store=run_store,
+        git_safety=git_safety,
+        clock=SteppingClock(start=NOW),
+        provider_retry=_provider_retry_config(),
+    )
+
+    result = orchestrator.run_logical_invocation(
+        role=AgentRole.CODER,
+        review_cycle=1,
+        provider_attempt=1,
+        prompt="Implement the fix.",
+        workspace=workspace,
+    )
+    assert result.agent_result is interrupted_result
+    assert len(run_store.persist_calls) == 1
+
+    with pytest.raises(RunInterruptedError):
+        orchestrator.run_logical_invocation(
+            role=AgentRole.CODER,
+            review_cycle=1,
+            provider_attempt=2,
+            prompt="Implement the fix, retried.",
+            workspace=workspace,
+        )
+
+    assert len(agent_runner.calls) == 1
+    assert run_store.sink_calls == [(AgentRole.CODER, 1, 1)]
