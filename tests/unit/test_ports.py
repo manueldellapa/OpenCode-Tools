@@ -339,6 +339,7 @@ class FakeTargetLease:
         self.entered = False
         self.exited_with: BaseException | None = None
         self.exit_called = False
+        self.quarantine_calls: list[str] = []
 
     def __enter__(self) -> Self:
         self.entered = True
@@ -352,6 +353,9 @@ class FakeTargetLease:
     ) -> None:
         self.exit_called = True
         self.exited_with = exc
+
+    def quarantine(self, reason: str) -> None:
+        self.quarantine_calls.append(reason)
 
 
 class FakeTargetLeaseFactory:
@@ -498,10 +502,12 @@ def test_target_lease_factory_port_acquires_a_context_managed_lease() -> None:
     fake = FakeTargetLeaseFactory(lease)
     factory: TargetLeaseFactory = fake
 
-    with factory.acquire(TARGET_ROOT, RUNTIME_ROOT, "run-001"):
+    with factory.acquire(TARGET_ROOT, RUNTIME_ROOT, "run-001") as acquired:
         assert lease.entered is True
         assert lease.exit_called is False
+        acquired.quarantine("unconfirmed termination")
 
     assert fake.calls == [(TARGET_ROOT, RUNTIME_ROOT, "run-001")]
     assert lease.exit_called is True
     assert lease.exited_with is None
+    assert lease.quarantine_calls == ["unconfirmed termination"]

@@ -421,6 +421,47 @@ def _fsync_directory_best_effort(path: Path) -> None:
         os.close(directory_fd)
 
 
+def write_private_file_atomically(path: Path, payload: bytes) -> None:
+    """Atomically replace `path` with `payload` (System Design SS15.4;
+    ADR-008; M10-03).
+
+    The same mechanism `persist_run_record` uses inline for `run.json`,
+    factored out so another artifact -- `locking.py`'s persistent
+    quarantine marker -- gets the identical atomicity and failure-cleanup
+    guarantee without duplicating it: a fresh, unpredictable, exclusive,
+    mode-`0600` temp file in the same directory (`open_private_exclusive`),
+    `flush` and `fsync`, `os.replace()` onto `path`, then a best-effort
+    directory `fsync`. A previously persisted file at `path` is left
+    untouched on any failure -- only this call's own temp file is
+    best-effort removed. Raises `OSError` unwrapped so each caller maps
+    it onto its own error taxonomy and code; `persist_run_record` keeps
+    its own inline sequence rather than calling this, to preserve its two
+    already-shipped, separately coded write-phase and replace-phase
+    failures unchanged.
+    """
+
+    directory = path.parent
+    temp_path = directory / _temp_document_name()
+
+    file_descriptor = open_private_exclusive(temp_path)
+    try:
+        with os.fdopen(file_descriptor, "wb") as stream:
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+    except OSError:
+        _best_effort_unlink(temp_path)
+        raise
+
+    try:
+        os.replace(temp_path, path)
+    except OSError:
+        _best_effort_unlink(temp_path)
+        raise
+
+    _fsync_directory_best_effort(directory)
+
+
 def persist_run_record(record: RunRecord) -> None:
     """Atomically replace `record.artifact_path` (`run.json`) on disk.
 
@@ -615,4 +656,5 @@ __all__ = (
     "open_private_exclusive",
     "persist_run_record",
     "serialize_run_record",
+    "write_private_file_atomically",
 )

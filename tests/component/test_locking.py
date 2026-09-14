@@ -1,5 +1,6 @@
 """Component tests for the M10-02 target-scoped, non-blocking POSIX lock
-lease (System Design SS16; ADR-006; ADR-009).
+lease and the M10-03 persistent quarantine (System Design SS16; ADR-006;
+ADR-009).
 
 Builds real temporary Git repositories (including linked worktrees) and
 drives `PosixTargetLeaseFactory`/`PosixTargetLease` through the real
@@ -22,12 +23,14 @@ from pathlib import Path
 
 import pytest
 
-from opencode_tools.errors import PreflightError
+from opencode_tools import locking as locking_module
+from opencode_tools.errors import LoggingError, PreflightError
 from opencode_tools.git_safety import resolve_absolute_git_dir, resolve_git_executable
 from opencode_tools.locking import (
     LOCK_METADATA_FILENAME,
     PosixTargetLeaseFactory,
     coordination_directory,
+    quarantine_path,
     target_lock_path,
 )
 from opencode_tools.process import SubprocessRunner
@@ -308,3 +311,78 @@ def test_acquire_fails_closed_when_flock_is_unreliable(
     with pytest.raises(PreflightError) as exc_info:
         _factory().acquire(repo, runtime_root, "run-001")
     assert exc_info.value.code == "locking.advisory_lock_unavailable"
+
+
+# =============================================================================
+# M10-03: persistent quarantine for an unconfirmed termination
+# =============================================================================
+
+
+def test_quarantine_writes_an_atomic_mode_0600_marker(tmp_path: Path) -> None:
+    repo = _init_repo(tmp_path / "repo")
+    runtime_root = tmp_path / ".opencode-tools"
+    lease = _factory().acquire(repo, runtime_root, "run-001")
+
+    lease.quarantine("unconfirmed process-group termination")
+
+    marker_path = quarantine_path(_git_dir(repo))
+    assert marker_path.is_file()
+    assert stat.S_IMODE(marker_path.stat().st_mode) == 0o600
+    marker = json.loads(marker_path.read_text(encoding="utf-8"))
+    assert marker["run_id"] == "run-001"
+    assert marker["reason"] == "unconfirmed process-group termination"
+    assert marker["pid"] == os.getpid()
+
+    lease.release()
+
+
+def test_quarantine_blocks_a_new_run_even_without_an_active_lock(
+    tmp_path: Path,
+) -> None:
+    repo = _init_repo(tmp_path / "repo")
+    runtime_root = tmp_path / ".opencode-tools"
+    lease = _factory().acquire(repo, runtime_root, "run-001")
+    lease.quarantine("unconfirmed process-group termination")
+    lease.release()
+
+    with pytest.raises(PreflightError) as exc_info:
+        _factory().acquire(repo, runtime_root, "run-002")
+    assert exc_info.value.code == "locking.target_quarantined"
+
+
+def test_quarantine_marker_is_never_removed_automatically(tmp_path: Path) -> None:
+    repo = _init_repo(tmp_path / "repo")
+    runtime_root = tmp_path / ".opencode-tools"
+    lease = _factory().acquire(repo, runtime_root, "run-001")
+    lease.quarantine("unconfirmed process-group termination")
+    lease.release()
+    marker_path = quarantine_path(_git_dir(repo))
+
+    for attempt in range(3):
+        with pytest.raises(PreflightError):
+            _factory().acquire(repo, runtime_root, f"run-{attempt + 2:03d}")
+
+    assert marker_path.exists()
+
+
+def test_quarantine_write_failure_raises_logging_error_and_preserves_the_lease(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = _init_repo(tmp_path / "repo")
+    runtime_root = tmp_path / ".opencode-tools"
+    lease = _factory().acquire(repo, runtime_root, "run-001")
+
+    def _raise(path: Path, payload: bytes) -> None:
+        raise OSError("simulated disk-full quarantine write failure")
+
+    monkeypatch.setattr(locking_module, "write_private_file_atomically", _raise)
+
+    with pytest.raises(LoggingError) as exc_info:
+        lease.quarantine("unconfirmed process-group termination")
+    assert exc_info.value.code == "locking.quarantine_write_failed"
+
+    # The write failure does not corrupt the lease itself: it can still
+    # be released normally afterward, exactly as the DoD requires ("final
+    # status stays FAILED", not some new, unreleasable state).
+    lease.release()
+    assert not quarantine_path(_git_dir(repo)).exists()

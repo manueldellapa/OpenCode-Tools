@@ -1,5 +1,5 @@
-"""Target-scoped, non-blocking POSIX lock lease (System Design SS16; ADR-006;
-ADR-009; M10-02).
+"""Target-scoped, non-blocking POSIX lock lease and persistent quarantine
+(System Design SS16; ADR-006; ADR-009; M10-02, M10-03).
 
 Two conforming runs on the same checkout would invalidate baseline
 attribution and review; a lock inside the configurable runtime location
@@ -24,8 +24,15 @@ on disk never implies an active lock, and a residual file with no live
 `flock` never blocks a fresh acquisition.
 
 The returned `PosixTargetLease` (`ports.TargetLease`) releases the OS lock
-on `__exit__`. Quarantine for an unconfirmed process-group termination is
-M10-03's addition to this same module.
+on `__exit__`. Its `quarantine` method (M10-03) atomically writes
+`quarantine-v1.json` in the same coordination directory -- via
+`runlog.write_private_file_atomically` -- before the lease is released,
+for a process group whose termination could not be confirmed. `acquire`
+checks for that marker before ever attempting the lock, so a quarantined
+target blocks a new run even with no active `flock`; the marker is never
+removed automatically, and a write failure raises `LoggingError` rather
+than being silently treated as a successful block (System Design SS16.3;
+ADR-006).
 """
 
 from __future__ import annotations
@@ -39,13 +46,16 @@ import stat
 from pathlib import Path
 from typing import Self
 
-from opencode_tools.errors import PreflightError
+from opencode_tools.errors import LoggingError, PreflightError
 from opencode_tools.git_safety import resolve_absolute_git_dir
 from opencode_tools.ports import Clock, ProcessRunner
+from opencode_tools.runlog import write_private_file_atomically
 
 COORDINATION_DIRECTORY_NAME = "opencode-tools"
 LOCK_FILENAME = "target.lock"
 LOCK_METADATA_FILENAME = "target.lock.meta.json"
+QUARANTINE_FILENAME = "quarantine-v1.json"
+QUARANTINE_SCHEMA_VERSION = 1
 
 _DIRECTORY_MODE = 0o700
 _FILE_MODE = 0o600
@@ -61,6 +71,10 @@ def coordination_directory(git_common_dir: Path) -> Path:
 
 def target_lock_path(git_common_dir: Path) -> Path:
     return coordination_directory(git_common_dir) / LOCK_FILENAME
+
+
+def quarantine_path(git_common_dir: Path) -> Path:
+    return coordination_directory(git_common_dir) / QUARANTINE_FILENAME
 
 
 def _target_digest(target_root: Path) -> str:
@@ -157,9 +171,51 @@ def _read_holder_metadata(path: Path) -> str | None:
         return None
 
 
+def write_quarantine(
+    coordination_dir: Path,
+    *,
+    run_id: str,
+    target_root: Path,
+    reason: str,
+    clock: Clock,
+) -> None:
+    """Atomically write the persistent `quarantine-v1.json` marker for an
+    unconfirmed process-group termination, before the lease is released
+    (System Design SS16.3; ADR-006; M10-03).
+
+    Never removed automatically -- the user inspects the target and
+    process state and removes it deliberately. A write failure raises
+    `LoggingError` rather than being swallowed: the caller preserves it
+    as an additional cause and still finalizes `FAILED`, but must warn
+    that future exclusion on this target is no longer guaranteed.
+    """
+
+    _ensure_coordination_directory(coordination_dir)
+    payload = json.dumps(
+        {
+            "schema_version": QUARANTINE_SCHEMA_VERSION,
+            "run_id": run_id,
+            "pid": os.getpid(),
+            "host": socket.gethostname(),
+            "quarantined_at": _format_timestamp(clock),
+            "reason": reason,
+            "target_digest": _target_digest(target_root),
+        }
+    ).encode("utf-8")
+    try:
+        write_private_file_atomically(coordination_dir / QUARANTINE_FILENAME, payload)
+    except OSError as error:
+        raise LoggingError(
+            "locking.quarantine_write_failed",
+            "failed to write the persistent quarantine marker; future "
+            "exclusion on this target is not guaranteed",
+            technical_detail=type(error).__name__,
+        ) from None
+
+
 class PosixTargetLease:
     """A held, non-blocking `flock` lease on one target's coordination
-    lock file (`ports.TargetLease`; ADR-006; M10-02)."""
+    lock file (`ports.TargetLease`; ADR-006; M10-02, M10-03)."""
 
     def __init__(
         self,
@@ -189,6 +245,21 @@ class PosixTargetLease:
         traceback: object,
     ) -> None:
         self.release()
+
+    def quarantine(self, reason: str) -> None:
+        """Write the persistent quarantine marker for this lease's target
+        (M10-03). Call before exiting the context when a process group's
+        termination could not be confirmed; the lease is still released
+        normally afterward -- this never substitutes for `release()`.
+        """
+
+        write_quarantine(
+            self._coordination_dir,
+            run_id=self._run_id,
+            target_root=self._target_root,
+            reason=reason,
+            clock=self._clock,
+        )
 
     def release(self) -> None:
         """Release the OS lock. Idempotent; the lock file itself is left
@@ -236,6 +307,17 @@ class PosixTargetLeaseFactory:
             termination_grace_seconds=self._termination_grace_seconds,
         )
         coordination_dir = coordination_directory(git_common_dir)
+
+        quarantine_marker = coordination_dir / QUARANTINE_FILENAME
+        if quarantine_marker.exists():
+            raise PreflightError(
+                "locking.target_quarantined",
+                "The target is quarantined after an unconfirmed "
+                "termination; manual recovery is required before a new "
+                "run can proceed.",
+                technical_detail=str(quarantine_marker),
+            )
+
         _ensure_coordination_directory(coordination_dir)
         lock_path = coordination_dir / LOCK_FILENAME
 
@@ -279,8 +361,12 @@ __all__ = (
     "COORDINATION_DIRECTORY_NAME",
     "LOCK_FILENAME",
     "LOCK_METADATA_FILENAME",
+    "QUARANTINE_FILENAME",
+    "QUARANTINE_SCHEMA_VERSION",
     "PosixTargetLease",
     "PosixTargetLeaseFactory",
     "coordination_directory",
+    "quarantine_path",
     "target_lock_path",
+    "write_quarantine",
 )

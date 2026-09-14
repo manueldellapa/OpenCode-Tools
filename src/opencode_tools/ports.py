@@ -221,6 +221,22 @@ class TargetLease(Protocol):
         traceback: TracebackType | None,
     ) -> None: ...
 
+    def quarantine(self, reason: str) -> None:
+        """Atomically write the persistent quarantine marker for this
+        lease's target, before it is released, because a process group's
+        termination could not be confirmed (System Design SS16.3;
+        ADR-006; M10-03).
+
+        Call from inside the `with` block when `termination_confirmed`
+        is false; this never substitutes for exiting the context, which
+        still releases the OS lock normally afterward. Never removed
+        automatically. A write failure raises `LoggingError` instead of
+        being swallowed, so the caller can preserve it as an additional
+        cause and warn that future exclusion on this target is no longer
+        guaranteed.
+        """
+        ...
+
 
 class TargetLeaseFactory(Protocol):
     """Acquires the non-blocking lease for one canonical target."""
@@ -243,7 +259,11 @@ class TargetLeaseFactory(Protocol):
         diagnostic holder metadata is available; a filesystem without a
         reliable advisory lock raises distinctly
         (`locking.advisory_lock_unavailable`) instead of proceeding
-        unlocked.
+        unlocked. A target still carrying a quarantine marker from a
+        prior unconfirmed termination (`TargetLease.quarantine`, M10-03)
+        raises `PreflightError` (`locking.target_quarantined`) before
+        even attempting the lock -- the block applies whether or not the
+        OS lock happens to be free, and is never lifted automatically.
         """
         ...
 
