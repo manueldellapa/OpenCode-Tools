@@ -553,3 +553,98 @@ def test_capture_git_state_inventories_staged_unstaged_and_untracked(
     assert (repo / "file.txt").read_text(encoding="utf-8") == "staged change\n"
     assert (repo / "second.txt").read_text(encoding="utf-8") == "unstaged change\n"
     assert (repo / "new.txt").read_text(encoding="utf-8") == "new\n"
+
+
+# =============================================================================
+# M09-06 [GATE BLOCCANTE M09]: git-state-v1 large-repository scalability
+# =============================================================================
+#
+# See docs/git-state-v1-scalability.md for the recorded qualification
+# evidence (corpus description, OS/Python/Git versions,
+# utility_timeout_seconds, repetition count, observed durations, and the
+# PASS/BLOCKED outcome). This test is the qualification's repeatable
+# measurement and this repository's ongoing regression guard for the two
+# properties that evidence depends on: a deterministic digest across
+# repeated captures of the same corpus, and completion within a generous,
+# canonical-range timeout. The companion test below proves the
+# already-existing fail-closed behavior (M09-03) still holds for this
+# corpus shape when the deadline is exceeded -- there is no fallback to
+# porcelain-only hashing.
+
+_QUALIFICATION_DIRECTORY_COUNT = 50
+_QUALIFICATION_FILES_PER_DIRECTORY = 100
+_QUALIFICATION_FILE_COUNT = (
+    _QUALIFICATION_DIRECTORY_COUNT * _QUALIFICATION_FILES_PER_DIRECTORY
+)
+_QUALIFICATION_REPETITIONS = 3
+_QUALIFICATION_TIMEOUT_SECONDS = 30.0
+
+
+def _build_large_repository(root: Path) -> Path:
+    _init_repo(root)
+    for directory_index in range(_QUALIFICATION_DIRECTORY_COUNT):
+        directory = root / f"dir{directory_index:03d}"
+        directory.mkdir()
+        for file_index in range(_QUALIFICATION_FILES_PER_DIRECTORY):
+            (directory / f"file{file_index:04d}.txt").write_text(
+                f"content {directory_index}-{file_index}\n", encoding="utf-8"
+            )
+    _commit_all(root, f"large corpus: {_QUALIFICATION_FILE_COUNT} files")
+    return root
+
+
+def test_git_state_v1_large_repository_qualification(tmp_path: Path) -> None:
+    workspace = _workspace(tmp_path / "workspace")
+    repo = _build_large_repository(workspace.root / "repo")
+    target = _resolve(workspace, repo)
+
+    digests = []
+    durations = []
+    for _repetition in range(_QUALIFICATION_REPETITIONS):
+        started = time.monotonic()
+        capture = capture_git_state(
+            SubprocessRunner(RealClock()),
+            git_executable=GIT_EXECUTABLE,
+            target=target,
+            clock=RealClock(),
+            utility_timeout_seconds=_QUALIFICATION_TIMEOUT_SECONDS,
+            termination_grace_seconds=TERMINATION_GRACE_SECONDS,
+        )
+        durations.append(time.monotonic() - started)
+        assert capture.safety_status is GitSafetyStatus.SAFE
+        digests.append(capture.state.fingerprint)
+
+    # Repeatability: an unchanged corpus produces an identical digest on
+    # every repetition (AC-036's "ripetibilità del digest").
+    assert len(set(digests)) == 1
+
+    # Completion within the configured deadline, on every repetition --
+    # this test's own regression guard; docs/git-state-v1-scalability.md
+    # records the actual observed durations as the qualification evidence,
+    # since no additional SLO is fixed by the canonical sources.
+    assert all(duration < _QUALIFICATION_TIMEOUT_SECONDS for duration in durations)
+
+
+def test_git_state_v1_exceeded_deadline_on_a_large_repository_is_indeterminate(
+    tmp_path: Path,
+) -> None:
+    """An exceeded deadline fails closed to `INDETERMINATE` -- never a
+    less-safe fallback to porcelain-only hashing -- even for a large
+    corpus (AC-036, System Design SS11.2).
+    """
+
+    workspace = _workspace(tmp_path / "workspace")
+    repo = _build_large_repository(workspace.root / "repo")
+    target = _resolve(workspace, repo)
+
+    capture = capture_git_state(
+        SubprocessRunner(RealClock()),
+        git_executable=GIT_EXECUTABLE,
+        target=target,
+        clock=RealClock(),
+        utility_timeout_seconds=0.001,
+        termination_grace_seconds=TERMINATION_GRACE_SECONDS,
+    )
+
+    assert capture.safety_status is GitSafetyStatus.INDETERMINATE
+    assert capture.state.fingerprint is None

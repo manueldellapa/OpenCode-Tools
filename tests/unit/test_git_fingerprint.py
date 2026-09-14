@@ -24,6 +24,7 @@ import os
 import stat
 from dataclasses import replace
 from pathlib import Path
+from typing import Final
 
 import pytest
 
@@ -464,3 +465,29 @@ def test_git_state_fingerprint_version_constant_matches_domain_default() -> None
         GIT_STATE_FINGERPRINT_VERSION
         == GitState.__dataclass_fields__["fingerprint_version"].default
     )
+
+
+# --- M09-06 [GATE BLOCCANTE M09]: scalability qualification evidence -------
+
+REPO_ROOT: Final = Path(__file__).resolve().parents[2]
+SCALABILITY_DOC_PATH: Final = REPO_ROOT / "docs" / "git-state-v1-scalability.md"
+
+
+def test_scalability_doc_records_a_pass_with_the_required_evidence_fields() -> None:
+    doc = SCALABILITY_DOC_PATH.read_text(encoding="utf-8")
+    assert "**PASS**" in doc
+    # Corpus description (non-sensitive).
+    assert "5,000" in doc
+    assert "synthetic" in doc.lower()
+    # OS, Python, and Git versions.
+    assert "macOS" in doc
+    assert "3.13.15" in doc
+    assert "2.54.0" in doc
+    # utility_timeout_seconds, repetition count, and observed durations.
+    assert "utility_timeout_seconds" in doc
+    assert "30.0" in doc
+    assert "Repetitions" in doc
+    assert "Duration (s)" in doc
+    # Fail-closed behavior and the no-fallback constraint.
+    assert "INDETERMINATE" in doc
+    assert "porcelain-only" in doc
