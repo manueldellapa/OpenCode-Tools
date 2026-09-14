@@ -39,6 +39,7 @@ from opencode_tools.git_safety import (
     capture_head,
     classify_lstat_mode,
     parse_index_manifest,
+    parse_porcelain_inventory,
     split_null_terminated_records,
 )
 
@@ -227,6 +228,65 @@ def test_capture_head_raises_on_empty_output() -> None:
     with pytest.raises(PreflightError) as exc_info:
         capture_head("")
     assert exc_info.value.code == "git_safety.state_head_probe_failed"
+
+
+# --- parse_porcelain_inventory (M09-05's change inventory) ------------------
+
+
+def test_parse_porcelain_inventory_handles_empty_output() -> None:
+    assert parse_porcelain_inventory(b"") == ((), (), ())
+
+
+def test_parse_porcelain_inventory_classifies_untracked() -> None:
+    staged, unstaged, untracked = parse_porcelain_inventory(b"?? new.txt\x00")
+    assert staged == ()
+    assert unstaged == ()
+    assert untracked == ("new.txt",)
+
+
+def test_parse_porcelain_inventory_classifies_a_staged_modification() -> None:
+    staged, unstaged, untracked = parse_porcelain_inventory(b"M  staged.txt\x00")
+    assert staged == ("staged.txt",)
+    assert unstaged == ()
+    assert untracked == ()
+
+
+def test_parse_porcelain_inventory_classifies_an_unstaged_modification() -> None:
+    staged, unstaged, untracked = parse_porcelain_inventory(b" M unstaged.txt\x00")
+    assert staged == ()
+    assert unstaged == ("unstaged.txt",)
+    assert untracked == ()
+
+
+def test_parse_porcelain_inventory_reports_both_columns_for_mm() -> None:
+    staged, unstaged, untracked = parse_porcelain_inventory(b"MM both.txt\x00")
+    assert staged == ("both.txt",)
+    assert unstaged == ("both.txt",)
+    assert untracked == ()
+
+
+def test_parse_porcelain_inventory_distinguishes_all_three_categories() -> None:
+    raw = b"M  staged.txt\x00 M unstaged.txt\x00?? new.txt\x00"
+    staged, unstaged, untracked = parse_porcelain_inventory(raw)
+    assert staged == ("staged.txt",)
+    assert unstaged == ("unstaged.txt",)
+    assert untracked == ("new.txt",)
+
+
+def test_parse_porcelain_inventory_consumes_the_orig_path_of_a_rename() -> None:
+    raw = b"R  renamed.txt\x00file.txt\x00?? new.txt\x00"
+    staged, unstaged, untracked = parse_porcelain_inventory(raw)
+    assert staged == ("renamed.txt",)
+    assert unstaged == ()
+    assert untracked == ("new.txt",)
+
+
+def test_parse_porcelain_inventory_is_display_safe_for_non_utf8_paths() -> None:
+    raw = b"?? caf\xe9.txt\x00"
+    staged, unstaged, untracked = parse_porcelain_inventory(raw)
+    assert untracked == ("caf\\xe9.txt",)
+    assert staged == ()
+    assert unstaged == ()
 
 
 # --- build_git_state_fingerprint: framing, hash, version, ordering ---------

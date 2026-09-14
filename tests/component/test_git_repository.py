@@ -330,8 +330,7 @@ def test_capture_git_state_returns_safe_for_a_stable_clean_repository(
     assert capture.state.branch == "main"
     assert capture.state.head
     assert capture.state.fingerprint is not None
-    # Inventory extraction is M09-05's scope; M09-03 only classifies and
-    # fingerprints the snapshot.
+    # A clean repository has an empty inventory (M09-05).
     assert capture.state.staged == ()
     assert capture.state.unstaged == ()
     assert capture.state.untracked == ()
@@ -520,3 +519,37 @@ def test_capture_git_state_does_not_retry_past_the_deadline(
     # ran; the deadline had already passed before a second attempt could be
     # considered.
     assert len(capture.process_results) == 12
+
+
+# =============================================================================
+# M09-05: change inventory (staged/unstaged/untracked preservation)
+# =============================================================================
+
+
+def test_capture_git_state_inventories_staged_unstaged_and_untracked(
+    tmp_path: Path,
+) -> None:
+    workspace = _workspace(tmp_path / "workspace")
+    repo = _clean_repo(workspace.root / "repo")
+    (repo / "second.txt").write_text("second\n", encoding="utf-8")
+    _commit_all(repo, "add second file")
+    target = _resolve(workspace, repo)
+
+    # Dirty the target the same way an in-progress coder attempt would,
+    # after the target has already been resolved as a clean top-level repo.
+    (repo / "file.txt").write_text("staged change\n", encoding="utf-8")
+    _git(["add", "file.txt"], cwd=repo)
+    (repo / "second.txt").write_text("unstaged change\n", encoding="utf-8")
+    (repo / "new.txt").write_text("new\n", encoding="utf-8")
+
+    capture = _capture(target)
+
+    assert capture.safety_status is GitSafetyStatus.SAFE
+    assert capture.state.staged == ("file.txt",)
+    assert capture.state.unstaged == ("second.txt",)
+    assert capture.state.untracked == ("new.txt",)
+    # Nothing here mutates or cleans up the target -- every file is exactly
+    # as this test itself left it.
+    assert (repo / "file.txt").read_text(encoding="utf-8") == "staged change\n"
+    assert (repo / "second.txt").read_text(encoding="utf-8") == "unstaged change\n"
+    assert (repo / "new.txt").read_text(encoding="utf-8") == "new\n"

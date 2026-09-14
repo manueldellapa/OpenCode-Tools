@@ -103,6 +103,28 @@ def test_build_git_argv_rejects_a_non_allowlisted_tail(tmp_path: Path) -> None:
         build_git_argv(tmp_path / "git", tmp_path / "target", ("push",))
 
 
+def test_allowed_git_argv_tails_is_exactly_the_reviewed_read_only_set() -> None:
+    """A static audit (M09-05): `ALLOWED_GIT_ARGV_TAILS` is the single
+    source of truth every probe in `git_safety.py` is constructed through
+    (`build_git_argv` -> `check_git_argv_is_allowlisted`); pinning it to an
+    exact, exhaustive, all-read-only tuple means any future addition must
+    be a deliberate, reviewed edit to this test, not a silent widening of
+    what Git commands this module can ever run.
+    """
+
+    assert ALLOWED_GIT_ARGV_TAILS == (
+        ("rev-parse", "--show-toplevel"),
+        ("rev-parse", "--is-bare-repository"),
+        ("rev-parse", "--absolute-git-dir"),
+        ("branch", "--show-current"),
+        ("rev-parse", "--verify", "HEAD^{commit}"),
+        ("status", "--porcelain=v1", "-z", "--untracked-files=all"),
+        ("ls-files", "--stage", "-z"),
+        ("ls-files", "-z"),
+        ("ls-files", "--others", "--exclude-standard", "-z"),
+    )
+
+
 # --- check_top_level -------------------------------------------------------------
 
 

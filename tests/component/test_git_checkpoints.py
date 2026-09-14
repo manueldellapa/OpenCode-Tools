@@ -408,3 +408,140 @@ def test_check_git_state_first_checkpoint_is_indeterminate_when_incomplete(
     record = _check(target, sequence=0, purpose="baseline")
 
     assert record.safety_status is GitSafetyStatus.INDETERMINATE
+
+
+# =============================================================================
+# M09-05: postflight -- check_git_state against the run's original baseline
+# =============================================================================
+#
+# Postflight is check_git_state itself: called with the run's original
+# baseline and role=AgentRole.CODER, so an expected coder delta over the
+# whole run stays SAFE while branch/HEAD drift -- System Design SS8.4's
+# final gate condition -- still fails it.
+
+
+def test_check_git_state_postflight_tolerates_the_runs_own_coder_delta(
+    tmp_path: Path,
+) -> None:
+    workspace = _workspace(tmp_path / "workspace")
+    repo = _clean_repo(workspace.root / "repo")
+    target = _resolve(workspace, repo)
+    run_baseline = _check(target, sequence=0, purpose="baseline")
+
+    (repo / "file.txt").write_text("coder edit\n", encoding="utf-8")
+
+    postflight = _check(
+        target,
+        sequence=1,
+        purpose="postflight",
+        role=AgentRole.CODER,
+        baseline=run_baseline.state,
+    )
+
+    assert postflight.safety_status is GitSafetyStatus.SAFE
+    assert postflight.state.branch == run_baseline.state.branch
+    assert postflight.state.head == run_baseline.state.head
+
+
+def test_check_git_state_postflight_detects_drift_after_reviewer_approval(
+    tmp_path: Path,
+) -> None:
+    """Drift discovered only at postflight must still block the final
+    APPROVED gate even though an earlier checkpoint (standing in for the
+    reviewer's own APPROVED decision) was itself SAFE -- drift prevails
+    over an already-recorded approval (System Design SS8.4).
+    """
+
+    workspace = _workspace(tmp_path / "workspace")
+    repo = _clean_repo(workspace.root / "repo")
+    target = _resolve(workspace, repo)
+    run_baseline = _check(target, sequence=0, purpose="baseline")
+
+    # The coder's own delta is accepted as the new last-accepted checkpoint.
+    (repo / "file.txt").write_text("coder edit\n", encoding="utf-8")
+    coder_after = _check(
+        target,
+        sequence=1,
+        purpose="coder-attempt-1-after",
+        role=AgentRole.CODER,
+        baseline=run_baseline.state,
+    )
+    assert coder_after.safety_status is GitSafetyStatus.SAFE
+
+    # The reviewer makes no edits of its own -- a clean APPROVED decision.
+    reviewer_checkpoint = _check(
+        target,
+        sequence=2,
+        purpose="reviewer-attempt-1-after-approved",
+        role=AgentRole.REVIEWER,
+        baseline=coder_after.state,
+    )
+    assert reviewer_checkpoint.safety_status is GitSafetyStatus.SAFE
+
+    # Something moves HEAD after the (simulated) approval -- e.g. an
+    # external process -- before postflight runs.
+    _git(["commit", "--quiet", "--allow-empty", "-m", "drift after approval"], cwd=repo)
+
+    postflight = _check(
+        target,
+        sequence=3,
+        purpose="postflight",
+        role=AgentRole.CODER,
+        baseline=run_baseline.state,
+    )
+
+    assert postflight.safety_status is GitSafetyStatus.UNSAFE
+
+
+def test_check_git_state_postflight_probe_failure_is_indeterminate(
+    tmp_path: Path,
+) -> None:
+    workspace = _workspace(tmp_path / "workspace")
+    repo = _clean_repo(workspace.root / "repo")
+    target = _resolve(workspace, repo)
+    run_baseline = _check(target, sequence=0, purpose="baseline")
+
+    secret = repo / "secret.txt"
+    secret.write_text("shh\n", encoding="utf-8")
+    _commit_all(repo, "add secret")
+    secret.chmod(0o000)
+    try:
+        postflight = _check(
+            target,
+            sequence=1,
+            purpose="postflight",
+            role=AgentRole.CODER,
+            baseline=run_baseline.state,
+        )
+        assert postflight.safety_status is GitSafetyStatus.INDETERMINATE
+    finally:
+        secret.chmod(0o644)
+
+
+def test_check_git_state_postflight_preserves_a_partial_coder_output(
+    tmp_path: Path,
+) -> None:
+    """A run that ends mid-attempt (e.g. a provider error cut the coder
+    short) still gets a postflight that preserves and reports the partial
+    edit -- Python never cleans it up, and it is never mistaken for drift.
+    """
+
+    workspace = _workspace(tmp_path / "workspace")
+    repo = _clean_repo(workspace.root / "repo")
+    target = _resolve(workspace, repo)
+    run_baseline = _check(target, sequence=0, purpose="baseline")
+
+    (repo / "partial.txt").write_text("only half done\n", encoding="utf-8")
+
+    postflight = _check(
+        target,
+        sequence=1,
+        purpose="postflight",
+        role=AgentRole.CODER,
+        baseline=run_baseline.state,
+    )
+
+    assert postflight.safety_status is GitSafetyStatus.SAFE
+    assert postflight.state.untracked == ("partial.txt",)
+    assert target_fingerprint_changed(postflight) is True
+    assert (repo / "partial.txt").read_text(encoding="utf-8") == "only half done\n"

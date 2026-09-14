@@ -32,8 +32,16 @@ and safe for the coder but unsafe for every other role. It also reports
 whether the target changed at all, the separate signal `retry.decide_retry`
 uses to suppress a coder's provider retry.
 
-Change inventory and postflight are out of scope here (M09-05); this
-module never mutates Git state, never retries beyond the one bounded
+Every checkpoint also carries a deterministic, display-safe change
+inventory -- `GitState.staged`/`unstaged`/`untracked` -- parsed from the
+same porcelain evidence (M09-05); postflight is `check_git_state` itself,
+called with the run's original baseline and `role=AgentRole.CODER` so an
+expected coder delta stays `SAFE` while branch/HEAD drift still fails it,
+attempted on every path including a failure, and never followed by any
+recovery command. Neither `run.json` nor this module ever holds full file
+content, only paths and hashes.
+
+This module never mutates Git state, never retries beyond the one bounded
 resample, and knows nothing about OpenCode.
 """
 
@@ -777,6 +785,49 @@ def _display_safe_text(raw: bytes) -> str:
     return raw.decode("utf-8", errors="backslashreplace")
 
 
+def parse_porcelain_inventory(
+    raw: bytes,
+) -> tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]]:
+    """Split `git status --porcelain=v1 -z` raw bytes into `(staged,
+    unstaged, untracked)` display-safe path tuples (M09-05).
+
+    Each record is `XY<space><path>`; a path is staged if `X` is neither
+    space nor `?`, tracked-unstaged if `Y` is neither space nor `?`, and
+    untracked only when both are `?` -- a path with both a staged and an
+    unstaged change (`MM`) lands in both of the first two tuples, exactly
+    reflecting its two independent porcelain columns. A staged rename or
+    copy (`X` is `R`/`C`) is followed by one extra `-z` record, the
+    original path, which this function consumes and does not itself
+    report -- content-sensitive rename/copy attribution belongs to the
+    `git-state-v1` fingerprint (SS11.2), not this display inventory.
+    """
+
+    staged: list[str] = []
+    unstaged: list[str] = []
+    untracked: list[str] = []
+
+    records = iter(split_null_terminated_records(raw))
+    for record in records:
+        if len(record) < 3:
+            continue
+        x_char = chr(record[0])
+        y_char = chr(record[1])
+        path = _display_safe_text(record[3:])
+
+        if x_char in ("R", "C"):
+            next(records, None)
+
+        if x_char == "?" and y_char == "?":
+            untracked.append(path)
+            continue
+        if x_char not in (" ", "?"):
+            staged.append(path)
+        if y_char not in (" ", "?"):
+            unstaged.append(path)
+
+    return tuple(staged), tuple(unstaged), tuple(untracked)
+
+
 def _lstat_signature(path: Path) -> tuple[int, int, int] | None:
     try:
         result = os.lstat(path)
@@ -946,14 +997,15 @@ def _sample_git_state_once(
         path_entries=tuple(path_entries),
         gitlink_entries=gitlink_entries,
     )
+    staged, unstaged, untracked = parse_porcelain_inventory(first["status"])
     state = GitState(
         root=target.root,
         branch=capture_branch(_display_safe_text(first["branch"])),
         head=capture_head(_display_safe_text(first["head"])),
         porcelain_summary=_display_safe_text(first["status"]),
-        staged=(),
-        unstaged=(),
-        untracked=(),
+        staged=staged,
+        unstaged=unstaged,
+        untracked=untracked,
         fingerprint=fingerprint,
     )
     return state, all_results
@@ -1312,6 +1364,7 @@ __all__ = (
     "compute_git_state_fingerprint",
     "parse_git_common_dir",
     "parse_index_manifest",
+    "parse_porcelain_inventory",
     "resolve_git_executable",
     "resolve_target",
     "split_null_terminated_records",
