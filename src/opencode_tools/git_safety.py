@@ -1,4 +1,5 @@
-"""Read-only Git target preflight (System Design SS11.1; ADR-003/004/009/010).
+"""Read-only Git target preflight and fingerprint (System Design SS11.1-11.2;
+ADR-003/004/009/010).
 
 This module proves, before any agent runs, that a target repository is safe
 to operate on: contained in the workspace after symlink resolution, the Git
@@ -9,14 +10,26 @@ an implicit `cwd`/workspace -- and shares one bounded `utility_timeout_seconds`
 deadline. An ambiguous, timed-out, or non-zero probe result fails closed
 rather than being treated as clean (AC-004-AC-006, AC-036).
 
-Fingerprinting (`git-state-v1`), per-attempt checkpoints, and postflight are
-out of scope here (M09-02/M09-04/M09-05); this module never mutates Git
+It also computes the `git-state-v1` content-sensitive fingerprint: a
+versioned SHA-256 of length-prefixed records covering raw porcelain, the
+index manifest, tracked/untracked path lists, and -- read directly from
+disk, not from Git's own object database -- each path's type, executable
+bit, and content/symlink-target hash, so a second edit to an already-`M`
+file changes the digest even though the porcelain line does not (M09-02).
+
+Race/instability handling, resampling, and mapping a failure to
+`GitSafetyStatus` are out of scope here (M09-03), as are per-attempt
+checkpoints and postflight (M09-04/M09-05); this module never mutates Git
 state, never retries, and knows nothing about OpenCode.
 """
 
 from __future__ import annotations
 
+import hashlib
+import os
 import shutil
+import stat
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
@@ -48,6 +61,14 @@ _CMD_STATUS: tuple[str, ...] = (
     "-z",
     "--untracked-files=all",
 )
+_CMD_LS_FILES_STAGE: tuple[str, ...] = ("ls-files", "--stage", "-z")
+_CMD_LS_FILES: tuple[str, ...] = ("ls-files", "-z")
+_CMD_LS_FILES_OTHERS: tuple[str, ...] = (
+    "ls-files",
+    "--others",
+    "--exclude-standard",
+    "-z",
+)
 
 ALLOWED_GIT_ARGV_TAILS: tuple[tuple[str, ...], ...] = (
     _CMD_SHOW_TOPLEVEL,
@@ -56,7 +77,23 @@ ALLOWED_GIT_ARGV_TAILS: tuple[tuple[str, ...], ...] = (
     _CMD_BRANCH_SHOW_CURRENT,
     _CMD_HEAD_VERIFY,
     _CMD_STATUS,
+    _CMD_LS_FILES_STAGE,
+    _CMD_LS_FILES,
+    _CMD_LS_FILES_OTHERS,
 )
+
+# System Design SS11.2's versioned fingerprint algorithm tag; matches
+# `GitState.fingerprint_version`'s frozen default in domain.py exactly.
+GIT_STATE_FINGERPRINT_VERSION = "git-state-v1"
+
+# The Git index mode that marks a path as a gitlink (submodule reference)
+# rather than a regular blob (System Design SS11.2 point 6).
+_GITLINK_MODE = "160000"
+
+# Big-endian byte width of each length-prefix header in the fingerprint's
+# serialization; 8 bytes is far beyond any real record's size but keeps the
+# framing trivially unambiguous.
+_LENGTH_PREFIX_BYTES = 8
 
 
 class _CapturingSink:
@@ -190,6 +227,21 @@ def _decode_probe_stdout(sink: _CapturingSink, *, code: str) -> str:
         raise PreflightError(code, "Git probe output was not valid UTF-8.") from None
 
 
+def _raw_probe_stdout(sink: _CapturingSink, *, code: str) -> bytes:
+    """Return one probe's raw stdout bytes, undecoded.
+
+    Fingerprint evidence is never UTF-8-decoded (System Design SS11.2's
+    byte-safe raw paths): unlike `_decode_probe_stdout`, this only enforces
+    the defensive size bound.
+    """
+
+    if sink.overflowed_stdout:
+        raise PreflightError(
+            code, "Git probe output exceeded the defensive size limit."
+        )
+    return sink.stdout_bytes()
+
+
 def check_top_level(raw_output: str, expected_target: Path) -> None:
     """Reject a target whose Git top-level differs from `expected_target`.
 
@@ -260,6 +312,349 @@ def check_clean_worktree(raw_output: str) -> None:
             "git_safety.dirty_worktree",
             "The target has staged, unstaged, or untracked changes.",
         )
+
+
+# =============================================================================
+# M09-02: `git-state-v1` content-sensitive fingerprint
+# =============================================================================
+
+
+@dataclass(frozen=True, slots=True)
+class IndexEntry:
+    """One `git ls-files --stage -z` record: a path's registered index state."""
+
+    mode: str
+    object_id: str
+    stage: int
+    path: bytes
+
+
+@dataclass(frozen=True, slots=True)
+class FingerprintPathEntry:
+    """One tracked or untracked path's contribution to the fingerprint.
+
+    `content_hash` is the SHA-256 digest of the file's raw on-disk content
+    (`type == "regular"`) or of its raw symlink target (`type == "symlink"`);
+    it is `None` for `"missing"` (listed by Git but absent on disk) and
+    `"other"` (not a regular file or symlink -- a FIFO, socket, device, or
+    similar) paths, which contribute only their path and type.
+    """
+
+    path: bytes
+    type: str
+    executable: bool
+    content_hash: bytes | None
+
+
+@dataclass(frozen=True, slots=True)
+class FingerprintGitlinkEntry:
+    """One gitlink (submodule reference)'s contribution to the fingerprint.
+
+    Only the index's own recorded object ID is included; the submodule's
+    own working-tree state is never inspected (System Design SS11.2 point
+    6) -- the parent repository's porcelain output, already part of the
+    fingerprint, already carries whether the gitlink path itself is dirty.
+    """
+
+    path: bytes
+    object_id: str
+
+
+def split_null_terminated_records(raw: bytes) -> tuple[bytes, ...]:
+    """Split `-z`-terminated Git output into its raw per-record entries.
+
+    Every record produced by `-z` output ends with `NUL`, including the
+    last one, so a trailing empty split segment is always dropped rather
+    than treated as a record.
+    """
+
+    if not raw:
+        return ()
+    return tuple(raw.split(b"\x00")[:-1])
+
+
+def parse_index_manifest(raw: bytes) -> tuple[IndexEntry, ...]:
+    """Parse `git ls-files --stage -z` output into structured `IndexEntry`s.
+
+    Each record is `<mode> <object-id> <stage>\\t<path>`; only the first tab
+    separates the header from the raw path, so a path byte-for-byte
+    containing a tab is still parsed correctly.
+    """
+
+    entries = []
+    for record in split_null_terminated_records(raw):
+        header, separator, path = record.partition(b"\t")
+        if not separator:
+            raise PreflightError(
+                "git_safety.fingerprint_index_malformed",
+                "git ls-files --stage -z produced a record with no path.",
+                technical_detail=f"record={record!r}",
+            )
+        mode_bytes, _, remainder = header.partition(b" ")
+        object_id_bytes, _, stage_bytes = remainder.partition(b" ")
+        try:
+            stage = int(stage_bytes)
+        except ValueError:
+            raise PreflightError(
+                "git_safety.fingerprint_index_malformed",
+                "git ls-files --stage -z produced a record with a non-numeric stage.",
+                technical_detail=f"record={record!r}",
+            ) from None
+        entries.append(
+            IndexEntry(
+                mode=mode_bytes.decode("ascii"),
+                object_id=object_id_bytes.decode("ascii"),
+                stage=stage,
+                path=path,
+            )
+        )
+    return tuple(entries)
+
+
+def classify_lstat_mode(st_mode: int) -> str:
+    """Classify an `lstat` mode as `"regular"`, `"symlink"`, or `"other"`.
+
+    Never returns `"missing"`: that classification applies only when
+    `lstat` itself finds nothing there, which this pure function -- given
+    an already-obtained mode -- cannot observe (System Design SS11.2).
+    """
+
+    if stat.S_ISREG(st_mode):
+        return "regular"
+    if stat.S_ISLNK(st_mode):
+        return "symlink"
+    return "other"
+
+
+def _length_prefixed(data: bytes) -> bytes:
+    return len(data).to_bytes(_LENGTH_PREFIX_BYTES, "big") + data
+
+
+def build_git_state_fingerprint(
+    *,
+    porcelain_raw: bytes,
+    index_manifest_raw: bytes,
+    tracked_raw: bytes,
+    untracked_raw: bytes,
+    path_entries: tuple[FingerprintPathEntry, ...],
+    gitlink_entries: tuple[FingerprintGitlinkEntry, ...],
+) -> str:
+    """Deterministically assemble the `git-state-v1` SHA-256 hex digest.
+
+    Every field -- the four raw command outputs and every per-path/gitlink
+    record -- is individually length-prefixed, so the digest never depends
+    on adjacent field lengths creating an ambiguous byte boundary. The two
+    per-path record sets are sorted by raw path before hashing, so the
+    result never depends on the caller's own ordering or on dict/set
+    iteration order (System Design SS11.2).
+    """
+
+    digest = hashlib.sha256()
+    digest.update(_length_prefixed(GIT_STATE_FINGERPRINT_VERSION.encode("ascii")))
+    digest.update(_length_prefixed(porcelain_raw))
+    digest.update(_length_prefixed(index_manifest_raw))
+    digest.update(_length_prefixed(tracked_raw))
+    digest.update(_length_prefixed(untracked_raw))
+
+    for entry in sorted(path_entries, key=lambda item: item.path):
+        digest.update(_length_prefixed(entry.path))
+        digest.update(_length_prefixed(entry.type.encode("ascii")))
+        digest.update(_length_prefixed(b"\x01" if entry.executable else b"\x00"))
+        digest.update(_length_prefixed(entry.content_hash or b""))
+
+    for gitlink in sorted(gitlink_entries, key=lambda item: item.path):
+        digest.update(_length_prefixed(gitlink.path))
+        digest.update(_length_prefixed(b"gitlink"))
+        digest.update(_length_prefixed(gitlink.object_id.encode("ascii")))
+
+    return digest.hexdigest()
+
+
+def _lstat_or_none(path: Path) -> os.stat_result | None:
+    try:
+        return os.lstat(path)
+    except FileNotFoundError:
+        return None
+    except OSError as error:
+        raise PreflightError(
+            "git_safety.fingerprint_path_unreadable",
+            "A tracked or untracked path could not be inspected.",
+            technical_detail=f"path={path} error={error}",
+        ) from None
+
+
+def _read_file_or_raise(path: Path) -> bytes:
+    try:
+        return path.read_bytes()
+    except OSError as error:
+        raise PreflightError(
+            "git_safety.fingerprint_path_unreadable",
+            "A tracked or untracked regular file could not be read.",
+            technical_detail=f"path={path} error={error}",
+        ) from None
+
+
+def _readlink_or_raise(path: Path) -> bytes:
+    try:
+        return os.readlink(os.fsencode(str(path)))
+    except OSError as error:
+        raise PreflightError(
+            "git_safety.fingerprint_path_unreadable",
+            "A tracked or untracked symlink could not be read.",
+            technical_detail=f"path={path} error={error}",
+        ) from None
+
+
+def build_fingerprint_path_entry(
+    target_root: Path, raw_path: bytes
+) -> FingerprintPathEntry:
+    """Classify one tracked or untracked path and hash its on-disk state.
+
+    `raw_path` is `target_root`-relative, exactly as Git printed it;
+    `os.fsdecode` round-trips it byte-for-byte via `surrogateescape`, so a
+    non-UTF-8 path is handled without ever raising a decode error. The
+    result is `"missing"` if nothing exists there, `"regular"`/`"symlink"`
+    with a content/target hash and (for `"regular"`) the Git-significant
+    executable bit, or `"other"` for anything else (System Design SS11.2).
+    """
+
+    absolute = target_root / os.fsdecode(raw_path)
+    lstat_result = _lstat_or_none(absolute)
+    if lstat_result is None:
+        return FingerprintPathEntry(
+            path=raw_path, type="missing", executable=False, content_hash=None
+        )
+
+    path_type = classify_lstat_mode(lstat_result.st_mode)
+    if path_type == "regular":
+        content_hash = hashlib.sha256(_read_file_or_raise(absolute)).digest()
+        executable = bool(lstat_result.st_mode & stat.S_IXUSR)
+        return FingerprintPathEntry(
+            path=raw_path,
+            type=path_type,
+            executable=executable,
+            content_hash=content_hash,
+        )
+    if path_type == "symlink":
+        content_hash = hashlib.sha256(_readlink_or_raise(absolute)).digest()
+        return FingerprintPathEntry(
+            path=raw_path, type=path_type, executable=False, content_hash=content_hash
+        )
+    return FingerprintPathEntry(
+        path=raw_path, type=path_type, executable=False, content_hash=None
+    )
+
+
+def compute_git_state_fingerprint(
+    process_runner: ProcessRunner,
+    *,
+    git_executable: Path,
+    target: TargetRepository,
+    utility_timeout_seconds: float,
+    termination_grace_seconds: float,
+) -> str:
+    """Compute the `git-state-v1` fingerprint for `target`'s current state.
+
+    Runs the four raw-evidence probes (porcelain status, index manifest,
+    tracked list, untracked list) and, for every tracked or untracked path
+    that is not a gitlink, reads its on-disk content or symlink target
+    directly -- not through Git -- so a second edit to an already-`M` file
+    changes the digest even though the porcelain line does not. Race and
+    read-stability handling, and mapping a failure to `GitSafetyStatus`,
+    are out of scope here (M09-03): a probe or read failure fails closed
+    with `PreflightError`.
+    """
+
+    def _probe(
+        argv_tail: tuple[str, ...], *, log_name: str
+    ) -> tuple[ProcessResult, _CapturingSink]:
+        return _run_git_probe(
+            process_runner,
+            git_executable,
+            target.root,
+            argv_tail,
+            log_name=log_name,
+            cwd=target.root,
+            timeout_seconds=utility_timeout_seconds,
+            termination_grace_seconds=termination_grace_seconds,
+        )
+
+    porcelain_result, porcelain_sink = _probe(
+        _CMD_STATUS, log_name="git-fingerprint-status.log"
+    )
+    _require_probe_succeeded(
+        porcelain_result,
+        code="git_safety.fingerprint_status_probe_failed",
+        message="git status did not complete successfully.",
+    )
+    porcelain_raw = _raw_probe_stdout(
+        porcelain_sink, code="git_safety.fingerprint_status_probe_failed"
+    )
+
+    index_result, index_sink = _probe(
+        _CMD_LS_FILES_STAGE, log_name="git-fingerprint-index.log"
+    )
+    _require_probe_succeeded(
+        index_result,
+        code="git_safety.fingerprint_index_probe_failed",
+        message="git ls-files --stage did not complete successfully.",
+    )
+    index_manifest_raw = _raw_probe_stdout(
+        index_sink, code="git_safety.fingerprint_index_probe_failed"
+    )
+
+    tracked_result, tracked_sink = _probe(
+        _CMD_LS_FILES, log_name="git-fingerprint-tracked.log"
+    )
+    _require_probe_succeeded(
+        tracked_result,
+        code="git_safety.fingerprint_tracked_probe_failed",
+        message="git ls-files did not complete successfully.",
+    )
+    tracked_raw = _raw_probe_stdout(
+        tracked_sink, code="git_safety.fingerprint_tracked_probe_failed"
+    )
+
+    untracked_result, untracked_sink = _probe(
+        _CMD_LS_FILES_OTHERS, log_name="git-fingerprint-untracked.log"
+    )
+    _require_probe_succeeded(
+        untracked_result,
+        code="git_safety.fingerprint_untracked_probe_failed",
+        message="git ls-files --others --exclude-standard did not complete "
+        "successfully.",
+    )
+    untracked_raw = _raw_probe_stdout(
+        untracked_sink, code="git_safety.fingerprint_untracked_probe_failed"
+    )
+
+    index_entries = parse_index_manifest(index_manifest_raw)
+    gitlink_paths = frozenset(
+        entry.path for entry in index_entries if entry.mode == _GITLINK_MODE
+    )
+    gitlink_entries = tuple(
+        FingerprintGitlinkEntry(path=entry.path, object_id=entry.object_id)
+        for entry in index_entries
+        if entry.mode == _GITLINK_MODE
+    )
+
+    all_paths = frozenset(split_null_terminated_records(tracked_raw)) | frozenset(
+        split_null_terminated_records(untracked_raw)
+    )
+    path_entries = tuple(
+        build_fingerprint_path_entry(target.root, raw_path)
+        for raw_path in all_paths
+        if raw_path not in gitlink_paths
+    )
+
+    return build_git_state_fingerprint(
+        porcelain_raw=porcelain_raw,
+        index_manifest_raw=index_manifest_raw,
+        tracked_raw=tracked_raw,
+        untracked_raw=untracked_raw,
+        path_entries=path_entries,
+        gitlink_entries=gitlink_entries,
+    )
 
 
 def resolve_target(
@@ -395,13 +790,23 @@ def resolve_target(
 
 __all__ = (
     "ALLOWED_GIT_ARGV_TAILS",
+    "GIT_STATE_FINGERPRINT_VERSION",
+    "FingerprintGitlinkEntry",
+    "FingerprintPathEntry",
+    "IndexEntry",
+    "build_fingerprint_path_entry",
     "build_git_argv",
+    "build_git_state_fingerprint",
     "check_branch_attached",
     "check_clean_worktree",
     "check_git_argv_is_allowlisted",
     "check_not_bare",
     "check_top_level",
+    "classify_lstat_mode",
+    "compute_git_state_fingerprint",
     "parse_git_common_dir",
+    "parse_index_manifest",
     "resolve_git_executable",
     "resolve_target",
+    "split_null_terminated_records",
 )
