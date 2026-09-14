@@ -119,6 +119,18 @@ class AgentRunner(Protocol):
 class GitSafetyPort(Protocol):
     """Target resolution and content-sensitive Git safety checkpoints."""
 
+    def check_runtime_location(self, runtime_root: Path) -> None:
+        """Fail closed unless `runtime_root` is safe to hold run artifacts.
+
+        A `runtime_root` under Git metadata is always rejected outright.
+        One inside some other Git working tree must already have itself
+        and a sentinel child covered by `git check-ignore`; this is never
+        fixed by editing `.gitignore`. One outside any Git working tree
+        entirely is accepted without an ignore check (System Design
+        SS15.1; ADR-008; M10-01).
+        """
+        ...
+
     def resolve_target(
         self,
         workspace: Workspace,

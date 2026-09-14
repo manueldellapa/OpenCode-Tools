@@ -41,6 +41,15 @@ attempted on every path including a failure, and never followed by any
 recovery command. Neither `run.json` nor this module ever holds full file
 content, only paths and hashes.
 
+`classify_runtime_root_containment` and `check_runtime_location` implement
+this module's other System Design SS6 responsibility, the runtime ignore
+probe (M10-01; ADR-008): before any run artifact is created, a candidate
+runtime root under a `.git` metadata directory at any depth is always
+rejected, and one inside some other Git working tree must already have
+itself and a `.probe` sentinel child covered by `git check-ignore
+--no-index` -- this module never edits `.gitignore` to make that true. A
+runtime root outside any Git working tree entirely needs no ignore check.
+
 This module never mutates Git state, never retries beyond the one bounded
 resample, and knows nothing about OpenCode.
 """
@@ -1341,6 +1350,219 @@ def resolve_target(
     )
 
 
+# =============================================================================
+# M10-01: runtime root bootstrap -- Git metadata rejection and ignore probe
+# =============================================================================
+
+_RUNTIME_IGNORE_SENTINEL_NAME = ".probe"
+
+_CMD_CHECK_IGNORE_PREFIX: tuple[str, ...] = (
+    "check-ignore",
+    "--quiet",
+    "--no-index",
+    "--",
+)
+
+
+def classify_runtime_root_containment(runtime_root: Path) -> Path | None:
+    """Classify `runtime_root`'s Git containment by pure filesystem walk.
+
+    Raises `PreflightError` immediately and unconditionally if
+    `runtime_root` sits under a `.git` metadata directory at any depth --
+    this is never softened by ignore status (System Design SS15.1;
+    ADR-008). Otherwise returns the nearest containing working tree's
+    root: the first ancestor, walking upward and including
+    `runtime_root` itself, that has its own `.git` entry -- or `None` if
+    `runtime_root` is outside any Git repository entirely, an accepted,
+    external location that needs no ignore check.
+
+    This never spawns `git` and never requires `runtime_root` to exist: a
+    `.git` entry can be a directory (an ordinary repository) or a file (a
+    worktree/submodule pointer) -- either marks its parent as a working
+    tree root, but only a directory literally named `.git` counts as
+    metadata a path can be "under".
+    """
+
+    if not runtime_root.is_absolute():
+        raise ValueError("runtime_root must be absolute")
+
+    candidates = (runtime_root, *runtime_root.parents)
+
+    for ancestor in candidates:
+        if ancestor.name == ".git" and ancestor.is_dir():
+            raise PreflightError(
+                "git_safety.runtime_root_under_git_metadata",
+                "The runtime root is located under Git metadata.",
+                technical_detail=f"runtime_root={runtime_root} git_dir={ancestor}",
+            )
+
+    for ancestor in candidates:
+        if (ancestor / ".git").exists():
+            return ancestor
+    return None
+
+
+def build_check_ignore_argv(
+    git_executable: Path, working_tree_root: Path, pathspec: str
+) -> tuple[str, ...]:
+    """Build `git -C <working_tree_root> check-ignore --quiet --no-index -- <pathspec>`.
+
+    A second, narrower self-verified command shape alongside
+    `ALLOWED_GIT_ARGV_TAILS`: unlike every other probe in this module,
+    this one must address a caller-supplied candidate path (the runtime
+    root or its sentinel), so the variable segment is baked directly into
+    the returned tuple rather than checked against a fixed allowlist
+    afterwards -- no value of `pathspec` can make this construct a
+    different git subcommand (System Design SS15.1; ADR-008). `pathspec`
+    is a raw string, not a `Path`, because `check_runtime_root_ignored`
+    must sometimes append a trailing `/` that `Path` would silently
+    normalize away.
+    """
+
+    return (
+        str(git_executable),
+        "-C",
+        str(working_tree_root),
+        *_CMD_CHECK_IGNORE_PREFIX,
+        pathspec,
+    )
+
+
+def _run_check_ignore_probe(
+    process_runner: ProcessRunner,
+    git_executable: Path,
+    working_tree_root: Path,
+    pathspec: str,
+    *,
+    log_name: str,
+    timeout_seconds: float,
+    termination_grace_seconds: float,
+) -> ProcessResult:
+    spec = ProcessSpec(
+        argv=build_check_ignore_argv(git_executable, working_tree_root, pathspec),
+        cwd=working_tree_root,
+        stdin=None,
+        timeout_seconds=timeout_seconds,
+        termination_grace_seconds=termination_grace_seconds,
+    )
+    sink = _CapturingSink(path=Path(log_name), max_bytes=_UTILITY_OUTPUT_LIMIT_BYTES)
+    return process_runner.run(spec, sink=sink)
+
+
+def _require_path_ignored(result: ProcessResult, *, code: str, pathspec: str) -> None:
+    """Classify one `git check-ignore --quiet --no-index` probe result.
+
+    Exit `0` means ignored (pass). Exit `1` -- a clean, successful run
+    that just means "not ignored" -- still leaves `ProcessResult.outcome
+    == PROCESS_ERROR`, exactly like any other non-zero exit: `process.py`
+    gives `check-ignore`'s two-valued exit code no special meaning, so
+    this inspects `return_code` directly rather than trusting `outcome`
+    alone. Anything else -- a timeout, an unconfirmed spawn, or any other
+    non-zero exit -- fails closed as ambiguous, never guessed ignored
+    (NFR-008).
+    """
+
+    if result.outcome is RunOutcome.SUCCEEDED:
+        return
+    if result.outcome is RunOutcome.PROCESS_ERROR and result.return_code == 1:
+        raise PreflightError(
+            code,
+            f"The runtime path is not covered by an existing ignore rule: {pathspec}",
+        )
+    raise PreflightError(
+        code,
+        "git check-ignore did not complete successfully.",
+        technical_detail=(
+            f"outcome={result.outcome.value} return_code={result.return_code}"
+        ),
+    )
+
+
+def check_runtime_root_ignored(
+    process_runner: ProcessRunner,
+    *,
+    git_executable: Path,
+    working_tree_root: Path,
+    runtime_root: Path,
+    utility_timeout_seconds: float,
+    termination_grace_seconds: float,
+) -> None:
+    """Require `runtime_root` and a sentinel child to already be
+    `git check-ignore`d inside `working_tree_root` (System Design SS15.1;
+    ADR-008; FR-015; AC-022). Neither path needs to exist --
+    `check-ignore --no-index` is a pure pattern match -- and a miss never
+    edits `.gitignore` to fix itself.
+
+    The directory pathspec carries an explicit trailing `/`: `git
+    check-ignore` only applies a directory-only (trailing-`/`) `.gitignore`
+    pattern -- the natural way to write one -- to a bare pathspec when it
+    can otherwise tell the path is a directory, which it cannot for a
+    `runtime_root` that does not exist yet (as required by M10-01's "no
+    directory is created before validation"). A trailing `/` on the
+    pathspec itself makes that determination explicit instead of
+    depending on on-disk state, without changing the result for any other
+    pattern style. The sentinel is unambiguously a file and is never
+    given one.
+    """
+
+    sentinel = runtime_root / _RUNTIME_IGNORE_SENTINEL_NAME
+    probes = (
+        (
+            f"{runtime_root}/",
+            "git_safety.runtime_root_not_ignored",
+            "git-runtime-check-ignore-root.log",
+        ),
+        (
+            str(sentinel),
+            "git_safety.runtime_sentinel_not_ignored",
+            "git-runtime-check-ignore-sentinel.log",
+        ),
+    )
+    for pathspec, code, log_name in probes:
+        result = _run_check_ignore_probe(
+            process_runner,
+            git_executable,
+            working_tree_root,
+            pathspec,
+            log_name=log_name,
+            timeout_seconds=utility_timeout_seconds,
+            termination_grace_seconds=termination_grace_seconds,
+        )
+        _require_path_ignored(result, code=code, pathspec=pathspec)
+
+
+def check_runtime_location(
+    process_runner: ProcessRunner,
+    *,
+    git_executable: Path,
+    runtime_root: Path,
+    utility_timeout_seconds: float,
+    termination_grace_seconds: float,
+) -> None:
+    """Fail closed unless `runtime_root` is safe to hold run artifacts,
+    before any of them is created (System Design SS15.1; ADR-008; M10-01).
+
+    A `runtime_root` under Git metadata is always rejected outright. One
+    inside some other Git working tree must already have both itself and
+    a sentinel child covered by `git check-ignore`; this module never
+    edits `.gitignore` to make that true. A `runtime_root` outside any
+    Git working tree entirely is accepted without an ignore check
+    (FR-015, FR-042; AC-022).
+    """
+
+    working_tree_root = classify_runtime_root_containment(runtime_root)
+    if working_tree_root is None:
+        return
+    check_runtime_root_ignored(
+        process_runner,
+        git_executable=git_executable,
+        working_tree_root=working_tree_root,
+        runtime_root=runtime_root,
+        utility_timeout_seconds=utility_timeout_seconds,
+        termination_grace_seconds=termination_grace_seconds,
+    )
+
+
 __all__ = (
     "ALLOWED_GIT_ARGV_TAILS",
     "GIT_STATE_FINGERPRINT_VERSION",
@@ -1348,6 +1570,7 @@ __all__ = (
     "FingerprintPathEntry",
     "GitStateCapture",
     "IndexEntry",
+    "build_check_ignore_argv",
     "build_fingerprint_path_entry",
     "build_git_argv",
     "build_git_state_fingerprint",
@@ -1359,8 +1582,11 @@ __all__ = (
     "check_git_argv_is_allowlisted",
     "check_git_state",
     "check_not_bare",
+    "check_runtime_location",
+    "check_runtime_root_ignored",
     "check_top_level",
     "classify_lstat_mode",
+    "classify_runtime_root_containment",
     "compute_git_state_fingerprint",
     "parse_git_common_dir",
     "parse_index_manifest",
