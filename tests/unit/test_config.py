@@ -668,3 +668,78 @@ def test_load_app_config_resolves_runtime_root_and_github_targets(
             repository="github.com/example/backend",
         ),
     )
+
+
+# --- AC-002: effective-config precedence, determinism, and rejection --------
+
+
+def test_ac_002_effective_config_precedence_and_rejection(tmp_path: Path) -> None:
+    """Prove the full three-tier precedence through `load_app_config` itself.
+
+    Explicit overrides conventional overrides defaults, deterministically,
+    and invalid input never yields an `AppConfig` -- the config-layer
+    precondition for the CLI never starting agents on a broken config.
+    """
+    workspace = _make_workspace(tmp_path)
+
+    # (1) Neither conventional nor explicit file present: defaults apply.
+    defaults_config = load_app_config(
+        config_path=None, workspace=workspace, cwd=tmp_path
+    )
+
+    assert defaults_config.source is ConfigSource.DEFAULTS
+    assert defaults_config.execution.max_review_cycles == 3
+
+    # (2) Conventional file present, no explicit path: conventional overrides
+    # the default.
+    conventional = workspace.root / CONVENTIONAL_CONFIG_FILENAME
+    conventional.write_text(
+        "version = 1\n[execution]\nmax_review_cycles = 7\n",
+        encoding="utf-8",
+    )
+
+    conventional_config = load_app_config(
+        config_path=None, workspace=workspace, cwd=tmp_path
+    )
+
+    assert conventional_config.source is ConfigSource.CONVENTIONAL
+    assert conventional_config.execution.max_review_cycles == 7
+
+    # (3) An explicit path is also given, with a different override for the
+    # same field: explicit wins over both the conventional file and the
+    # default.
+    explicit = tmp_path / "explicit.toml"
+    explicit.write_text(
+        "version = 1\n[execution]\nmax_review_cycles = 11\n",
+        encoding="utf-8",
+    )
+
+    explicit_config = load_app_config(
+        config_path=explicit, workspace=workspace, cwd=tmp_path
+    )
+
+    assert explicit_config.source is ConfigSource.EXPLICIT
+    assert explicit_config.execution.max_review_cycles == 11
+
+    # (4) Determinism: the same inputs produce an equal `AppConfig` again.
+    explicit_config_again = load_app_config(
+        config_path=explicit, workspace=workspace, cwd=tmp_path
+    )
+
+    assert explicit_config_again == explicit_config
+
+    # (5) Rejection: invalid input never produces an `AppConfig`, whether it
+    # comes from the conventional file or an explicit one.
+    conventional.write_text('version = 1\nmodel = "gpt-unexpected"\n', encoding="utf-8")
+
+    with pytest.raises(ConfigError) as exc_info:
+        load_app_config(config_path=None, workspace=workspace, cwd=tmp_path)
+
+    assert exc_info.value.code == "config.unknown_key"
+
+    invalid_explicit = _fixture("unknown-top-level-key.toml")
+
+    with pytest.raises(ConfigError) as exc_info:
+        load_app_config(config_path=invalid_explicit, workspace=workspace, cwd=tmp_path)
+
+    assert exc_info.value.code == "config.unknown_key"

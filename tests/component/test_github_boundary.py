@@ -23,6 +23,7 @@ failure (a clean non-zero exit and a timeout), and, throughout, that
 
 from __future__ import annotations
 
+import json
 import re
 import subprocess
 import time
@@ -32,12 +33,15 @@ from pathlib import Path
 import pytest
 
 from opencode_tools.domain import (
+    AgentRole,
+    AgentStatus,
     GithubTargetOverride,
     IssueLocator,
+    IssueRef,
     RepositoryIdentity,
     Workspace,
 )
-from opencode_tools.errors import PreflightError
+from opencode_tools.errors import PreflightError, ProtocolError
 from opencode_tools.git_safety import resolve_git_executable, resolve_target
 from opencode_tools.github import (
     GhPreflightEvidence,
@@ -47,6 +51,8 @@ from opencode_tools.github import (
     run_gh_preflight,
 )
 from opencode_tools.process import SubprocessRunner
+from opencode_tools.prompting import build_architect_prompt, build_coder_prompt
+from opencode_tools.protocol import parse_agent_response
 
 UTILITY_TIMEOUT_SECONDS = 5.0
 TERMINATION_GRACE_SECONDS = 1.0
@@ -442,3 +448,262 @@ def test_locate_issue_rejects_a_non_positive_issue_number_as_a_domain_error(
         )
 
     assert not isinstance(exc_info.value, PreflightError)
+
+
+# =============================================================================
+# AC-029: issue identity, architect handoff, and fail-closed paths
+# =============================================================================
+
+
+def _issue_ref_envelope(
+    locator: IssueLocator,
+    overrides: dict[str, object] | None = None,
+    *,
+    drop: str | None = None,
+) -> str:
+    """Build a JSON `ISSUE_REF_JSON` envelope matching `locator`, with
+    optional field overrides/drops -- mirrors `tests/unit/test_protocol.py`'s
+    own `_envelope` helper rather than hand-copying `protocol.py`'s schema.
+    """
+
+    identity = locator.repository_identity
+    fields: dict[str, object] = {
+        "schema_version": 1,
+        "host": identity.host,
+        "owner": identity.owner,
+        "repository": identity.repository,
+        "number": locator.number,
+        "url": (
+            f"https://{identity.host}/{identity.owner}/{identity.repository}"
+            f"/issues/{locator.number}"
+        ),
+        "title": "A real issue title",
+    }
+    if overrides:
+        fields.update(overrides)
+    if drop is not None:
+        del fields[drop]
+    return json.dumps(fields)
+
+
+def _ready_text(body: str, envelope: str) -> str:
+    """An architect `READY` response carrying `envelope`, mirroring
+    `tests/unit/test_protocol.py`'s own `_ready_text` helper."""
+
+    return f"{body}\nISSUE_REF_JSON: {envelope}\nAGENT_STATUS: READY"
+
+
+def test_ac_029_identity_architect_handoff_and_failures(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """AC-029 (PRD "Issue identity e handoff"): "in un fixture
+    multi-repository, il repository GitHub viene derivato dal target o da
+    override esplicito, l'architect viene istruito a usare `gh issue view`,
+    un'identita ambigua/auth failure/not-found fallisce chiuso e un handoff
+    riuscito contiene ISSUE_REF_JSON valido. Envelope e testo dell'handoff
+    vengono validati e passati al coder senza interpretare il body della
+    issue in Python; mismatch, JSON malformato o campo obbligatorio assente
+    produce PROTOCOL_ERROR."
+
+    This is the single canonical entry point the implementation plan names
+    for AC-029 (SS6). It does not re-derive any of the underlying proofs --
+    every clause below is exhaustively covered elsewhere already, and this
+    test only assembles the already-proven real-process/pure entry points
+    behind one recognizable node, one inline-commented clause per sentence
+    of the acceptance criterion. AC-029 is itself explicitly a
+    multi-milestone AC ("parte AC-029" in the implementation plan's own
+    table, validated across M06/M07/M11/M13); the one clause this component
+    file cannot legitimately own on its own -- the full pipeline-halts-
+    the-coder behavior on a `not-found`-shaped architect failure, which
+    needs the orchestrator/`SequencedAgentRunner` apparatus -- is instead
+    cross-referenced below rather than duplicated.
+    """
+
+    workspace = _workspace(tmp_path / "workspace")
+
+    # (1) "il repository GitHub viene derivato dal target" -- one repository
+    # in a shared multi-repository fixture, identified from its `origin`
+    # remote alone. Exhaustively proven already by
+    # test_a_repository_with_a_valid_origin_resolves_from_origin; re-invoked
+    # here against a sibling repository in the same workspace.
+    origin_repo = _init_repo(workspace.root / "repo-origin")
+    _add_remote(origin_repo, "origin", "https://github.com/owner/origin-repo.git")
+    origin_identity = _resolve_identity(workspace, origin_repo)
+    assert origin_identity == RepositoryIdentity(
+        host="github.com",
+        owner="owner",
+        repository="origin-repo",
+        source="origin",
+        remote_name="origin",
+    )
+
+    # (1) "...o da override esplicito" -- a sibling repository in the same
+    # multi-repository fixture, identified by an explicit remote override
+    # instead. Exhaustively proven already by
+    # test_an_override_naming_a_specific_remote_resolves_from_that_remote.
+    override_repo = _init_repo(workspace.root / "repo-override")
+    _add_remote(override_repo, "origin", "https://github.com/decoy/decoy.git")
+    _add_remote(override_repo, "upstream", "git@github.com:owner/override-repo.git")
+    override = GithubTargetOverride(
+        workspace_relative=Path("repo-override"), remote="upstream"
+    )
+    override_identity = _resolve_identity(
+        workspace, override_repo, github_targets=(override,)
+    )
+    assert override_identity == RepositoryIdentity(
+        host="github.com",
+        owner="owner",
+        repository="override-repo",
+        source="remote",
+        remote_name="upstream",
+    )
+
+    # (2) "un'identita ambigua ... fallisce chiuso" -- a third repository in
+    # the same fixture, with two remotes and no origin. Exhaustively proven
+    # already by test_multiple_ambiguous_remotes_and_no_origin_fails_closed.
+    ambiguous_repo = _init_repo(workspace.root / "repo-ambiguous")
+    _add_remote(ambiguous_repo, "alpha", "https://github.com/owner-a/repo-a.git")
+    _add_remote(ambiguous_repo, "beta", "https://github.com/owner-b/repo-b.git")
+    with pytest.raises(PreflightError) as ambiguous_error:
+        _resolve_identity(workspace, ambiguous_repo)
+    assert ambiguous_error.value.code == "github.no_unique_identity"
+
+    # (2) "...auth failure ... fallisce chiuso" -- a clean non-zero
+    # `gh auth status` exit fails closed and never constructs a locator.
+    # Exhaustively proven already by
+    # test_run_gh_preflight_fails_closed_when_auth_status_exits_nonzero and
+    # test_locate_issue_never_constructs_a_locator_when_the_preflight_fails.
+    monkeypatch.delenv("FAKE_GH_VERSION_OUTPUT", raising=False)
+    monkeypatch.setenv("FAKE_GH_AUTH_EXIT_CODE", "1")
+    with pytest.raises(PreflightError) as auth_error:
+        locate_issue(
+            origin_identity,
+            42,
+            process_runner=SubprocessRunner(RealClock()),
+            gh_executable=FAKE_GH,
+            utility_timeout_seconds=UTILITY_TIMEOUT_SECONDS,
+            termination_grace_seconds=TERMINATION_GRACE_SECONDS,
+        )
+    assert auth_error.value.code == "github.gh_auth_failed"
+    monkeypatch.delenv("FAKE_GH_AUTH_EXIT_CODE", raising=False)
+
+    # A clean preflight, needed as the shared locator for every remaining
+    # clause below.
+    locator = locate_issue(
+        origin_identity,
+        42,
+        process_runner=SubprocessRunner(RealClock()),
+        gh_executable=FAKE_GH,
+        utility_timeout_seconds=UTILITY_TIMEOUT_SECONDS,
+        termination_grace_seconds=TERMINATION_GRACE_SECONDS,
+    )
+
+    # (3) "l'architect viene istruito a usare `gh issue view`" -- the
+    # trusted architect prompt embeds the exact command shape built from
+    # this target-specific locator. Exhaustively proven already by
+    # tests/unit/test_prompting.py's golden prompt and its dedicated
+    # command-shape assertions for both a github.com and an Enterprise
+    # host; this file never otherwise touches `prompting.py`.
+    architect_prompt = build_architect_prompt(
+        issue_locator=locator,
+        workspace_root=workspace.root,
+        target_root=origin_repo,
+    )
+    identity_display = (
+        f"{locator.repository_identity.owner}/{locator.repository_identity.repository}"
+    )
+    assert f"gh issue view {locator.number} --repo {identity_display}" in (
+        architect_prompt
+    )
+
+    # (4) "un handoff riuscito contiene ISSUE_REF_JSON valido. Envelope e
+    # testo dell'handoff vengono validati e passati al coder senza
+    # interpretare il body della issue in Python" -- a valid envelope
+    # produces an IssueRef matching the locator, and the untrusted,
+    # multi-line handoff body is forwarded byte-for-byte -- Python never
+    # parses or rewrites it -- into the coder prompt.
+    handoff_body = (
+        "Investigated the issue and confirmed the failing scenario.\n"
+        "Plan: fix the retry policy and add regression tests."
+    )
+    valid_envelope = _issue_ref_envelope(locator)
+    parsed = parse_agent_response(
+        AgentRole.ARCHITECT,
+        _ready_text(handoff_body, valid_envelope),
+        issue_locator=locator,
+    )
+    assert parsed.agent_status is AgentStatus.READY
+    assert parsed.body == handoff_body
+    assert parsed.issue_ref is not None
+    assert parsed.issue_ref == IssueRef(
+        locator=locator,
+        url=(
+            f"https://{locator.repository_identity.host}"
+            f"/{locator.repository_identity.owner}"
+            f"/{locator.repository_identity.repository}/issues/{locator.number}"
+        ),
+        title="A real issue title",
+    )
+
+    coder_prompt = build_coder_prompt(
+        issue_ref=parsed.issue_ref,
+        architect_handoff=parsed.body,
+        target_root=origin_repo,
+        review_cycle=1,
+        max_review_cycles=3,
+    )
+    assert handoff_body in coder_prompt
+
+    # (5) "mismatch, JSON malformato o campo obbligatorio assente produce
+    # PROTOCOL_ERROR" -- the full precedence matrix for this is already
+    # exhaustively unit-tested in tests/unit/test_protocol.py
+    # (test_malformed_json_syntax_is_rejected, test_a_missing_key_is_rejected,
+    # test_identity_mismatch_against_the_locator_is_rejected); re-driven
+    # here through the same real parser against this target-specific
+    # locator to prove the link end to end within this file.
+    with pytest.raises(ProtocolError) as malformed_json_error:
+        parse_agent_response(
+            AgentRole.ARCHITECT,
+            _ready_text(handoff_body, "{not valid json"),
+            issue_locator=locator,
+        )
+    assert malformed_json_error.value.code == "protocol.issue_ref_invalid_json"
+
+    with pytest.raises(ProtocolError) as missing_key_error:
+        parse_agent_response(
+            AgentRole.ARCHITECT,
+            _ready_text(handoff_body, _issue_ref_envelope(locator, drop="title")),
+            issue_locator=locator,
+        )
+    assert missing_key_error.value.code == "protocol.issue_ref_missing_key"
+
+    with pytest.raises(ProtocolError) as mismatch_error:
+        parse_agent_response(
+            AgentRole.ARCHITECT,
+            _ready_text(
+                handoff_body,
+                _issue_ref_envelope(locator, {"host": "example.com"}),
+            ),
+            issue_locator=locator,
+        )
+    assert mismatch_error.value.code == "protocol.issue_ref_identity_mismatch"
+
+    # (6) "not-found fallisce chiuso" -- Python's own locate_issue/
+    # run_gh_preflight never call `gh issue view` at all (this file's own
+    # module docstring, and protocol.py's/github.py's): only the architect
+    # agent does, inside its own sandbox. The piece this component file can
+    # legitimately own is that the *protocol* accepts and terminally
+    # classifies a not-found-shaped architect failure as a normal,
+    # non-exceptional agent-reported failure parse -- never an exception --
+    # so the pipeline can proceed to its own AGENT_REPORTED_FAILURE
+    # handling. The full pipeline-halts-the-coder proof for this same
+    # scenario lives in
+    # tests/component/test_single_issue_pipeline.py::
+    # test_coder_is_not_invoked_when_the_architect_reports_failed.
+    not_found_result = parse_agent_response(
+        AgentRole.ARCHITECT,
+        "Could not access the issue.\nAGENT_STATUS: FAILED",
+        issue_locator=locator,
+    )
+    assert not_found_result.agent_status is AgentStatus.FAILED
+    assert not_found_result.issue_ref is None

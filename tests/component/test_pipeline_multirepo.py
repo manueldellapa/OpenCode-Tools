@@ -567,7 +567,10 @@ def test_current_phase_reaches_architect_independently_for_each_target(
         assert outcome.record.target == target
 
 
-def test_a_logical_invocation_runs_opencode_in_the_workspace_and_git_on_the_explicit_target(
+# --- AC-003: workspace/target split ------------------------------------------
+
+
+def test_ac_003_workspace_target_split(
     tmp_path: Path,
 ) -> None:
     """Bootstrapping alone only proves *resolution* stays distinct per
