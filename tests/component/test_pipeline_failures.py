@@ -22,6 +22,7 @@ own once-per-run preflight) still never reaches the coder or reviewer.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Self
@@ -31,6 +32,7 @@ import pytest
 from opencode_tools.domain import (
     AgentResult,
     AgentRole,
+    AgentStatus,
     AppConfig,
     ConfigSource,
     ExecutionConfig,
@@ -39,6 +41,7 @@ from opencode_tools.domain import (
     GitSafetyStatus,
     GitState,
     IssueLocator,
+    ParsedAgentResponse,
     PersistenceStatus,
     PipelinePhase,
     ProcessResult,
@@ -57,9 +60,11 @@ from opencode_tools.errors import (
     ProtocolError,
 )
 from opencode_tools.orchestrator import (
+    _TERMINATION_UNCONFIRMED_QUARANTINE_REASON,
     BootstrapOutcome,
     IssueOrchestrator,
     bootstrap_run,
+    finalize_run,
 )
 from opencode_tools.ports import AttemptLogSink, LogChannel
 
@@ -1316,3 +1321,506 @@ def test_a_control_plane_digest_drift_blocks_the_attempt_before_the_agent_runs(
     # The lease is still held: this is a normal terminal attempt outcome,
     # not something bootstrap_run (or this call) releases.
     assert lease.released is False
+
+
+def test_ac_017_agent_reported_failure_is_distinct(tmp_path: Path) -> None:
+    """AC-017: an agent-reported `FAILED` marker and a malformed/unparseable
+    protocol envelope are two distinct, non-confusable technical outcomes
+    (System Design SS13.2's precedence: `AGENT_REPORTED_FAILURE` vs.
+    `PROTOCOL_ERROR`) -- driven here directly through this file's own
+    ScriptedAgentRunner/bootstrap_run/IssueOrchestrator wiring (see
+    `test_a_control_plane_failure_on_the_architects_first_attempt_never_reaches_coder_or_reviewer`
+    for the pattern), mirroring the two proofs already in
+    `test_single_issue_pipeline.py`'s `test_coder_is_not_invoked_when_the_
+    architect_reports_failed` / `test_coder_is_not_invoked_when_the_architect_
+    envelope_is_malformed` without importing that file's whole harness."""
+
+    workspace, target = _workspace_and_target(tmp_path)
+    config = _app_config(runtime_root=tmp_path / "runtime")
+    run_request = _run_request(workspace=workspace, target_root=target.root)
+
+    architect_before = GitCheckRecord(
+        sequence=1,
+        purpose="ARCHITECT:0:1:before",
+        process_results=(_git_probe_result(target_root=target.root),),
+        state=_git_state(target_root=target.root),
+        safety_status=GitSafetyStatus.SAFE,
+    )
+    architect_after = GitCheckRecord(
+        sequence=2,
+        purpose="ARCHITECT:0:1:after",
+        process_results=(_git_probe_result(target_root=target.root),),
+        state=_git_state(target_root=target.root),
+        safety_status=GitSafetyStatus.SAFE,
+    )
+    coder_before = GitCheckRecord(
+        sequence=3,
+        purpose="CODER:1:1:before",
+        process_results=(_git_probe_result(target_root=target.root),),
+        state=_git_state(target_root=target.root),
+        safety_status=GitSafetyStatus.SAFE,
+    )
+    coder_after = GitCheckRecord(
+        sequence=4,
+        purpose="CODER:1:1:after",
+        process_results=(_git_probe_result(target_root=target.root),),
+        state=_git_state(target_root=target.root),
+        safety_status=GitSafetyStatus.SAFE,
+    )
+    git_safety = ScriptedGitSafetyPort(
+        target=target,
+        baseline_check=_baseline_check(target_root=target.root),
+        subsequent_checks=[
+            architect_before,
+            architect_after,
+            coder_before,
+            coder_after,
+        ],
+    )
+    lease = RecordingTargetLease()
+    lease_factory = ScriptedTargetLeaseFactory(lease=lease)
+    run_store = RecordingRunStorePort()
+    issue_resolver = ScriptedIssueResolver(
+        repository_identity=_repository_identity(), issue_locator=_issue_locator()
+    )
+
+    # (1) The architect ran, produced a real process outcome, and reported
+    # its own role-specific FAILED marker with an explanation -- a
+    # successful *parse* of an unsuccessful attempt (System Design SS9).
+    architect_reported_failed = AgentResult(
+        role=AgentRole.ARCHITECT,
+        phase=PipelinePhase.ARCHITECT,
+        review_cycle=None,
+        provider_attempt=1,
+        process=ProcessResult(
+            command=("/usr/bin/opencode", "run"),
+            cwd=workspace.root,
+            started_at=NOW,
+            finished_at=NOW + timedelta(seconds=1),
+            duration_ns=1_000_000_000,
+            return_code=0,
+            timed_out=False,
+            termination_confirmed=True,
+            log_path=Path("architect-provider-attempt-1.log"),
+            stdout_byte_count=0,
+            stdout_sha256="stdout-digest-1",
+            stderr_byte_count=0,
+            stderr_sha256="stderr-digest-1",
+            outcome=RunOutcome.SUCCEEDED,
+        ),
+        terminal_response=ParsedAgentResponse(
+            role=AgentRole.ARCHITECT,
+            body="Could not access the issue.",
+            agent_status=AgentStatus.FAILED,
+        ),
+        session_id=None,
+        verified_agent=None,
+        provider_diagnostic=None,
+        outcome=RunOutcome.AGENT_REPORTED_FAILURE,
+    )
+    # (2) The coder ran and its process outcome was clean too, but the
+    # concrete adapter could not parse a terminal envelope out of it at all
+    # (e.g. no marker line, or an inconsistent ISSUE_REF_JSON) -- reported
+    # with `terminal_response=None`, exactly as if nothing had been said.
+    coder_malformed_envelope = AgentResult(
+        role=AgentRole.CODER,
+        phase=PipelinePhase.CODER,
+        review_cycle=1,
+        provider_attempt=1,
+        process=ProcessResult(
+            command=("/usr/bin/opencode", "run"),
+            cwd=workspace.root,
+            started_at=NOW,
+            finished_at=NOW + timedelta(seconds=1),
+            duration_ns=1_000_000_000,
+            return_code=0,
+            timed_out=False,
+            termination_confirmed=True,
+            log_path=Path("coder-provider-attempt-1.log"),
+            stdout_byte_count=0,
+            stdout_sha256="stdout-digest-2",
+            stderr_byte_count=0,
+            stderr_sha256="stderr-digest-2",
+            outcome=RunOutcome.SUCCEEDED,
+        ),
+        terminal_response=None,
+        session_id=None,
+        verified_agent=None,
+        provider_diagnostic=None,
+        outcome=RunOutcome.PROTOCOL_ERROR,
+    )
+    agent_runner = ScriptedAgentRunner(
+        [architect_reported_failed, coder_malformed_envelope]
+    )
+
+    outcome = bootstrap_run(
+        run_request=run_request,
+        config=config,
+        run_id=RUN_ID,
+        config_snapshot={},
+        environment_snapshot={},
+        git_safety=git_safety,
+        issue_resolver=issue_resolver,
+        run_store=run_store,
+        lease_factory=lease_factory,
+        opencode_preflight=ScriptedOpenCodePreflightPort(),
+        agent_runner=agent_runner,
+        clock=SteppingClock(),
+        sleeper=RecordingSleeper(),
+    )
+    assert outcome.error is None
+    assert isinstance(outcome.orchestrator, IssueOrchestrator)
+
+    failed_result = outcome.orchestrator.run_logical_invocation(
+        role=AgentRole.ARCHITECT,
+        review_cycle=None,
+        provider_attempt=1,
+        prompt="Design the fix for issue 48.",
+        workspace=workspace,
+    )
+    malformed_result = outcome.orchestrator.run_logical_invocation(
+        role=AgentRole.CODER,
+        review_cycle=1,
+        provider_attempt=1,
+        prompt="Implement the fix for issue 48.",
+        workspace=workspace,
+    )
+
+    # The two halves of AC-017: distinct RunOutcomes, never confused.
+    assert failed_result.precedence is not None
+    assert failed_result.precedence.outcome is RunOutcome.AGENT_REPORTED_FAILURE
+    assert malformed_result.precedence is not None
+    assert malformed_result.precedence.outcome is RunOutcome.PROTOCOL_ERROR
+
+    # Neither is ever retried (System Design SS13.2's precedence covers
+    # both; only PROVIDER_ERROR retries).
+    assert failed_result.retry_decision is not None
+    assert failed_result.retry_decision.should_retry is False
+    assert malformed_result.retry_decision is not None
+    assert malformed_result.retry_decision.should_retry is False
+
+    # This is a normal terminal attempt outcome, not something
+    # bootstrap_run or run_logical_invocation itself releases.
+    assert lease.released is False
+
+
+def test_ac_020_all_terminal_failures_attempt_postflight(tmp_path: Path) -> None:
+    """AC-020: every terminal-failure trigger attempts postflight and
+    converges to `FINISHED`/`FinalStatus.FAILED` -- never skipped just
+    because the trigger came from an agent attempt rather than a
+    preflight-stage failure. Provider exhaustion and review-cycle
+    exhaustion are already proven end to end in test_single_issue_pipeline.
+    py (`test_finalize_run_reports_a_provider_exhaustion_trigger_as_failed`
+    / `test_finalize_run_reports_review_cycles_exhausted_as_failed`); this
+    covers the two trigger categories the PRD names that neither that file
+    nor this one had ever chased through to `finalize_run` before: TIMEOUT,
+    and a technical PROCESS_ERROR/PROTOCOL_ERROR (one grouped category in
+    the PRD text -- both variants are covered below to remove ambiguity).
+    `finalize_run`'s own logic never branches on which technical
+    `RunOutcome` triggered it (it only branches on Git-safety/termination/
+    persistence signals), so this exercises the same PREFLIGHT-stage
+    convergence `test_an_ambiguous_control_plane_fails_closed_and_
+    converges_to_finalization` already proves above, but for a trigger that
+    only exists after at least one agent attempt has actually run."""
+
+    def _run_one_scenario(
+        *,
+        scenario_root: Path,
+        build_agent_result: Callable[[Workspace], AgentResult],
+        expected_trigger: RunOutcome,
+    ) -> None:
+        scenario_root.mkdir()
+        workspace, target = _workspace_and_target(scenario_root)
+        config = _app_config(runtime_root=scenario_root / "runtime")
+        run_request = _run_request(workspace=workspace, target_root=target.root)
+
+        architect_before = GitCheckRecord(
+            sequence=1,
+            purpose="ARCHITECT:0:1:before",
+            process_results=(_git_probe_result(target_root=target.root),),
+            state=_git_state(target_root=target.root),
+            safety_status=GitSafetyStatus.SAFE,
+        )
+        architect_after = GitCheckRecord(
+            sequence=2,
+            purpose="ARCHITECT:0:1:after",
+            process_results=(_git_probe_result(target_root=target.root),),
+            state=_git_state(target_root=target.root),
+            safety_status=GitSafetyStatus.SAFE,
+        )
+        postflight_check = GitCheckRecord(
+            sequence=3,
+            purpose="postflight",
+            process_results=(_git_probe_result(target_root=target.root),),
+            state=_git_state(target_root=target.root),
+            safety_status=GitSafetyStatus.SAFE,
+        )
+        git_safety = ScriptedGitSafetyPort(
+            target=target,
+            baseline_check=_baseline_check(target_root=target.root),
+            subsequent_checks=[architect_before, architect_after, postflight_check],
+        )
+        lease = RecordingTargetLease()
+        lease_factory = ScriptedTargetLeaseFactory(lease=lease)
+        run_store = RecordingRunStorePort()
+        issue_resolver = ScriptedIssueResolver(
+            repository_identity=_repository_identity(), issue_locator=_issue_locator()
+        )
+        # `workspace` (needed for `ProcessResult.cwd`) is only known once
+        # `_workspace_and_target` has run, so the one scripted result is
+        # built here, right before bootstrap_run, rather than up front.
+        agent_runner = ScriptedAgentRunner([build_agent_result(workspace)])
+
+        outcome = bootstrap_run(
+            run_request=run_request,
+            config=config,
+            run_id=RUN_ID,
+            config_snapshot={},
+            environment_snapshot={},
+            git_safety=git_safety,
+            issue_resolver=issue_resolver,
+            run_store=run_store,
+            lease_factory=lease_factory,
+            opencode_preflight=ScriptedOpenCodePreflightPort(),
+            agent_runner=agent_runner,
+            clock=SteppingClock(),
+            sleeper=RecordingSleeper(),
+        )
+        assert outcome.error is None
+        assert isinstance(outcome.orchestrator, IssueOrchestrator)
+
+        result = outcome.orchestrator.run_logical_invocation(
+            role=AgentRole.ARCHITECT,
+            review_cycle=None,
+            provider_attempt=1,
+            prompt="Design the fix for issue 48.",
+            workspace=workspace,
+        )
+        assert result.precedence is not None
+        assert result.precedence.outcome is expected_trigger
+        assert result.agent_result is not None
+
+        issue_result = finalize_run(
+            record=outcome.orchestrator.record,
+            target=target,
+            trigger_outcome=result.precedence.outcome,
+            review_status=None,
+            interrupted=False,
+            termination_confirmed=result.agent_result.process.termination_confirmed,
+            git_safety=git_safety,
+            run_store=run_store,
+            lease=lease,
+            clock=SteppingClock(),
+            max_review_cycles=config.execution.max_review_cycles,
+        )
+
+        # The postflight probe WAS attempted -- the whole point of AC-020 --
+        # never skipped just because the trigger was technical rather than
+        # a preflight-stage failure.
+        assert git_safety.check_calls[-1][2] == "postflight"
+        final_record = run_store.persist_calls[-1]
+        assert final_record.current_phase is PipelinePhase.FINISHED
+        assert final_record.git_postflight == postflight_check
+        assert issue_result.final_status is FinalStatus.FAILED
+        assert issue_result.trigger_outcome is expected_trigger
+        assert issue_result.expected_exit_code == 20
+        assert lease.released is True
+
+    def _timeout_result(workspace: Workspace) -> AgentResult:
+        return AgentResult(
+            role=AgentRole.ARCHITECT,
+            phase=PipelinePhase.ARCHITECT,
+            review_cycle=None,
+            provider_attempt=1,
+            process=ProcessResult(
+                command=("/usr/bin/opencode", "run"),
+                cwd=workspace.root,
+                started_at=NOW,
+                finished_at=NOW + timedelta(seconds=120),
+                duration_ns=120_000_000_000,
+                return_code=None,
+                timed_out=True,
+                termination_confirmed=True,
+                log_path=Path("architect-provider-attempt-1.log"),
+                stdout_byte_count=0,
+                stdout_sha256="stdout-digest",
+                stderr_byte_count=0,
+                stderr_sha256="stderr-digest",
+                outcome=RunOutcome.TIMEOUT,
+            ),
+            terminal_response=None,
+            session_id=None,
+            verified_agent=None,
+            provider_diagnostic=None,
+            outcome=RunOutcome.TIMEOUT,
+        )
+
+    def _process_error_result(workspace: Workspace) -> AgentResult:
+        return AgentResult(
+            role=AgentRole.ARCHITECT,
+            phase=PipelinePhase.ARCHITECT,
+            review_cycle=None,
+            provider_attempt=1,
+            process=ProcessResult(
+                command=("/usr/bin/opencode", "run"),
+                cwd=workspace.root,
+                started_at=NOW,
+                finished_at=NOW + timedelta(seconds=1),
+                duration_ns=1_000_000_000,
+                return_code=None,
+                timed_out=False,
+                termination_confirmed=True,
+                log_path=Path("architect-provider-attempt-1.log"),
+                stdout_byte_count=0,
+                stdout_sha256="stdout-digest",
+                stderr_byte_count=0,
+                stderr_sha256="stderr-digest",
+                outcome=RunOutcome.PROCESS_ERROR,
+            ),
+            terminal_response=None,
+            session_id=None,
+            verified_agent=None,
+            provider_diagnostic=None,
+            outcome=RunOutcome.PROCESS_ERROR,
+        )
+
+    def _protocol_error_result(workspace: Workspace) -> AgentResult:
+        return AgentResult(
+            role=AgentRole.ARCHITECT,
+            phase=PipelinePhase.ARCHITECT,
+            review_cycle=None,
+            provider_attempt=1,
+            process=ProcessResult(
+                command=("/usr/bin/opencode", "run"),
+                cwd=workspace.root,
+                started_at=NOW,
+                finished_at=NOW + timedelta(seconds=1),
+                duration_ns=1_000_000_000,
+                return_code=0,
+                timed_out=False,
+                termination_confirmed=True,
+                log_path=Path("architect-provider-attempt-1.log"),
+                stdout_byte_count=0,
+                stdout_sha256="stdout-digest",
+                stderr_byte_count=0,
+                stderr_sha256="stderr-digest",
+                outcome=RunOutcome.SUCCEEDED,
+            ),
+            terminal_response=None,
+            session_id=None,
+            verified_agent=None,
+            provider_diagnostic=None,
+            outcome=RunOutcome.PROTOCOL_ERROR,
+        )
+
+    _run_one_scenario(
+        scenario_root=tmp_path / "timeout",
+        build_agent_result=_timeout_result,
+        expected_trigger=RunOutcome.TIMEOUT,
+    )
+    _run_one_scenario(
+        scenario_root=tmp_path / "process-error",
+        build_agent_result=_process_error_result,
+        expected_trigger=RunOutcome.PROCESS_ERROR,
+    )
+    _run_one_scenario(
+        scenario_root=tmp_path / "protocol-error",
+        build_agent_result=_protocol_error_result,
+        expected_trigger=RunOutcome.PROTOCOL_ERROR,
+    )
+
+
+def test_ac_032_unconfirmed_termination_quarantines_and_fails(tmp_path: Path) -> None:
+    """AC-032: an attempt whose termination could not be confirmed forces
+    `finalize_run`'s own postflight determination to `INDETERMINATE` even
+    when the fresh probe itself comes back `SAFE`, quarantines the target
+    *before* the lease is ever released, and still converges to a
+    persisted `FinalStatus.FAILED` -- reusing this file's own bootstrap_run
+    wiring (as in `test_a_control_plane_failure_on_the_architects_first_
+    attempt_never_reaches_coder_or_reviewer`) to reach a valid, baselined
+    `RunRecord`, then calling `finalize_run` directly with
+    `termination_confirmed=False`. This is the same convergence
+    `test_single_issue_pipeline.py`'s `test_finalize_run_quarantines_and_
+    marks_indeterminate_when_termination_is_unconfirmed` already proves,
+    reached here without importing that file's whole harness. The real,
+    bounded (never-hanging) SIGTERM/grace/SIGKILL escalation that produces
+    an unconfirmed termination in the first place is proven separately, at
+    the real-subprocess level, by test_process_runner.py::test_run_reports_
+    unconfirmed_termination_when_a_descendant_escapes_the_group and its
+    grace-bound siblings -- this test only proves what `finalize_run` does
+    once handed `termination_confirmed=False`, against a fake port."""
+
+    workspace, target = _workspace_and_target(tmp_path)
+    config = _app_config(runtime_root=tmp_path / "runtime")
+    run_request = _run_request(workspace=workspace, target_root=target.root)
+
+    postflight_check = GitCheckRecord(
+        sequence=1,
+        purpose="postflight",
+        process_results=(_git_probe_result(target_root=target.root),),
+        state=_git_state(target_root=target.root),
+        safety_status=GitSafetyStatus.SAFE,
+    )
+    git_safety = ScriptedGitSafetyPort(
+        target=target,
+        baseline_check=_baseline_check(target_root=target.root),
+        subsequent_checks=[postflight_check],
+    )
+    lease = RecordingTargetLease()
+    lease_factory = ScriptedTargetLeaseFactory(lease=lease)
+    run_store = RecordingRunStorePort()
+    issue_resolver = ScriptedIssueResolver(
+        repository_identity=_repository_identity(), issue_locator=_issue_locator()
+    )
+
+    outcome = bootstrap_run(
+        run_request=run_request,
+        config=config,
+        run_id=RUN_ID,
+        config_snapshot={},
+        environment_snapshot={},
+        git_safety=git_safety,
+        issue_resolver=issue_resolver,
+        run_store=run_store,
+        lease_factory=lease_factory,
+        opencode_preflight=ScriptedOpenCodePreflightPort(),
+        agent_runner=ScriptedAgentRunner([]),
+        clock=SteppingClock(),
+        sleeper=RecordingSleeper(),
+    )
+    assert outcome.error is None
+    assert outcome.record is not None
+    assert lease.quarantine_reasons == []  # nothing quarantined yet
+
+    issue_result = finalize_run(
+        record=outcome.record,
+        target=target,
+        trigger_outcome=RunOutcome.PROCESS_ERROR,
+        review_status=None,
+        interrupted=False,
+        termination_confirmed=False,
+        git_safety=git_safety,
+        run_store=run_store,
+        lease=lease,
+        clock=SteppingClock(),
+        max_review_cycles=config.execution.max_review_cycles,
+    )
+
+    # Quarantined with production's own reason -- before the lease is
+    # released, never after -- not a different, test-invented string.
+    assert lease.quarantine_reasons == [_TERMINATION_UNCONFIRMED_QUARANTINE_REASON]
+    assert lease.released is True
+
+    final_record = run_store.persist_calls[-1]
+    assert final_record.current_phase is PipelinePhase.FINISHED
+    # The raw probe evidence is preserved verbatim -- it really was SAFE --
+    # even though it can never be TRUSTED once termination is unconfirmed.
+    assert final_record.git_postflight == postflight_check
+    assert final_record.git_postflight is not None
+    assert final_record.git_postflight.safety_status is GitSafetyStatus.SAFE
+    assert final_record.git_safety_status is GitSafetyStatus.INDETERMINATE
+    assert final_record.termination_confirmed is False
+
+    assert issue_result.final_status is FinalStatus.FAILED
+    assert issue_result.git_safety_status is GitSafetyStatus.INDETERMINATE
+    assert issue_result.termination_confirmed is False

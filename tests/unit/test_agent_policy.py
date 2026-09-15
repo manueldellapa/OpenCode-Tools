@@ -38,18 +38,32 @@ from typing import Final, cast
 
 import pytest
 
+import opencode_tools.github as github_module
+from opencode_tools.config import (
+    _EXECUTION_KEYS,  # closed-schema ground truth, never hand-copied
+    _GITHUB_KEYS,
+    _GITHUB_TARGET_ENTRY_KEYS,
+    _PROVIDER_RETRY_KEYS,
+    _RUNTIME_KEYS,
+    _TOP_LEVEL_KEYS,
+    read_config_file,
+)
 from opencode_tools.domain import AgentRole
-from opencode_tools.errors import PreflightError
+from opencode_tools.errors import ConfigError, PreflightError
+from opencode_tools.git_safety import ALLOWED_GIT_ARGV_TAILS
 from opencode_tools.opencode import (
     _PERMISSION_BASELINE,  # ground truth for permission, never hand-copied
+    FORBIDDEN_RUN_FLAGS,
     check_debug_agent,
     check_debug_config,
+    check_no_forbidden_flags,
     compute_control_plane_digest,
 )
 
 REPO_ROOT: Final = Path(__file__).resolve().parents[2]
 AGENTS_DIR: Final = REPO_ROOT / ".opencode" / "agents"
 SRC_ROOT: Final = REPO_ROOT / "src" / "opencode_tools"
+CONFIG_FIXTURES_DIR: Final = REPO_ROOT / "tests" / "fixtures" / "config"
 
 _ROLE_TOKENS: Final = ("architect", "coder", "reviewer")
 _ROLE_BY_TOKEN: Final[dict[str, AgentRole]] = {
@@ -274,6 +288,111 @@ def test_coder_body_forbids_issue_mutation() -> None:
     assert "gh issue" in body.lower(), "coder.md must forbid issue mutation"
 
 
+def test_ac_024_forbidden_action_policy_and_command_inventory() -> None:
+    """AC-024 has three clauses; this composite asserts all three at the
+    AC level, reusing already-shipped ground truth rather than duplicating
+    the finer-grained tests that already exist:
+
+    1. "prompt/definizioni agent codificano l'allowlist/deny policy
+       richiesta" -- the itemized, per-verb proof already lives in the 14
+       `test_coder_body_forbids_*` tests above plus the permission-baseline
+       tests; this only re-asserts the AC-level fact via the real,
+       already-imported `_PERMISSION_BASELINE` (architect/reviewer deny
+       edit and bash outright; every role denies webfetch), without
+       re-deriving the FR-021 verb list.
+    2. "Python non costruisce mutazioni Git/GitHub" -- structural, not
+       free-text, proof for both halves:
+       (a) Git: every argv tail in the real `ALLOWED_GIT_ARGV_TAILS`
+           starts with a read-only verb. The exact-tuple audit of that
+           same constant already lives in
+           `tests/unit/test_git_commands.py::
+           test_allowed_git_argv_tails_is_exactly_the_reviewed_read_only_set`;
+           this does not repeat that exact-equality assertion, only the
+           weaker read-only-verb-prefix structural fact, against the real
+           constant.
+       (b) GitHub: `github.py` has no PR/issue mutation-building function
+           at all. Proven two ways: none of its public names suggest a
+           mutation (structural, introspection-based), and its source text
+           never contains a mutating `gh pr`/`gh issue` subcommand literal
+           (the same `SRC_ROOT`-relative source-grep pattern
+           `test_no_agent_model_id_literal_appears_anywhere_in_the_python_package`
+           already uses for model IDs, applied here to `github.py`
+           specifically). Nothing before this test named this as a
+           regression-proof fact for `github.py`.
+    3. "senza presentarla come sandbox contro un agent ostile" -- entirely
+       new: the cooperative-control-not-a-sandbox (ADR-010) disclaimer is
+       already present verbatim in all three agent bodies, but nothing
+       asserted that before this test; a future deletion of that wording
+       would not have failed anything.
+    """
+
+    # (1) AC-level allowlist/deny claim via the real permission baseline.
+    assert _PERMISSION_BASELINE[AgentRole.ARCHITECT]["edit"] == "deny"
+    assert _PERMISSION_BASELINE[AgentRole.ARCHITECT]["bash"] == "deny"
+    assert _PERMISSION_BASELINE[AgentRole.REVIEWER]["edit"] == "deny"
+    assert _PERMISSION_BASELINE[AgentRole.REVIEWER]["bash"] == "deny"
+    for role_permission in _PERMISSION_BASELINE.values():
+        assert role_permission["webfetch"] == "deny"
+
+    # (2a) Git: every allowlisted argv tail starts with a read-only verb.
+    # (The exact-tuple audit of ALLOWED_GIT_ARGV_TAILS itself lives in
+    # test_git_commands.py; this only checks the weaker verb-prefix fact.)
+    read_only_git_verbs = {"rev-parse", "branch", "status", "ls-files"}
+    for argv_tail in ALLOWED_GIT_ARGV_TAILS:
+        assert argv_tail[0] in read_only_git_verbs, (
+            f"git_safety.ALLOWED_GIT_ARGV_TAILS contains a non-read-only "
+            f"verb: {argv_tail!r}"
+        )
+
+    # (2b) GitHub: no public name suggests a PR/issue mutation.
+    mutation_suggestive_substrings = ("create", "close", "merge", "comment", "edit")
+    public_names = tuple(
+        name for name in dir(github_module) if not name.startswith("_")
+    )
+    for name in public_names:
+        lowered_name = name.lower()
+        for substring in mutation_suggestive_substrings:
+            assert substring not in lowered_name, (
+                f"opencode_tools.github exposes {name!r}, which suggests a "
+                "PR/issue mutation; github.py must stay read-only"
+            )
+
+    # (2b, continued) GitHub: no mutating `gh pr`/`gh issue` subcommand
+    # literal appears in github.py's own source text.
+    github_source = (SRC_ROOT / "github.py").read_text(encoding="utf-8")
+    forbidden_gh_subcommands = (
+        "gh pr create",
+        "gh pr merge",
+        "gh pr close",
+        "gh pr comment",
+        "gh pr edit",
+        "gh issue create",
+        "gh issue close",
+        "gh issue comment",
+        "gh issue edit",
+    )
+    for forbidden in forbidden_gh_subcommands:
+        assert forbidden not in github_source, (
+            f"github.py must not construct the mutating command {forbidden!r}"
+        )
+
+    # (3) The cooperative-control-not-a-sandbox disclaimer (ADR-010) is
+    # present verbatim in every role's body.
+    for token in _ROLE_TOKENS:
+        _, body = _load_agent_definition(token)
+        lowered = body.lower()
+        assert "cooperative control" in lowered, (
+            f"{token}.md must disclose the permission matrix is a "
+            "cooperative control (ADR-010)"
+        )
+        assert "not a sandbox" in lowered, (
+            f"{token}.md must disclaim sandbox-strength containment (ADR-010)"
+        )
+        assert "adr-010" in lowered, (
+            f"{token}.md must cite ADR-010 for the cooperative-control disclaimer"
+        )
+
+
 # =============================================================================
 # Compatibility with the real, already-shipped `debug agent` / `debug
 # config` effective-policy validators (ADR-005 SS10.4)
@@ -386,3 +505,82 @@ def test_config_module_defines_no_model_related_default_constant() -> None:
     )
     assert default_constant_names, "sanity: config.py must define _DEFAULT_* constants"
     assert not any("MODEL" in name for name in default_constant_names)
+
+
+def test_ac_023_models_are_external_to_python_and_toml() -> None:
+    """AC-023: the three experimental model IDs never appear as literals in
+    a Python command or config, and are never passed via `--model` -- i.e.
+    swapping a model on the OpenCode side never requires a Python change.
+    This composite proves the full sentence end-to-end by *reusing*
+    already-shipped, unmodified machinery rather than re-deriving it:
+
+    1. The three real model IDs are parsed the same way
+       `test_no_agent_model_id_literal_appears_anywhere_in_the_python_package`
+       already does. That sibling test is the literal-absence-in-`*.py`
+       proof; it is not re-run here (no second `SRC_ROOT.rglob` sweep over
+       the same files for the same reason) -- only reused as a source of
+       real, never-hand-typed model IDs.
+    2. The TOML config surface, which nothing before this test checked for
+       model literals at all:
+       (a) `config.py`'s own closed-schema key sets contain no key named
+           "model" at any nesting level, so the schema has no model knob
+           to begin with;
+       (b) the accepted ("golden") fixtures never carry a model literal;
+       (c) `tests/fixtures/config/unknown-top-level-key.toml` and
+           `unknown-target-entry-key.toml` *do* each contain a literal
+           `model = "gpt-unexpected"` line -- by construction, as rejection
+           fixtures, not an oversight -- so this asserts the literal really
+           is there (non-vacuous) and that `read_config_file` still refuses
+           the file. `tests/unit/test_config.py` already proves this
+           generically over "any unknown key"; what is new here is naming
+           "model" specifically as the key under test, tying the TOML half
+           directly to this AC rather than to schema-closedness in general.
+    3. The `--model` run-flag half: `FORBIDDEN_RUN_FLAGS` names it and the
+       real `check_no_forbidden_flags` enforcement function rejects it --
+       one targeted call, not a re-parametrization of
+       `test_opencode_adapter.py`'s full forbidden-flag battery.
+    """
+
+    # (1) Reuse, don't re-derive: three real model IDs, parsed from disk.
+    model_ids = {
+        str(_load_agent_definition(token)[0]["model"]) for token in _ROLE_TOKENS
+    }
+    assert model_ids, "sanity: at least one model id must have been parsed"
+
+    # (2a) The closed TOML schema's own known key sets have no "model" key
+    # at any level -- the schema has no model knob, structurally.
+    known_key_sets = (
+        _TOP_LEVEL_KEYS,
+        _EXECUTION_KEYS,
+        _PROVIDER_RETRY_KEYS,
+        _RUNTIME_KEYS,
+        _GITHUB_KEYS,
+        _GITHUB_TARGET_ENTRY_KEYS,
+    )
+    for keys in known_key_sets:
+        assert "model" not in keys
+
+    # (2b) The accepted fixtures never carry a model literal.
+    for fixture_name in ("golden-minimal.toml", "golden-full.toml"):
+        text = (CONFIG_FIXTURES_DIR / fixture_name).read_text(encoding="utf-8")
+        assert "model" not in text.lower()
+        for model_id in model_ids:
+            assert model_id not in text
+
+    # (2c) The two fixtures that *do* carry a literal `model = ...` line
+    # exist precisely to prove it is rejected, not accepted.
+    for fixture_name in (
+        "unknown-top-level-key.toml",
+        "unknown-target-entry-key.toml",
+    ):
+        fixture_path = CONFIG_FIXTURES_DIR / fixture_name
+        assert "model" in fixture_path.read_text(encoding="utf-8")
+        with pytest.raises(ConfigError) as exc_info:
+            read_config_file(fixture_path)
+        assert exc_info.value.code == "config.unknown_key"
+
+    # (3) The `--model` run-flag half: named in the real deny-list and
+    # enforced by the real function.
+    assert "--model" in FORBIDDEN_RUN_FLAGS
+    with pytest.raises(AssertionError):
+        check_no_forbidden_flags(("run", "--model", "sonnet"))

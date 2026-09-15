@@ -119,6 +119,22 @@ def test_ac_022_runtime_ignore_is_fail_closed_and_non_mutating(
     assert not runtime_root.exists()
     assert not (repo / ".gitignore").exists()
 
+    # Second half of the AC: once the same path *is* ignored, it is not
+    # just accepted (the sibling tests below already prove that) but, when
+    # actually used, stays invisible in `git status` -- nothing here
+    # surfaces the runtime root as untracked/dirty content.
+    (repo / ".gitignore").write_text(".opencode-tools/\n", encoding="utf-8")
+
+    _check_location(runtime_root)
+
+    runtime_root.mkdir()
+    (runtime_root / "run.json").write_text("{}", encoding="utf-8")
+
+    status = _git(["status", "--porcelain"], cwd=repo)
+
+    assert b"run.json" not in status.stdout
+    assert b".opencode-tools" not in status.stdout
+
 
 def test_check_runtime_location_accepts_an_already_ignored_root_and_creates_nothing(
     tmp_path: Path,

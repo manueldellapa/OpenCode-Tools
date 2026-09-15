@@ -153,3 +153,46 @@ def test_classify_provider_signal_returns_the_first_signal_in_stream_order() -> 
     diagnostic = classify_provider_signal(f"{first}\n{second}")
     assert diagnostic is not None
     assert diagnostic.signature == "429"
+
+
+# --- AC-031: trusted provider boundary and precedence -----------------------
+
+
+def test_ac_031_trusted_provider_boundary_and_precedence() -> None:
+    # A signature present only in a non-trusted channel -- assistant text,
+    # tool output, issue-like text, or stderr-like text -- must never trigger
+    # a retry, regardless of how closely it mimics a trusted signature.
+    assert (
+        classify_provider_signal(_provider_text("lookalike-in-assistant-text.ndjson"))
+        is None
+    )
+    assert (
+        classify_provider_signal(_provider_text("lookalike-in-tool-output.ndjson"))
+        is None
+    )
+
+    issue_like = (
+        "The upstream API returns 502 Bad Gateway under load; please add a "
+        "retry with backoff and handle provider_unavailable gracefully."
+    )
+    assert classify_provider_signal(issue_like) is None
+
+    stderr_like = (
+        "Error: 429 Too Many Requests\noverloaded_error\nprovider_unavailable\n"
+    )
+    assert classify_provider_signal(stderr_like) is None
+
+    # A trusted provider event -- a `session.error` with an allowlisted
+    # `error.data.code` -- does trigger it.
+    diagnostic = classify_provider_signal(_provider_text("http-429-rate-limit.ndjson"))
+    assert isinstance(diagnostic, ProviderDiagnostic)
+    assert diagnostic.source == "session.error"
+    assert diagnostic.retryable is True
+
+    # Concurrent trusted signals follow the documented precedence: the first
+    # signal in stream order wins.
+    first = _provider_text("http-429-rate-limit.ndjson").strip()
+    second = _provider_text("http-502-bad-gateway.ndjson").strip()
+    precedence_diagnostic = classify_provider_signal(f"{first}\n{second}")
+    assert precedence_diagnostic is not None
+    assert precedence_diagnostic.signature == "429"

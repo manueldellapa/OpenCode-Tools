@@ -199,6 +199,44 @@ def test_run_reports_a_missing_executable_as_process_error_with_null_return_code
     assert sink.writes == []
 
 
+def test_ac_015_spawn_and_non_provider_exit_are_process_error(
+    tmp_path: Path,
+) -> None:
+    """AC-015: neither a spawn failure nor a non-zero, non-provider exit is
+    ever provider-retryable -- both are `PROCESS_ERROR`, a purely technical
+    outcome `process.py` can emit on its own without knowing anything about
+    provider classification (its own module docstring). `PROVIDER_ERROR` is
+    architecturally impossible to reach from this module; the explicit
+    `is not RunOutcome.PROVIDER_ERROR` assertions below make that guarantee
+    visible in the test itself rather than only implied by outcome
+    exclusivity."""
+
+    runner = SubprocessRunner(FakeClock(now=NOW))
+
+    # Sub-scenario 1: spawn failure (the executable itself does not exist).
+    spawn_sink = RecordingAttemptLogSink()
+    missing_executable = tmp_path / "does-not-exist"
+    spawn_spec = _spec((str(missing_executable),), tmp_path)
+
+    spawn_result = runner.run(spawn_spec, sink=spawn_sink)
+
+    assert spawn_result.outcome is not RunOutcome.PROVIDER_ERROR
+    assert spawn_result.outcome is RunOutcome.PROCESS_ERROR
+    assert spawn_result.return_code is None
+    assert spawn_sink.writes == []
+
+    # Sub-scenario 2: the child spawns fine but exits non-zero for a reason
+    # that has nothing to do with the (agent-only) provider concept.
+    exit_sink = RecordingAttemptLogSink()
+    exit_spec = _spec(_helper_argv("--exit-code", "7", "--stderr", "boom"), tmp_path)
+
+    exit_result = runner.run(exit_spec, sink=exit_sink)
+
+    assert exit_result.outcome is not RunOutcome.PROVIDER_ERROR
+    assert exit_result.outcome is RunOutcome.PROCESS_ERROR
+    assert exit_result.return_code == 7
+
+
 def test_run_delivers_stdin_out_of_band_and_never_leaks_it_into_the_command(
     tmp_path: Path,
 ) -> None:
@@ -582,6 +620,42 @@ def test_run_kills_the_whole_process_group_including_descendants(
     assert elapsed < 3.0
     assert result.outcome is RunOutcome.TIMEOUT
     assert result.termination_confirmed is True
+
+
+def test_ac_014_timeout_kills_process_group_and_keeps_output(
+    tmp_path: Path,
+) -> None:
+    """AC-014, combined in one place: a child with a same-group descendant
+    that overruns its deadline is killed -- whole group, descendant
+    included -- within the configured grace policy, is reported as
+    `TIMEOUT` with confirmed termination, and none of the output it managed
+    to write before the hang began is lost."""
+
+    runner = SubprocessRunner(RealClock())
+    sink = RecordingAttemptLogSink()
+    spec = _bounded_spec(
+        _helper_argv("--stderr", "before-the-hang", "--fork-and-sleep", "10"),
+        tmp_path,
+    )
+
+    started = time.monotonic()
+    result = runner.run(spec, sink=sink)
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 3.0
+    assert result.outcome is RunOutcome.TIMEOUT
+    assert result.termination_confirmed is True
+    # The field's declared type is Optional[int] (see
+    # test_run_reports_a_missing_executable_as_process_error_with_null_return_code
+    # for the `None` case, which arises from a spawn failure, not a
+    # TIMEOUT): a confirmed process-group kill always yields a real
+    # negative-signal return code, per build_process_result's own contract.
+    assert result.return_code is not None
+    assert isinstance(result.return_code, int)
+    stderr_chunks = [
+        payload for channel, payload, _ in sink.writes if channel == "stderr"
+    ]
+    assert stderr_chunks == [b"before-the-hang\n"]
 
 
 def test_run_reports_unconfirmed_termination_when_a_descendant_escapes_the_group(

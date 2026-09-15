@@ -343,3 +343,323 @@ def test_a_full_approved_pipeline_renders_exit_zero_and_one_final_status_line(
     assert str(run_json_paths[0]) in captured.err
     assert "changes preserved: yes" in captured.err
     assert "staged=0 unstaged=0 untracked=0" in captured.err
+
+
+# --- AC-001: single positive issue accepted; batch/non-positive rejected ---
+
+
+def test_ac_001_single_positive_issue_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """PRD AC-001: "il comando canonico avvia una issue valida e rifiuta
+    batch o issue non positive." The accept half is proven here through the
+    real `main()` composition -- not merely `parse_args` -- reusing the
+    same single-role architect-failure fixture
+    `test_architect_reported_failure_writes_a_failed_run_via_real_git_and_
+    faked_gh_opencode` drives: reaching real execution (a `run.json` on
+    disk, a non-argparse exit code) is what distinguishes "accepted" from
+    an argparse-level rejection. The reject half needs no git/gh/opencode
+    setup at all -- `argparse` rejects a non-positive or batch `--issue`
+    before `main` ever touches an adapter, exactly as `tests/unit/
+    test_cli.py::test_rejects_non_positive_or_non_scalar_issue_values`/
+    `::test_rejects_a_batch_issue_form` already prove at the parser level;
+    this corroborates the same rejected values through the real end-to-end
+    entry point instead of `parse_args` alone.
+    """
+
+    workspace = tmp_path / "workspace"
+    _clean_repo(workspace)
+    runtime_root = tmp_path / "runtime"
+    config_path = tmp_path / "opencode-tools.toml"
+    _config_file(config_path, runtime_root=runtime_root)
+
+    monkeypatch.setenv("PATH", _shim_path(tmp_path / "bin"))
+    _set_opencode_debug_fixtures(monkeypatch)
+    monkeypatch.setenv(
+        "FAKE_OPENCODE_RUN_OUTPUT_FILE", str(RUN_FIXTURES / "architect-failed.ndjson")
+    )
+    export_file = tmp_path / "export-architect-failed.json"
+    _write_export_fixture(
+        export_file, session_id="ses_architect_failed", agent="architect"
+    )
+    monkeypatch.setenv("FAKE_OPENCODE_EXPORT_FILE", str(export_file))
+
+    base_args = [
+        "run",
+        "--workspace",
+        str(workspace),
+        "--target",
+        ".",
+        "--config",
+        str(config_path),
+    ]
+
+    # Accept: a single positive issue proceeds past argument parsing into
+    # real execution -- proven by a real `run.json` on disk, never merely a
+    # nonzero exit code (which a rejection also produces).
+    exit_code = main([*base_args, "--issue", "42"])
+    assert exit_code == 20
+    assert len(list(runtime_root.rglob("run.json"))) == 1
+
+    # Reject: a non-positive issue is rejected by argparse itself, before
+    # any adapter is ever touched -- the same `SystemExit(2)` `tests/unit/
+    # test_cli.py::test_rejects_non_positive_or_non_scalar_issue_values`
+    # already proves at the parser level for this same value.
+    with pytest.raises(SystemExit) as non_positive_error:
+        main([*base_args, "--issue", "0"])
+    assert non_positive_error.value.code == 2
+
+    # Reject: a batch/repeated-issue form is rejected the same way, the
+    # same shape `tests/unit/test_cli.py::test_rejects_a_batch_issue_form`
+    # already proves at the parser level.
+    with pytest.raises(SystemExit) as batch_error:
+        main([*base_args, "--issue", "42", "54"])
+    assert batch_error.value.code == 2
+
+
+# --- AC-025: final status/exit code/run.json consistency, plus the two
+# explicit pre-init and logging-failure exceptions the PRD names ----------
+
+
+def test_ac_025_final_status_exit_and_run_json_consistency(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """PRD AC-025: "ogni run inizializzato produce esattamente un final
+    status coerente con exit code e, quando la persistenza finale riesce,
+    con run.json; errori pre-inizializzazione e logging failure seguono le
+    eccezioni esplicite del PRD." Four branches, each through the real
+    `main()` composition:
+
+    (1) FAILED/AGENT_REPORTED_FAILURE/exit-20 -- reusing
+        `test_architect_reported_failure_writes_a_failed_run_via_real_git_
+        and_faked_gh_opencode`'s single-fixture wiring;
+    (2) APPROVED/exit-0 -- reusing
+        `test_a_full_approved_pipeline_renders_exit_zero_and_one_final_
+        status_line`'s three-fixture, sequential wiring (run *after* (1)
+        so its `FAKE_OPENCODE_RUN_OUTPUT_FILES`/`EXPORT_FILES` -- which
+        `fake_opencode.py` prefers over the singular `_FILE` variables
+        whenever set -- are never left stale for a later branch that
+        expects the singular form);
+    (3) the pre-initialization exception -- PREFLIGHT_ERROR/exit-10, zero
+        `run.json` anywhere -- reusing
+        `test_a_dirty_target_fails_before_any_run_directory_or_artifact_
+        exists`'s dirty-worktree setup;
+    (4) the PRD's other explicit exception, a genuine *logging* failure --
+        reached for real, never faked, by denying write access to the
+        runtime root (`chmod 0o500`) before `main()` runs, so
+        `runlog.create_run_directory`'s real `os.mkdir` fails with a
+        permission `OSError` that `runlog._ensure_runs_root` wraps into a
+        `LoggingError` (`runlog.directory_create_failed`). That happens
+        inside `bootstrap_run`'s step 3 -- `RunStorePort.initialize` --
+        strictly before any run directory or `run.json` can exist, so
+        `main` renders it exactly like branch (3)'s pre-init shape (no
+        `FINAL_STATUS` line, no artifact promise) but in the distinct
+        LOGGING_ERROR/exit-40 family, which is the concrete case this AC's
+        "logging failure" exception names. (This sandbox runs as a
+        non-root user, confirmed by `os.geteuid() != 0` below, so the
+        permission denial is real and not silently bypassed.) The other,
+        already-provable shapes of a logging failure -- a first-persist
+        failure, and a mid-subprocess sink fault -- stay covered by
+        `tests/component/test_pipeline_failures.py::
+        test_a_first_persist_failure_blocks_everything_before_the_
+        baseline`, `tests/component/test_process_runner.py::
+        test_run_terminates_the_child_and_reports_logging_error_on_a_
+        sink_fault`, and `tests/unit/test_cli.py`'s own exit-code mapping
+        table -- named here rather than re-derived.
+    """
+
+    # --- (1) FAILED / AGENT_REPORTED_FAILURE / exit 20 --------------------
+    failure_workspace = tmp_path / "failure-workspace"
+    _clean_repo(failure_workspace)
+    failure_runtime_root = tmp_path / "failure-runtime"
+    failure_config = tmp_path / "failure-opencode-tools.toml"
+    _config_file(failure_config, runtime_root=failure_runtime_root)
+
+    monkeypatch.setenv("PATH", _shim_path(tmp_path / "failure-bin"))
+    _set_opencode_debug_fixtures(monkeypatch)
+    monkeypatch.setenv(
+        "FAKE_OPENCODE_RUN_OUTPUT_FILE", str(RUN_FIXTURES / "architect-failed.ndjson")
+    )
+    failure_export_file = tmp_path / "export-architect-failed.json"
+    _write_export_fixture(
+        failure_export_file, session_id="ses_architect_failed", agent="architect"
+    )
+    monkeypatch.setenv("FAKE_OPENCODE_EXPORT_FILE", str(failure_export_file))
+
+    failure_exit_code = main(
+        [
+            "run",
+            "--workspace",
+            str(failure_workspace),
+            "--target",
+            ".",
+            "--issue",
+            "42",
+            "--config",
+            str(failure_config),
+        ]
+    )
+
+    failure_run_json_paths = list(failure_runtime_root.rglob("run.json"))
+    assert len(failure_run_json_paths) == 1
+    failure_record = json.loads(failure_run_json_paths[0].read_text(encoding="utf-8"))
+    assert failure_record["final_status"] == "FAILED"
+    assert failure_record["trigger_outcome"] == "AGENT_REPORTED_FAILURE"
+    assert failure_exit_code == 20
+
+    failure_captured = capsys.readouterr()
+    assert failure_captured.out == "FINAL_STATUS: FAILED\n"
+    assert "FINAL_STATUS" not in failure_captured.err
+    assert "terminal outcome: AGENT_REPORTED_FAILURE" in failure_captured.err
+    assert str(failure_run_json_paths[0]) in failure_captured.err
+
+    # --- (2) APPROVED / exit 0 --------------------------------------------
+    approved_workspace = tmp_path / "approved-workspace"
+    _clean_repo(approved_workspace)
+    approved_runtime_root = tmp_path / "approved-runtime"
+    approved_config = tmp_path / "approved-opencode-tools.toml"
+    _config_file(approved_config, runtime_root=approved_runtime_root)
+
+    monkeypatch.setenv("PATH", _shim_path(tmp_path / "approved-bin"))
+    _set_opencode_debug_fixtures(monkeypatch)
+    monkeypatch.setenv(
+        "FAKE_OPENCODE_RUN_OUTPUT_FILES",
+        os.pathsep.join(
+            str(RUN_FIXTURES / name)
+            for name in (
+                "architect-ready-success.ndjson",
+                "coder-completed-success.ndjson",
+                "reviewer-approved-success.ndjson",
+            )
+        ),
+    )
+    monkeypatch.setenv(
+        "FAKE_OPENCODE_RUN_OUTPUT_INDEX_FILE",
+        str(tmp_path / "approved-run-output-index"),
+    )
+    monkeypatch.setenv(
+        "FAKE_OPENCODE_EXPORT_FILES",
+        os.pathsep.join(
+            str(EXPORT_FIXTURES / name)
+            for name in (
+                "architect-correct-agent.json",
+                "coder-correct-agent.json",
+                "reviewer-correct-agent.json",
+            )
+        ),
+    )
+    monkeypatch.setenv(
+        "FAKE_OPENCODE_EXPORT_INDEX_FILE", str(tmp_path / "approved-export-index")
+    )
+
+    approved_exit_code = main(
+        [
+            "run",
+            "--workspace",
+            str(approved_workspace),
+            "--target",
+            ".",
+            "--issue",
+            "42",
+            "--config",
+            str(approved_config),
+        ]
+    )
+
+    approved_run_json_paths = list(approved_runtime_root.rglob("run.json"))
+    assert len(approved_run_json_paths) == 1
+    approved_record = json.loads(approved_run_json_paths[0].read_text(encoding="utf-8"))
+    assert approved_record["final_status"] == "APPROVED"
+    assert approved_record["trigger_outcome"] == "SUCCEEDED"
+    assert approved_exit_code == 0
+
+    approved_captured = capsys.readouterr()
+    assert approved_captured.out == "FINAL_STATUS: APPROVED\n"
+    assert "FINAL_STATUS" not in approved_captured.err
+    assert "terminal outcome: SUCCEEDED" in approved_captured.err
+    assert str(approved_run_json_paths[0]) in approved_captured.err
+
+    # --- (3) pre-init exception: PREFLIGHT_ERROR / exit 10, no run.json --
+    dirty_workspace = tmp_path / "dirty-workspace"
+    _clean_repo(dirty_workspace)
+    (dirty_workspace / "untracked.txt").write_text("dirty\n", encoding="utf-8")
+    dirty_runtime_root = tmp_path / "dirty-runtime"
+    dirty_config = tmp_path / "dirty-opencode-tools.toml"
+    _config_file(dirty_config, runtime_root=dirty_runtime_root)
+
+    monkeypatch.setenv("PATH", _shim_path(tmp_path / "dirty-bin"))
+    _set_opencode_debug_fixtures(monkeypatch)
+
+    dirty_exit_code = main(
+        [
+            "run",
+            "--workspace",
+            str(dirty_workspace),
+            "--target",
+            ".",
+            "--issue",
+            "42",
+            "--config",
+            str(dirty_config),
+        ]
+    )
+
+    assert dirty_exit_code == 10
+    assert list(dirty_runtime_root.rglob("run.json")) == []
+
+    dirty_captured = capsys.readouterr()
+    assert dirty_captured.out == ""
+    assert "FINAL_STATUS" not in dirty_captured.err
+    assert "artifact: none" in dirty_captured.err
+    assert "terminal outcome: PREFLIGHT_ERROR" in dirty_captured.err
+
+    # --- (4) the PRD's other explicit exception: a genuine logging failure
+    assert os.geteuid() != 0, (
+        "permission-based fault injection needs a non-root process; running "
+        "as root would silently bypass the denial this branch relies on"
+    )
+
+    logging_failure_workspace = tmp_path / "logging-failure-workspace"
+    _clean_repo(logging_failure_workspace)
+    logging_failure_runtime_root = tmp_path / "logging-failure-runtime"
+    logging_failure_config = tmp_path / "logging-failure-opencode-tools.toml"
+    _config_file(logging_failure_config, runtime_root=logging_failure_runtime_root)
+
+    monkeypatch.setenv("PATH", _shim_path(tmp_path / "logging-failure-bin"))
+    _set_opencode_debug_fixtures(monkeypatch)
+
+    # `bootstrap_runtime_root` accepts a pre-existing root as long as it is
+    # a real, non-symlink, owned directory whose mode does not exceed
+    # `0700` (`runlog._verify_existing_runtime_root`) -- it never requires
+    # the write bit -- so a root already denied write access still passes
+    # that check; the write denial only bites one step later, inside
+    # `RunStorePort.initialize` -> `runlog.create_run_directory` ->
+    # `_ensure_runs_root`'s own `os.mkdir(runs_root, ...)`.
+    logging_failure_runtime_root.mkdir()
+    logging_failure_runtime_root.chmod(0o500)
+    try:
+        logging_failure_exit_code = main(
+            [
+                "run",
+                "--workspace",
+                str(logging_failure_workspace),
+                "--target",
+                ".",
+                "--issue",
+                "42",
+                "--config",
+                str(logging_failure_config),
+            ]
+        )
+    finally:
+        logging_failure_runtime_root.chmod(0o700)
+
+    assert logging_failure_exit_code == 40
+    assert list(logging_failure_runtime_root.rglob("run.json")) == []
+
+    logging_failure_captured = capsys.readouterr()
+    assert logging_failure_captured.out == ""
+    assert "FINAL_STATUS" not in logging_failure_captured.err
+    assert "artifact: none" in logging_failure_captured.err
+    assert "terminal outcome: LOGGING_ERROR" in logging_failure_captured.err
+    assert "runlog.directory_create_failed" in logging_failure_captured.err

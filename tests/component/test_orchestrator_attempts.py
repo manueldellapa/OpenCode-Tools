@@ -32,6 +32,7 @@ from opencode_tools.domain import (
     AgentResult,
     AgentRole,
     AgentStatus,
+    FinalStatus,
     GitCheckRecord,
     GitSafetyStatus,
     GitState,
@@ -54,6 +55,11 @@ from opencode_tools.orchestrator import (
     LogicalInvocationResult,
 )
 from opencode_tools.ports import AttemptLogSink, LogChannel
+from opencode_tools.state_machine import (
+    evaluate_final_gate,
+    resolve_exit_code,
+    resolve_terminal_outcome,
+)
 
 _PHASE_BY_ROLE: dict[AgentRole, PipelinePhase] = {
     AgentRole.ARCHITECT: PipelinePhase.ARCHITECT,
@@ -834,14 +840,16 @@ def test_cancellation_observed_during_an_attempt_blocks_the_next_invocation(
     assert run_store.sink_calls == [(AgentRole.CODER, 1, 1)]
 
 
-def test_run_provider_attempts_recovers_after_a_transient_provider_error(
+def test_ac_011_provider_recovery_same_phase_cycle(
     tmp_path: Path,
 ) -> None:
-    """M12-04: a trusted, budgeted `PROVIDER_ERROR` on attempt 1 is retried
-    with the exact planned backoff and recovers on attempt 2 -- proving the
-    loop end to end with real `tmp_path` paths, Git continuity across the
-    retry, and the diagnostic's source/signature surviving into the second
-    persisted snapshot's first attempt."""
+    """AC-011/M12-04: a trusted, budgeted `PROVIDER_ERROR` on attempt 1 is
+    retried with the exact planned backoff and recovers on attempt 2 --
+    proving the loop end to end with real `tmp_path` paths, Git continuity
+    across the retry, the diagnostic's source/signature surviving into the
+    second persisted snapshot's first attempt, and -- the AC's own claim --
+    that the retry stays within the same phase and review cycle rather than
+    silently advancing either."""
 
     workspace, target = _workspace_and_target(tmp_path)
     workspace_root = workspace.root
@@ -921,6 +929,10 @@ def test_run_provider_attempts_recovers_after_a_transient_provider_error(
     assert [result.provider_attempt for result in results] == [1, 2]
     assert len(agent_runner.calls) == 2
     assert sleeper.calls == [1.0]  # compute_backoff_delay_seconds(1, default config)
+    # AC-011: the retry stays within the same phase and review cycle -- a
+    # provider retry never advances either (ADR-004).
+    assert results[0].state.phase is results[1].state.phase is PipelinePhase.CODER
+    assert results[0].state.review_cycle == results[1].state.review_cycle == 1
     assert results[0].retry_decision is not None
     assert results[0].retry_decision.should_retry is True
     assert results[1].retry_decision is not None
@@ -1035,3 +1047,229 @@ def test_run_provider_attempts_exhausts_the_budget_with_capped_backoff(
     # rechecked once per attempt -- three attempts, three rechecks, always
     # against the exact same digest.
     assert opencode_preflight.recheck_calls == [CONTROL_PLANE_DIGEST] * 3
+
+
+def test_ac_012_provider_exhaustion(tmp_path: Path) -> None:
+    """AC-012: every configured provider attempt is registered as its own
+    distinct `AttemptRecord` AND the run composes to FAILED/PROVIDER_ERROR --
+    proving both halves of the PRD's exhaustion scenario together, by
+    feeding this module's own exhausted-loop precedence into the exact same
+    `state_machine.resolve_terminal_outcome` / `evaluate_final_gate` /
+    `resolve_exit_code` gate `tests/unit/test_final_gate.py` unit-tests in
+    isolation, rather than proving each half only on its own."""
+
+    workspace, target = _workspace_and_target(tmp_path)
+    workspace_root = workspace.root
+    target_root = target.root
+
+    config = ProviderRetryConfig(
+        max_attempts=3,
+        initial_delay_seconds=2.0,
+        multiplier=4.0,
+        max_delay_seconds=5.0,
+    )
+    diagnostic = _provider_diagnostic(retryable=True)
+    agent_results = [
+        _agent_result(
+            role=AgentRole.CODER,
+            review_cycle=1,
+            provider_attempt=attempt,
+            workspace_root=workspace_root,
+            provider_diagnostic=diagnostic,
+        )
+        for attempt in (1, 2, 3)
+    ]
+    git_results: list[GitCheckRecord] = []
+    for index in range(3):
+        git_results.append(
+            _git_check(
+                target_root=target_root,
+                sequence=len(git_results),
+                purpose=f"coder:1:{index + 1}:before",
+                fingerprint="fp-unchanged",
+            )
+        )
+        git_results.append(
+            _git_check(
+                target_root=target_root,
+                sequence=len(git_results),
+                purpose=f"coder:1:{index + 1}:after",
+                fingerprint="fp-unchanged",
+            )
+        )
+
+    run_store = SequencedRunStorePort()
+    agent_runner = SequencedAgentRunner(agent_results)
+    git_safety = SequencedGitSafetyPort(git_results)
+    sleeper = RecordingSleeper()
+    orchestrator = IssueOrchestrator(
+        initial_record=_initial_record(
+            run_id="run-2026-09-15-ghij", workspace=workspace, target=target
+        ),
+        agent_runner=agent_runner,
+        run_store=run_store,
+        git_safety=git_safety,
+        opencode_preflight=SequencedOpenCodePreflightPort(),
+        control_plane_digest=CONTROL_PLANE_DIGEST,
+        clock=SteppingClock(start=NOW),
+        sleeper=sleeper,
+        provider_retry=config,
+    )
+
+    results = orchestrator.run_provider_attempts(
+        role=AgentRole.CODER,
+        review_cycle=1,
+        prompt="Implement the fix.",
+        workspace=workspace,
+    )
+
+    # M12-scoped half: every configured attempt actually ran and was
+    # registered as its own distinct, accumulating AttemptRecord.
+    assert [result.provider_attempt for result in results] == [1, 2, 3]
+    assert len(agent_runner.calls) == 3  # exactly the configured budget
+    assert sleeper.calls == [2.0, 5.0]
+    assert len(run_store.persist_calls) == 3
+    assert len(run_store.persist_calls[-1].attempts) == 3
+
+    final_attempt = results[-1]
+    assert final_attempt.precedence is not None
+    assert final_attempt.precedence.outcome is RunOutcome.PROVIDER_ERROR
+    assert final_attempt.git_after is not None
+
+    # State-machine half: feed the exhausted loop's own final precedence
+    # into the same gate test_final_gate.py unit-tests in isolation, to
+    # prove the one end-to-end composition AC-012 actually asks for -- "il
+    # run termina FAILED/PROVIDER_ERROR".
+    terminal = resolve_terminal_outcome(
+        trigger_outcome=final_attempt.precedence.outcome,
+        git_safety_status=final_attempt.git_after.safety_status,
+        interrupted=False,
+        persistence_status=orchestrator.record.persistence_status,
+    )
+    final_status = evaluate_final_gate(
+        review_status=None,
+        postflight_git_safety_status=final_attempt.git_after.safety_status,
+        baseline_branch=final_attempt.git_after.state.branch,
+        baseline_head=final_attempt.git_after.state.head,
+        postflight_branch=final_attempt.git_after.state.branch,
+        postflight_head=final_attempt.git_after.state.head,
+        persistence_status=orchestrator.record.persistence_status,
+    )
+    exit_code = resolve_exit_code(
+        final_status=final_status, terminal_outcome=terminal.terminal_outcome
+    )
+
+    assert terminal.terminal_outcome is RunOutcome.PROVIDER_ERROR
+    assert final_status is FinalStatus.FAILED
+    assert exit_code == 20
+
+
+def test_ac_013_coder_mutation_suppresses_retry(tmp_path: Path) -> None:
+    """AC-013: a coder's provider-retryable failure whose Git fingerprint
+    changed (a legitimately preserved partial mutation, `safety_status`
+    still `SAFE` -- `git_safety.py`'s own contract: a fingerprint delta is
+    `SAFE` only for the coder) has its retry suppressed rather than
+    authorized, the mutation is never reset, and a later invocation's own
+    "before" baseline continues from that preserved mutation -- "non
+    resetta file e segnala la modifica preservata"."""
+
+    workspace, target = _workspace_and_target(tmp_path)
+    workspace_root = workspace.root
+    target_root = target.root
+
+    diagnostic = _provider_diagnostic(retryable=True)
+    first_attempt = _agent_result(
+        role=AgentRole.CODER,
+        review_cycle=1,
+        provider_attempt=1,
+        workspace_root=workspace_root,
+        provider_diagnostic=diagnostic,
+    )
+    # A second, successful attempt run manually afterward, purely to
+    # demonstrate that the preserved mutation becomes the next trusted
+    # continuity baseline rather than being discarded.
+    second_attempt = _agent_result(
+        role=AgentRole.CODER,
+        review_cycle=1,
+        provider_attempt=2,
+        workspace_root=workspace_root,
+    )
+    git_results = [
+        _git_check(
+            target_root=target_root,
+            sequence=0,
+            purpose="coder:1:1:before",
+            fingerprint="fp-0",
+        ),
+        # The coder actually wrote something before the provider failed:
+        # the fingerprint changed, but the delta is SAFE (only ever legal
+        # for the coder), so this is a preserved mutation, not Git drift.
+        _git_check(
+            target_root=target_root,
+            sequence=1,
+            purpose="coder:1:1:after",
+            fingerprint="fp-1",
+            safety_status=GitSafetyStatus.SAFE,
+        ),
+        _git_check(
+            target_root=target_root,
+            sequence=2,
+            purpose="coder:1:2:before",
+            fingerprint="fp-1",
+        ),
+        _git_check(
+            target_root=target_root,
+            sequence=3,
+            purpose="coder:1:2:after",
+            fingerprint="fp-2",
+        ),
+    ]
+
+    run_store = SequencedRunStorePort()
+    agent_runner = SequencedAgentRunner([first_attempt, second_attempt])
+    git_safety = SequencedGitSafetyPort(git_results)
+    orchestrator = IssueOrchestrator(
+        initial_record=_initial_record(
+            run_id="run-2026-09-15-klmn", workspace=workspace, target=target
+        ),
+        agent_runner=agent_runner,
+        run_store=run_store,
+        git_safety=git_safety,
+        opencode_preflight=SequencedOpenCodePreflightPort(),
+        control_plane_digest=CONTROL_PLANE_DIGEST,
+        clock=SteppingClock(start=NOW),
+        sleeper=RecordingSleeper(),
+        provider_retry=_provider_retry_config(),
+    )
+
+    result = orchestrator.run_logical_invocation(
+        role=AgentRole.CODER,
+        review_cycle=1,
+        provider_attempt=1,
+        prompt="Implement the fix.",
+        workspace=workspace,
+    )
+
+    assert result.precedence is not None
+    assert result.precedence.outcome is RunOutcome.PROVIDER_ERROR
+    assert result.retry_decision is not None
+    assert result.retry_decision.retry_suppressed_due_to_target_change is True
+    assert result.retry_decision.should_retry is False
+    assert result.git_after is not None
+    assert result.git_after.safety_status is GitSafetyStatus.SAFE
+    # the mutation is preserved, not reset back to the pre-attempt fingerprint
+    assert result.git_after.state.fingerprint == "fp-1"
+
+    # A further invocation's own "before" baseline continues from this
+    # attempt's preserved mutation, mirroring the continuity-chain assertion
+    # in test_logical_invocations_across_a_rework_cycle_keep_checkpoint_continuity.
+    next_result = orchestrator.run_logical_invocation(
+        role=AgentRole.CODER,
+        review_cycle=1,
+        provider_attempt=2,
+        prompt="Implement the fix, retried.",
+        workspace=workspace,
+    )
+    before_calls = [call for call in git_safety.calls if call[2].endswith(":before")]
+    assert before_calls[1][4] is git_results[1].state
+    assert next_result.git_before.state.fingerprint == "fp-1"
