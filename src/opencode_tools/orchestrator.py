@@ -92,37 +92,50 @@ by this function -- it is held "from before the baseline until after
 finalization" (System Design SS16.2), and finalization is M13-04's concern,
 not this one's.
 
-`run_issue_pipeline` composes the nominal `architect -> coder(1) ->
-reviewer(1)` happy path (System Design SS8.1, SS9; M13-02): it invokes each
-role, in turn, as its own primary-agent session through `IssueOrchestrator.
+`run_issue_pipeline` composes the full nominal-through-rework path --
+`architect -> coder(1) -> reviewer(1) -> [coder(n+1) -> reviewer(n+1)]*`
+(System Design SS8.1, SS9, SS12.3; M13-02, M13-03): it invokes each role, in
+turn, as its own primary-agent session through `IssueOrchestrator.
 run_provider_attempts` (never a fourth agent, never a raw `AgentRunner.run`
-call bypassing checkpoint/persistence), and reconstructs the resulting
-`state_machine.TransitionEvent` independently of `AgentResult.outcome`,
-exactly as `_classify_agent_result` already does for a single attempt --
-never trusting an upstream `AgentRunner` adapter's own claimed
-`AgentStatus`/`ReviewStatus` without also requiring the attempt's own Git
-"after" checkpoint stayed `SAFE` (System Design SS7.1: protocol precedence
-and Git safety are orthogonal, and a mutation by the read-only architect or
-reviewer must block the next phase exactly as a protocol failure would,
-never silently excused because the marker itself parsed). Architect's
-opaque handoff body and discovered `IssueRef`, and the coder's opaque report
-alongside its own final Git change inventory (`GitState.staged/unstaged/
-untracked`, never a diff), are transported into the next role's prompt via
-`prompting.py` without Python ever reading, summarizing, or judging them
-(ADR-002, ADR-010). The coder is never invoked without a `READY` architect
-response carrying a locator-consistent `IssueRef`; the reviewer is never
-invoked without a `COMPLETED` coder response. A reviewer `CHANGES_REQUIRED`
-or `APPROVED` is resolved into `state_machine.transition`'s own verdict --
-`INVOKE_CODER` (rework) or `ENTER_POSTFLIGHT` respectively -- and returned to
-the caller without ever being acted on any further here: the rework loop
-(M13-03) and postflight/finalization/final-status decision (M13-04) are
-deliberately out of scope, so `APPROVED` is reported as the *action* the
-caller must take next, never as an early approval and never rendered as
-CLI/`FINAL_STATUS` output.
+call bypassing checkpoint/persistence, and never any new provider-retry
+logic of its own -- every attempt within one logical invocation is still
+M12's `run_provider_attempts` loop, unchanged), and reconstructs the
+resulting `state_machine.TransitionEvent` independently of
+`AgentResult.outcome`, exactly as `_classify_agent_result` already does for
+a single attempt -- never trusting an upstream `AgentRunner` adapter's own
+claimed `AgentStatus`/`ReviewStatus` without also requiring the attempt's
+own Git "after" checkpoint stayed `SAFE` (System Design SS7.1: protocol
+precedence and Git safety are orthogonal, and a mutation by the read-only
+architect or reviewer must block the next phase exactly as a protocol
+failure would, never silently excused because the marker itself parsed).
+Architect's opaque handoff body and discovered `IssueRef`, the coder's
+opaque report alongside its own final Git change inventory
+(`GitState.staged/unstaged/untracked`, never a diff), and -- from review
+cycle 2 onward -- the reviewer's own opaque `CHANGES_REQUIRED` body, are
+transported into the next role's prompt via `prompting.py` without Python
+ever reading, summarizing, or judging them (ADR-002, ADR-010).
 
-Full rework-loop composition beyond one review cycle, postflight/
-finalization, and the `cli.py` composition root (System Design SS5.3, SS8.2)
-remain out of scope here.
+The coder is never invoked without a `READY` architect response carrying a
+locator-consistent `IssueRef`; the reviewer is never invoked without a
+`COMPLETED` coder response. A reviewer `CHANGES_REQUIRED` at a review cycle
+still below `max_review_cycles` opens the next coder(n+1)/reviewer(n+1)
+cycle -- `review_cycle` and `provider_attempt` remain the separate counters
+System Design SS12.1/SS12.3 requires, so a provider retry inside any single
+role invocation never advances `review_cycle` and a rework cycle never
+resets `provider_attempt` back below what `run_provider_attempts` already
+spent -- while `CHANGES_REQUIRED` at the last allowed cycle instead resolves
+to `state_machine.transition`'s own `REVIEW_CYCLES_EXHAUSTED` outcome
+without ever invoking one more coder. A reviewer `APPROVED`, or any
+terminal failure at any step (architect, any coder cycle, any reviewer
+cycle, or cycle exhaustion), is resolved into `state_machine.transition`'s
+own verdict and returned to the caller without ever being acted on any
+further here: postflight, finalization, and any `FinalStatus`/exit-code
+decision (M13-04) remain deliberately out of scope, so `APPROVED` is
+reported as the *action* the caller must take next, never as an early
+approval and never rendered as CLI/`FINAL_STATUS` output.
+
+Postflight, finalization, and the `cli.py` composition root (System Design
+SS5.3, SS8.2) remain out of scope here.
 """
 
 from __future__ import annotations
@@ -1148,7 +1161,7 @@ def _reviewer_event(result: LogicalInvocationResult) -> TransitionEvent:
     )
 
 
-def _require_invocation_tuple(
+def _require_invocation_cycle(
     value: object, field_name: str
 ) -> tuple[LogicalInvocationResult, ...]:
     if not isinstance(value, tuple):
@@ -1159,52 +1172,81 @@ def _require_invocation_tuple(
     return value
 
 
+def _require_invocation_cycles(
+    value: object, field_name: str
+) -> tuple[tuple[LogicalInvocationResult, ...], ...]:
+    if not isinstance(value, tuple):
+        raise TypeError(f"{field_name} must be a tuple")
+    cycles: list[tuple[LogicalInvocationResult, ...]] = []
+    for item in value:
+        cycle = _require_invocation_cycle(item, f"{field_name}[]")
+        if not cycle:
+            raise ValueError(f"{field_name}[] must not be empty")
+        cycles.append(cycle)
+    return tuple(cycles)
+
+
 @dataclass(frozen=True, slots=True)
 class IssuePipelineResult:
-    """The typed result of composing the nominal `architect -> coder(1) ->
-    reviewer(1)` happy path (System Design SS8.1, SS9; M13-02).
+    """The typed result of composing the full nominal-through-rework path
+    (System Design SS8.1, SS9, SS12.3; M13-02, M13-03).
 
-    `architect`/`coder`/`reviewer` are every provider attempt
-    `IssueOrchestrator.run_provider_attempts` actually ran for that logical
-    invocation, in order; `coder`/`reviewer` are the empty tuple exactly when
-    that role was never invoked because the previous one did not establish
-    this pipeline's own precondition for it (a `READY` architect response
-    carrying a locator-consistent `IssueRef`, a Git-safe `SAFE` checkpoint
-    throughout, before the coder; a `COMPLETED`, Git-safe coder response
-    before the reviewer) -- reconstructed independently of whatever concrete
-    `AgentRunner` adapter produced the attempt, never assumed from
-    `AgentResult.outcome` alone (`_attempt_result`).
+    `architect` is every provider attempt `IssueOrchestrator.
+    run_provider_attempts` actually ran for the architect's own logical
+    invocation, in order; the empty tuple never occurs here (an architect
+    invocation always runs). `coder_cycles`/`reviewer_cycles` are, in review
+    cycle order, the same per-invocation attempt tuple for each coder/
+    reviewer logical invocation this pipeline actually ran -- so
+    `coder_cycles[i]`/`reviewer_cycles[i]` is review cycle `i + 1`.
+    `coder_cycles` is empty exactly when the architect never established
+    this pipeline's own precondition for the coder (a `READY` response
+    carrying a locator-consistent `IssueRef`, with a Git-safe `SAFE`
+    checkpoint throughout) -- reconstructed independently of whatever
+    concrete `AgentRunner` adapter produced the attempt, never assumed from
+    `AgentResult.outcome` alone (`_attempt_result`). `reviewer_cycles` has
+    either exactly as many entries as `coder_cycles`, or exactly one fewer:
+    the latter iff the *last* coder cycle never established the
+    precondition for its own reviewer (a `COMPLETED`, Git-safe response) --
+    every earlier coder cycle, by construction, was already followed by its
+    own reviewer cycle, since only a reviewer `CHANGES_REQUIRED` below
+    `max_review_cycles` ever opens a further coder cycle at all.
 
     `state`/`action`/`outcome` are exactly `state_machine.transition`'s own
-    verdict for the last role actually invoked: `action` is
-    `PipelineAction.ENTER_POSTFLIGHT` on any failure (architect/coder/
-    reviewer) or on a reviewer `APPROVED`, or `PipelineAction.INVOKE_CODER`
-    with `state.review_cycle == 2` on a reviewer `CHANGES_REQUIRED` --
-    deliberately never acted upon here, since the rework loop is M13-03's
-    own composition, not this one's. Postflight, finalization, and any
-    `FinalStatus`/exit-code decision remain entirely out of scope: this
-    pipeline never marks a reviewer `APPROVED` as an early approval and never
-    emits CLI/`FINAL_STATUS` output.
+    verdict for the last role actually invoked. Since this pipeline now acts
+    on the rework loop itself (M13-03) rather than only reporting it,
+    `action` is always `PipelineAction.ENTER_POSTFLIGHT` here: on any
+    failure (architect, any coder cycle, or any reviewer cycle), on a
+    reviewer `APPROVED`, or on `state_machine.TransitionEventKind.
+    REVIEWER_CHANGES_REQUIRED` at the last allowed review cycle (`outcome`
+    is then `RunOutcome.REVIEW_CYCLES_EXHAUSTED`, and no further coder is
+    ever invoked). Postflight, finalization, and any `FinalStatus`/exit-code
+    decision remain entirely out of scope: this pipeline never marks a
+    reviewer `APPROVED` as an early approval and never emits
+    CLI/`FINAL_STATUS` output.
     """
 
     architect: tuple[LogicalInvocationResult, ...]
-    coder: tuple[LogicalInvocationResult, ...]
-    reviewer: tuple[LogicalInvocationResult, ...]
+    coder_cycles: tuple[tuple[LogicalInvocationResult, ...], ...]
+    reviewer_cycles: tuple[tuple[LogicalInvocationResult, ...], ...]
     state: PipelineState
     action: PipelineAction
     outcome: RunOutcome | None
 
     def __post_init__(self) -> None:
-        architect = _require_invocation_tuple(self.architect, "architect")
+        architect = _require_invocation_cycle(self.architect, "architect")
         if not architect:
             raise ValueError("architect must not be empty")
         object.__setattr__(self, "architect", architect)
-        coder = _require_invocation_tuple(self.coder, "coder")
-        object.__setattr__(self, "coder", coder)
-        reviewer = _require_invocation_tuple(self.reviewer, "reviewer")
-        object.__setattr__(self, "reviewer", reviewer)
-        if not coder and reviewer:
-            raise ValueError("reviewer must not be set when coder was never invoked")
+        coder_cycles = _require_invocation_cycles(self.coder_cycles, "coder_cycles")
+        object.__setattr__(self, "coder_cycles", coder_cycles)
+        reviewer_cycles = _require_invocation_cycles(
+            self.reviewer_cycles, "reviewer_cycles"
+        )
+        object.__setattr__(self, "reviewer_cycles", reviewer_cycles)
+        if len(reviewer_cycles) > len(coder_cycles):
+            raise ValueError("reviewer_cycles must not exceed coder_cycles")
+        if len(coder_cycles) - len(reviewer_cycles) > 1:
+            raise ValueError("only the last coder cycle may lack a reviewer cycle")
         if type(self.state) is not PipelineState:
             raise TypeError("state must be PipelineState")
         _require_exact_enum(self.action, PipelineAction, "action")
@@ -1220,27 +1262,35 @@ def run_issue_pipeline(
     target: TargetRepository,
     max_review_cycles: int,
 ) -> IssuePipelineResult:
-    """Compose the nominal `architect -> coder(1) -> reviewer(1)` path (M13-02).
+    """Compose the full nominal-through-rework path (M13-02, M13-03).
 
     Invokes architect, then -- only if it reports `READY` with a locator-
     consistent `IssueRef` and stayed Git-safe -- coder at review cycle 1,
     then -- only if it reports `COMPLETED` and stayed Git-safe -- reviewer at
     review cycle 1, each as its own primary-agent session via
     `IssueOrchestrator.run_provider_attempts` (never a raw `AgentRunner.run`
-    call, never a fourth agent). Every opaque payload -- the architect's
-    handoff body and discovered `IssueRef`, the coder's report, its final Git
-    change inventory (`staged`/`unstaged`/`untracked` paths, never a diff) --
-    is carried into the next role's prompt via `prompting.py` verbatim;
+    call, never a fourth agent, and never any new provider-retry logic --
+    every attempt within one logical invocation is still M12's unchanged
+    `run_provider_attempts` loop, so a provider retry never advances
+    `review_cycle` and a rework cycle never re-runs an already-spent
+    `provider_attempt`). Every opaque payload -- the architect's handoff body
+    and discovered `IssueRef`, the coder's report, its final Git change
+    inventory (`staged`/`unstaged`/`untracked` paths, never a diff), and --
+    from review cycle 2 onward -- the reviewer's own `CHANGES_REQUIRED` body
+    -- is carried into the next role's prompt via `prompting.py` verbatim;
     Python never reads, summarizes, or judges any of it (ADR-002, ADR-010).
     `test_scope` is always empty: nothing in this milestone runs or
     summarizes tests.
 
-    Stops and returns as soon as a role's attempt does not clear the next
-    role's precondition, or after the reviewer's own attempt, in every case
-    reporting `state_machine.transition`'s own verdict rather than acting on
-    it any further -- a reviewer `CHANGES_REQUIRED` or `APPROVED` alike is
-    only ever *reported*, never turned into a second coder invocation or a
-    final status here (M13-03/M13-04).
+    A reviewer `CHANGES_REQUIRED` below `max_review_cycles` opens the next
+    coder(n+1)/reviewer(n+1) cycle in the same loop, using the reviewer's own
+    body as `previous_review_feedback`; at the last allowed cycle it instead
+    resolves to `state_machine.transition`'s own `REVIEW_CYCLES_EXHAUSTED`
+    outcome without ever invoking one more coder. Stops and returns as soon
+    as a role's attempt does not clear the next role's precondition, on a
+    reviewer `APPROVED`, or on cycle exhaustion -- in every case reporting
+    `state_machine.transition`'s own verdict rather than deciding a final
+    status here (M13-04).
     """
 
     if not isinstance(orchestrator, IssueOrchestrator):
@@ -1273,8 +1323,8 @@ def run_issue_pipeline(
     if architect_transition.action is not PipelineAction.INVOKE_CODER:
         return IssuePipelineResult(
             architect=architect_results,
-            coder=(),
-            reviewer=(),
+            coder_cycles=(),
+            reviewer_cycles=(),
             state=architect_transition.state,
             action=architect_transition.action,
             outcome=architect_transition.outcome,
@@ -1286,76 +1336,100 @@ def run_issue_pipeline(
     issue_ref = architect_response.issue_ref
     architect_handoff = architect_response.body
 
-    coder_prompt = build_coder_prompt(
-        issue_ref=issue_ref,
-        architect_handoff=architect_handoff,
-        target_root=target.root,
-        review_cycle=1,
-        max_review_cycles=max_review_cycles,
-        previous_review_feedback=None,
-    )
-    coder_results = orchestrator.run_provider_attempts(
-        role=AgentRole.CODER,
-        review_cycle=1,
-        prompt=coder_prompt,
-        workspace=workspace,
-    )
-    coder_final = coder_results[-1]
-    coder_transition = transition(
-        PipelineState(phase=PipelinePhase.CODER, review_cycle=1),
-        _coder_event(coder_final),
-        max_review_cycles=max_review_cycles,
-    )
-    if coder_transition.action is not PipelineAction.INVOKE_REVIEWER:
-        return IssuePipelineResult(
-            architect=architect_results,
-            coder=coder_results,
-            reviewer=(),
-            state=coder_transition.state,
-            action=coder_transition.action,
-            outcome=coder_transition.outcome,
+    coder_cycles: list[tuple[LogicalInvocationResult, ...]] = []
+    reviewer_cycles: list[tuple[LogicalInvocationResult, ...]] = []
+    review_cycle = 1
+    previous_review_feedback: str | None = None
+
+    while True:
+        coder_prompt = build_coder_prompt(
+            issue_ref=issue_ref,
+            architect_handoff=architect_handoff,
+            target_root=target.root,
+            review_cycle=review_cycle,
+            max_review_cycles=max_review_cycles,
+            previous_review_feedback=previous_review_feedback,
         )
+        coder_results = orchestrator.run_provider_attempts(
+            role=AgentRole.CODER,
+            review_cycle=review_cycle,
+            prompt=coder_prompt,
+            workspace=workspace,
+        )
+        coder_cycles.append(coder_results)
+        coder_final = coder_results[-1]
+        coder_transition = transition(
+            PipelineState(phase=PipelinePhase.CODER, review_cycle=review_cycle),
+            _coder_event(coder_final),
+            max_review_cycles=max_review_cycles,
+        )
+        if coder_transition.action is not PipelineAction.INVOKE_REVIEWER:
+            return IssuePipelineResult(
+                architect=architect_results,
+                coder_cycles=tuple(coder_cycles),
+                reviewer_cycles=tuple(reviewer_cycles),
+                state=coder_transition.state,
+                action=coder_transition.action,
+                outcome=coder_transition.outcome,
+            )
 
-    coder_response, _ = _attempt_result(coder_final)
-    if coder_response is None:
-        raise AssertionError("INVOKE_REVIEWER implies a COMPLETED coder response")
-    coder_report = coder_response.body
-    if coder_final.git_after is None:
-        raise AssertionError("a non-blocked attempt always has a git_after checkpoint")
-    inventory = coder_final.git_after.state
+        coder_response, _ = _attempt_result(coder_final)
+        if coder_response is None:
+            raise AssertionError("INVOKE_REVIEWER implies a COMPLETED coder response")
+        coder_report = coder_response.body
+        if coder_final.git_after is None:
+            raise AssertionError(
+                "a non-blocked attempt always has a git_after checkpoint"
+            )
+        inventory = coder_final.git_after.state
 
-    reviewer_prompt = build_reviewer_prompt(
-        issue_ref=issue_ref,
-        architect_handoff=architect_handoff,
-        coder_report=coder_report,
-        staged=inventory.staged,
-        unstaged=inventory.unstaged,
-        untracked=inventory.untracked,
-        test_scope="",
-        target_root=target.root,
-        review_cycle=1,
-        max_review_cycles=max_review_cycles,
-    )
-    reviewer_results = orchestrator.run_provider_attempts(
-        role=AgentRole.REVIEWER,
-        review_cycle=1,
-        prompt=reviewer_prompt,
-        workspace=workspace,
-    )
-    reviewer_final = reviewer_results[-1]
-    reviewer_transition = transition(
-        PipelineState(phase=PipelinePhase.REVIEWER, review_cycle=1),
-        _reviewer_event(reviewer_final),
-        max_review_cycles=max_review_cycles,
-    )
-    return IssuePipelineResult(
-        architect=architect_results,
-        coder=coder_results,
-        reviewer=reviewer_results,
-        state=reviewer_transition.state,
-        action=reviewer_transition.action,
-        outcome=reviewer_transition.outcome,
-    )
+        reviewer_prompt = build_reviewer_prompt(
+            issue_ref=issue_ref,
+            architect_handoff=architect_handoff,
+            coder_report=coder_report,
+            staged=inventory.staged,
+            unstaged=inventory.unstaged,
+            untracked=inventory.untracked,
+            test_scope="",
+            target_root=target.root,
+            review_cycle=review_cycle,
+            max_review_cycles=max_review_cycles,
+        )
+        reviewer_results = orchestrator.run_provider_attempts(
+            role=AgentRole.REVIEWER,
+            review_cycle=review_cycle,
+            prompt=reviewer_prompt,
+            workspace=workspace,
+        )
+        reviewer_cycles.append(reviewer_results)
+        reviewer_final = reviewer_results[-1]
+        reviewer_transition = transition(
+            PipelineState(phase=PipelinePhase.REVIEWER, review_cycle=review_cycle),
+            _reviewer_event(reviewer_final),
+            max_review_cycles=max_review_cycles,
+        )
+        if reviewer_transition.action is not PipelineAction.INVOKE_CODER:
+            return IssuePipelineResult(
+                architect=architect_results,
+                coder_cycles=tuple(coder_cycles),
+                reviewer_cycles=tuple(reviewer_cycles),
+                state=reviewer_transition.state,
+                action=reviewer_transition.action,
+                outcome=reviewer_transition.outcome,
+            )
+
+        # REVIEWER_CHANGES_REQUIRED below max_review_cycles: rework, using
+        # the reviewer's own body as the next coder's feedback (M13-03).
+        reviewer_response, _ = _attempt_result(reviewer_final)
+        if reviewer_response is None:
+            raise AssertionError(
+                "INVOKE_CODER implies a CHANGES_REQUIRED reviewer response"
+            )
+        previous_review_feedback = reviewer_response.body
+        next_review_cycle = reviewer_transition.state.review_cycle
+        if next_review_cycle is None:
+            raise AssertionError("INVOKE_CODER always carries a review_cycle")
+        review_cycle = next_review_cycle
 
 
 __all__ = (
