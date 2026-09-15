@@ -92,10 +92,37 @@ by this function -- it is held "from before the baseline until after
 finalization" (System Design SS16.2), and finalization is M13-04's concern,
 not this one's.
 
-Full pipeline composition (driving the state machine through the architect/
-coder/reviewer roles), the review rework loop, postflight/finalization, and
-the `cli.py` composition root (System Design SS5.3, SS8.2) remain out of
-scope here.
+`run_issue_pipeline` composes the nominal `architect -> coder(1) ->
+reviewer(1)` happy path (System Design SS8.1, SS9; M13-02): it invokes each
+role, in turn, as its own primary-agent session through `IssueOrchestrator.
+run_provider_attempts` (never a fourth agent, never a raw `AgentRunner.run`
+call bypassing checkpoint/persistence), and reconstructs the resulting
+`state_machine.TransitionEvent` independently of `AgentResult.outcome`,
+exactly as `_classify_agent_result` already does for a single attempt --
+never trusting an upstream `AgentRunner` adapter's own claimed
+`AgentStatus`/`ReviewStatus` without also requiring the attempt's own Git
+"after" checkpoint stayed `SAFE` (System Design SS7.1: protocol precedence
+and Git safety are orthogonal, and a mutation by the read-only architect or
+reviewer must block the next phase exactly as a protocol failure would,
+never silently excused because the marker itself parsed). Architect's
+opaque handoff body and discovered `IssueRef`, and the coder's opaque report
+alongside its own final Git change inventory (`GitState.staged/unstaged/
+untracked`, never a diff), are transported into the next role's prompt via
+`prompting.py` without Python ever reading, summarizing, or judging them
+(ADR-002, ADR-010). The coder is never invoked without a `READY` architect
+response carrying a locator-consistent `IssueRef`; the reviewer is never
+invoked without a `COMPLETED` coder response. A reviewer `CHANGES_REQUIRED`
+or `APPROVED` is resolved into `state_machine.transition`'s own verdict --
+`INVOKE_CODER` (rework) or `ENTER_POSTFLIGHT` respectively -- and returned to
+the caller without ever being acted on any further here: the rework loop
+(M13-03) and postflight/finalization/final-status decision (M13-04) are
+deliberately out of scope, so `APPROVED` is reported as the *action* the
+caller must take next, never as an early approval and never rendered as
+CLI/`FINAL_STATUS` output.
+
+Full rework-loop composition beyond one review cycle, postflight/
+finalization, and the `cli.py` composition root (System Design SS5.3, SS8.2)
+remain out of scope here.
 """
 
 from __future__ import annotations
@@ -116,13 +143,16 @@ from opencode_tools.domain import (
     GitSafetyStatus,
     GitState,
     IssueLocator,
+    ParsedAgentResponse,
     PersistenceStatus,
     PipelinePhase,
     ProviderRetryConfig,
     RetryDecision,
+    ReviewStatus,
     RunOutcome,
     RunRecord,
     RunRequest,
+    TargetRepository,
     Workspace,
 )
 from opencode_tools.errors import (
@@ -144,9 +174,15 @@ from opencode_tools.ports import (
     TargetLease,
     TargetLeaseFactory,
 )
+from opencode_tools.prompting import (
+    build_architect_prompt,
+    build_coder_prompt,
+    build_reviewer_prompt,
+)
 from opencode_tools.retry import decide_retry
 from opencode_tools.state_machine import (
     AttemptPrecedence,
+    PipelineAction,
     PipelineState,
     TransitionEvent,
     TransitionEventKind,
@@ -1033,11 +1069,302 @@ def bootstrap_run(
     )
 
 
+def _attempt_result(
+    result: LogicalInvocationResult,
+) -> tuple[ParsedAgentResponse | None, RunOutcome | None]:
+    """Combine one attempt's protocol precedence and Git safety (M13-02).
+
+    Returns `(response, None)` iff the attempt technically succeeded
+    (`precedence.outcome is SUCCEEDED`) *and* its own "after" checkpoint
+    stayed `SAFE`; returns `(None, outcome)` naming the `RunOutcome` this
+    pipeline should report otherwise. Protocol precedence and Git safety are
+    orthogonal dimensions (System Design SS7.1) that `run_logical_invocation`
+    deliberately never reconciles into one value -- this is the one place
+    that combines them for the purpose of gating the *next* role invocation,
+    so a mutation by architect or reviewer (or any branch/HEAD drift, for
+    any role) blocks the next phase exactly as a protocol failure would,
+    never silently excused because the marker itself parsed. Git safety
+    wins when both are simultaneously bad, matching `resolve_terminal_outcome`
+    's own `GIT_SAFETY_ERROR`-over-`trigger_outcome` precedence (SS13.3).
+    """
+
+    if result.agent_result is None:
+        if result.control_plane_error is not None:
+            return None, result.control_plane_error.outcome
+        return None, RunOutcome.GIT_SAFETY_ERROR
+
+    git_after = result.git_after
+    if git_after is None:
+        raise AssertionError("a non-blocked attempt always has a git_after checkpoint")
+    if git_after.safety_status is not GitSafetyStatus.SAFE:
+        return None, RunOutcome.GIT_SAFETY_ERROR
+
+    precedence = result.precedence
+    if precedence is None:
+        raise AssertionError("a non-blocked attempt always has a precedence")
+    if precedence.outcome is not RunOutcome.SUCCEEDED:
+        return None, precedence.outcome
+
+    response = result.agent_result.terminal_response
+    if response is None:
+        raise AssertionError("a SUCCEEDED precedence always has a terminal_response")
+    return response, None
+
+
+def _architect_event(result: LogicalInvocationResult) -> TransitionEvent:
+    response, failure = _attempt_result(result)
+    if (
+        response is not None
+        and response.agent_status is AgentStatus.READY
+        and response.issue_ref is not None
+    ):
+        return TransitionEvent(kind=TransitionEventKind.ARCHITECT_READY)
+    return TransitionEvent(
+        kind=TransitionEventKind.TERMINAL_OUTCOME,
+        outcome=failure if failure is not None else RunOutcome.PROTOCOL_ERROR,
+    )
+
+
+def _coder_event(result: LogicalInvocationResult) -> TransitionEvent:
+    response, failure = _attempt_result(result)
+    if response is not None and response.agent_status is AgentStatus.COMPLETED:
+        return TransitionEvent(kind=TransitionEventKind.CODER_COMPLETED)
+    return TransitionEvent(
+        kind=TransitionEventKind.TERMINAL_OUTCOME,
+        outcome=failure if failure is not None else RunOutcome.PROTOCOL_ERROR,
+    )
+
+
+def _reviewer_event(result: LogicalInvocationResult) -> TransitionEvent:
+    response, failure = _attempt_result(result)
+    if response is not None:
+        if response.review_status is ReviewStatus.APPROVED:
+            return TransitionEvent(kind=TransitionEventKind.REVIEWER_APPROVED)
+        if response.review_status is ReviewStatus.CHANGES_REQUIRED:
+            return TransitionEvent(kind=TransitionEventKind.REVIEWER_CHANGES_REQUIRED)
+    return TransitionEvent(
+        kind=TransitionEventKind.TERMINAL_OUTCOME,
+        outcome=failure if failure is not None else RunOutcome.PROTOCOL_ERROR,
+    )
+
+
+def _require_invocation_tuple(
+    value: object, field_name: str
+) -> tuple[LogicalInvocationResult, ...]:
+    if not isinstance(value, tuple):
+        raise TypeError(f"{field_name} must be a tuple")
+    for item in value:
+        if type(item) is not LogicalInvocationResult:
+            raise TypeError(f"{field_name} must contain only LogicalInvocationResult")
+    return value
+
+
+@dataclass(frozen=True, slots=True)
+class IssuePipelineResult:
+    """The typed result of composing the nominal `architect -> coder(1) ->
+    reviewer(1)` happy path (System Design SS8.1, SS9; M13-02).
+
+    `architect`/`coder`/`reviewer` are every provider attempt
+    `IssueOrchestrator.run_provider_attempts` actually ran for that logical
+    invocation, in order; `coder`/`reviewer` are the empty tuple exactly when
+    that role was never invoked because the previous one did not establish
+    this pipeline's own precondition for it (a `READY` architect response
+    carrying a locator-consistent `IssueRef`, a Git-safe `SAFE` checkpoint
+    throughout, before the coder; a `COMPLETED`, Git-safe coder response
+    before the reviewer) -- reconstructed independently of whatever concrete
+    `AgentRunner` adapter produced the attempt, never assumed from
+    `AgentResult.outcome` alone (`_attempt_result`).
+
+    `state`/`action`/`outcome` are exactly `state_machine.transition`'s own
+    verdict for the last role actually invoked: `action` is
+    `PipelineAction.ENTER_POSTFLIGHT` on any failure (architect/coder/
+    reviewer) or on a reviewer `APPROVED`, or `PipelineAction.INVOKE_CODER`
+    with `state.review_cycle == 2` on a reviewer `CHANGES_REQUIRED` --
+    deliberately never acted upon here, since the rework loop is M13-03's
+    own composition, not this one's. Postflight, finalization, and any
+    `FinalStatus`/exit-code decision remain entirely out of scope: this
+    pipeline never marks a reviewer `APPROVED` as an early approval and never
+    emits CLI/`FINAL_STATUS` output.
+    """
+
+    architect: tuple[LogicalInvocationResult, ...]
+    coder: tuple[LogicalInvocationResult, ...]
+    reviewer: tuple[LogicalInvocationResult, ...]
+    state: PipelineState
+    action: PipelineAction
+    outcome: RunOutcome | None
+
+    def __post_init__(self) -> None:
+        architect = _require_invocation_tuple(self.architect, "architect")
+        if not architect:
+            raise ValueError("architect must not be empty")
+        object.__setattr__(self, "architect", architect)
+        coder = _require_invocation_tuple(self.coder, "coder")
+        object.__setattr__(self, "coder", coder)
+        reviewer = _require_invocation_tuple(self.reviewer, "reviewer")
+        object.__setattr__(self, "reviewer", reviewer)
+        if not coder and reviewer:
+            raise ValueError("reviewer must not be set when coder was never invoked")
+        if type(self.state) is not PipelineState:
+            raise TypeError("state must be PipelineState")
+        _require_exact_enum(self.action, PipelineAction, "action")
+        if self.outcome is not None and type(self.outcome) is not RunOutcome:
+            raise TypeError("outcome must be RunOutcome or None")
+
+
+def run_issue_pipeline(
+    *,
+    orchestrator: IssueOrchestrator,
+    issue_locator: IssueLocator,
+    workspace: Workspace,
+    target: TargetRepository,
+    max_review_cycles: int,
+) -> IssuePipelineResult:
+    """Compose the nominal `architect -> coder(1) -> reviewer(1)` path (M13-02).
+
+    Invokes architect, then -- only if it reports `READY` with a locator-
+    consistent `IssueRef` and stayed Git-safe -- coder at review cycle 1,
+    then -- only if it reports `COMPLETED` and stayed Git-safe -- reviewer at
+    review cycle 1, each as its own primary-agent session via
+    `IssueOrchestrator.run_provider_attempts` (never a raw `AgentRunner.run`
+    call, never a fourth agent). Every opaque payload -- the architect's
+    handoff body and discovered `IssueRef`, the coder's report, its final Git
+    change inventory (`staged`/`unstaged`/`untracked` paths, never a diff) --
+    is carried into the next role's prompt via `prompting.py` verbatim;
+    Python never reads, summarizes, or judges any of it (ADR-002, ADR-010).
+    `test_scope` is always empty: nothing in this milestone runs or
+    summarizes tests.
+
+    Stops and returns as soon as a role's attempt does not clear the next
+    role's precondition, or after the reviewer's own attempt, in every case
+    reporting `state_machine.transition`'s own verdict rather than acting on
+    it any further -- a reviewer `CHANGES_REQUIRED` or `APPROVED` alike is
+    only ever *reported*, never turned into a second coder invocation or a
+    final status here (M13-03/M13-04).
+    """
+
+    if not isinstance(orchestrator, IssueOrchestrator):
+        raise TypeError("orchestrator must be IssueOrchestrator")
+    if type(issue_locator) is not IssueLocator:
+        raise TypeError("issue_locator must be IssueLocator")
+    if not isinstance(workspace, Workspace):
+        raise TypeError("workspace must be Workspace")
+    if not isinstance(target, TargetRepository):
+        raise TypeError("target must be TargetRepository")
+    _require_int(max_review_cycles, "max_review_cycles", minimum=1)
+
+    architect_prompt = build_architect_prompt(
+        issue_locator=issue_locator,
+        workspace_root=workspace.root,
+        target_root=target.root,
+    )
+    architect_results = orchestrator.run_provider_attempts(
+        role=AgentRole.ARCHITECT,
+        review_cycle=None,
+        prompt=architect_prompt,
+        workspace=workspace,
+    )
+    architect_final = architect_results[-1]
+    architect_transition = transition(
+        PipelineState(phase=PipelinePhase.ARCHITECT),
+        _architect_event(architect_final),
+        max_review_cycles=max_review_cycles,
+    )
+    if architect_transition.action is not PipelineAction.INVOKE_CODER:
+        return IssuePipelineResult(
+            architect=architect_results,
+            coder=(),
+            reviewer=(),
+            state=architect_transition.state,
+            action=architect_transition.action,
+            outcome=architect_transition.outcome,
+        )
+
+    architect_response, _ = _attempt_result(architect_final)
+    if architect_response is None or architect_response.issue_ref is None:
+        raise AssertionError("INVOKE_CODER implies a READY response with an issue_ref")
+    issue_ref = architect_response.issue_ref
+    architect_handoff = architect_response.body
+
+    coder_prompt = build_coder_prompt(
+        issue_ref=issue_ref,
+        architect_handoff=architect_handoff,
+        target_root=target.root,
+        review_cycle=1,
+        max_review_cycles=max_review_cycles,
+        previous_review_feedback=None,
+    )
+    coder_results = orchestrator.run_provider_attempts(
+        role=AgentRole.CODER,
+        review_cycle=1,
+        prompt=coder_prompt,
+        workspace=workspace,
+    )
+    coder_final = coder_results[-1]
+    coder_transition = transition(
+        PipelineState(phase=PipelinePhase.CODER, review_cycle=1),
+        _coder_event(coder_final),
+        max_review_cycles=max_review_cycles,
+    )
+    if coder_transition.action is not PipelineAction.INVOKE_REVIEWER:
+        return IssuePipelineResult(
+            architect=architect_results,
+            coder=coder_results,
+            reviewer=(),
+            state=coder_transition.state,
+            action=coder_transition.action,
+            outcome=coder_transition.outcome,
+        )
+
+    coder_response, _ = _attempt_result(coder_final)
+    if coder_response is None:
+        raise AssertionError("INVOKE_REVIEWER implies a COMPLETED coder response")
+    coder_report = coder_response.body
+    if coder_final.git_after is None:
+        raise AssertionError("a non-blocked attempt always has a git_after checkpoint")
+    inventory = coder_final.git_after.state
+
+    reviewer_prompt = build_reviewer_prompt(
+        issue_ref=issue_ref,
+        architect_handoff=architect_handoff,
+        coder_report=coder_report,
+        staged=inventory.staged,
+        unstaged=inventory.unstaged,
+        untracked=inventory.untracked,
+        test_scope="",
+        target_root=target.root,
+        review_cycle=1,
+        max_review_cycles=max_review_cycles,
+    )
+    reviewer_results = orchestrator.run_provider_attempts(
+        role=AgentRole.REVIEWER,
+        review_cycle=1,
+        prompt=reviewer_prompt,
+        workspace=workspace,
+    )
+    reviewer_final = reviewer_results[-1]
+    reviewer_transition = transition(
+        PipelineState(phase=PipelinePhase.REVIEWER, review_cycle=1),
+        _reviewer_event(reviewer_final),
+        max_review_cycles=max_review_cycles,
+    )
+    return IssuePipelineResult(
+        architect=architect_results,
+        coder=coder_results,
+        reviewer=reviewer_results,
+        state=reviewer_transition.state,
+        action=reviewer_transition.action,
+        outcome=reviewer_transition.outcome,
+    )
+
+
 __all__ = (
     "BootstrapOutcome",
     "InvocationEvent",
     "InvocationEventKind",
     "IssueOrchestrator",
+    "IssuePipelineResult",
     "LogicalInvocationResult",
     "bootstrap_run",
+    "run_issue_pipeline",
 )
