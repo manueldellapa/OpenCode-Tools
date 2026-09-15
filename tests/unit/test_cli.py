@@ -19,6 +19,9 @@ import pytest
 from opencode_tools.cli import (
     _CaptureSink,
     _CliAgentRunner,
+    _render_issue_result,
+    _render_pre_init_failure,
+    _render_preinit_interrupted,
     _TeeSink,
     build_parser,
     main,
@@ -31,6 +34,7 @@ from opencode_tools.domain import (
     AgentStatus,
     AppConfig,
     ConfigSource,
+    ErrorRecord,
     ExecutionConfig,
     FinalStatus,
     GitCheckRecord,
@@ -45,11 +49,12 @@ from opencode_tools.domain import (
     ProviderRetryConfig,
     RepositoryIdentity,
     RunOutcome,
+    RunRecord,
     RunRequest,
     TargetRepository,
     Workspace,
 )
-from opencode_tools.errors import LoggingError, PreflightError
+from opencode_tools.errors import ConfigError, LoggingError, PreflightError
 from opencode_tools.opencode import open_run_capture_sink
 from opencode_tools.ports import (
     AgentRunner,
@@ -103,21 +108,23 @@ def test_config_is_optional_and_kept_as_a_plain_path() -> None:
     assert args.config == Path("custom.toml")
 
 
-def test_main_composes_a_valid_parse_and_prints_nothing_of_its_own(
+def test_main_composes_a_valid_parse_and_renders_a_pre_init_failure(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """A syntactically valid parse reaches composition (M14-02): with a
-    nonexistent `--workspace`, that fails at `ConfigError` and returns a
-    non-zero placeholder exit code (the canonical exit-code table is
-    M14-03's job) -- but `main` itself never prints anything; only
-    `argparse` ever writes here, and only for a syntax error."""
+    """A syntactically valid parse reaches composition: with a nonexistent
+    `--workspace`, that fails at `ConfigError` before any run directory can
+    exist (M14-03's pre-init contract) -- exit 10, no `FINAL_STATUS` line
+    or artifact promise on stdout, and a stderr diagnosis naming the
+    outcome and the sanitized `ConfigError` message."""
 
     exit_code = main(_VALID_ARGS)
 
     captured = capsys.readouterr()
-    assert exit_code != 0
+    assert exit_code == 10
     assert captured.out == ""
-    assert captured.err == ""
+    assert "FINAL_STATUS" not in captured.err
+    assert "terminal outcome: CONFIG_ERROR" in captured.err
+    assert "artifact: none" in captured.err
 
 
 # --- negative parsing: rejected before any run ---------------------------
@@ -938,3 +945,382 @@ def test_tee_sink_fans_writes_out_to_both_the_real_sink_and_the_capture() -> Non
     assert real_sink.closed is True
     assert cast(_CaptureSink, capture).bytes_for("stdout") == b"hello"
     assert tee.path == Path("real.log")
+
+
+# =========================================================================
+# M14-03: final rendering, exit code, and stderr summary.
+# =========================================================================
+
+
+def _issue_result(
+    *,
+    final_status: FinalStatus = FinalStatus.FAILED,
+    expected_exit_code: int = 20,
+    trigger_outcome: RunOutcome = RunOutcome.AGENT_REPORTED_FAILURE,
+    git_safety_status: GitSafetyStatus = GitSafetyStatus.SAFE,
+    persistence_status: PersistenceStatus = PersistenceStatus.OK,
+    changes_preserved: bool = True,
+) -> IssueResult:
+    return IssueResult(
+        run_id="20260915T090000.000000Z-abcdefabcdef",
+        artifact_path=Path(
+            "/runtime/runs/20260915T090000.000000Z-abcdefabcdef/run.json"
+        ),
+        final_status=final_status,
+        expected_exit_code=expected_exit_code,
+        trigger_outcome=trigger_outcome,
+        git_safety_status=git_safety_status,
+        persistence_status=persistence_status,
+        changes_preserved=changes_preserved,
+    )
+
+
+def _run_record(
+    *,
+    workspace: Workspace,
+    target: TargetRepository,
+    git_baseline: GitState | None = None,
+    git_postflight: GitCheckRecord | None = None,
+    errors: tuple[ErrorRecord, ...] = (),
+) -> RunRecord:
+    return RunRecord(
+        schema_version=1,
+        run_id="20260915T090000.000000Z-abcdefabcdef",
+        artifact_path=workspace.root / ".opencode-tools" / "runs" / "r1" / "run.json",
+        workspace=workspace,
+        target=target,
+        issue_number=42,
+        config={},
+        environment={},
+        started_at=NOW,
+        current_phase=PipelinePhase.FINISHED,
+        persistence_status=PersistenceStatus.OK,
+        git_baseline=git_baseline,
+        git_postflight=git_postflight,
+        errors=errors,
+    )
+
+
+def _error_record(
+    *, code: str, message: str, technical_detail: str | None = None
+) -> ErrorRecord:
+    return ErrorRecord(
+        sequence=0,
+        timestamp=NOW,
+        phase=PipelinePhase.PREFLIGHT,
+        outcome=RunOutcome.PREFLIGHT_ERROR,
+        code=code,
+        message=message,
+        technical_detail=technical_detail,
+    )
+
+
+# --- _render_issue_result: the initialized-run terminal contract ---------
+
+
+def test_render_issue_result_prints_exactly_one_final_status_line_on_stdout(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _render_issue_result(
+        _issue_result(final_status=FinalStatus.APPROVED, expected_exit_code=0),
+        last_record=None,
+    )
+
+    out_lines = capsys.readouterr().out.splitlines()
+    assert out_lines == ["FINAL_STATUS: APPROVED"]
+
+
+def test_render_issue_result_never_writes_final_status_to_stderr(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _render_issue_result(_issue_result(), last_record=None)
+
+    assert "FINAL_STATUS" not in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    ("final_status", "trigger_outcome", "expected_exit_code"),
+    [
+        (FinalStatus.APPROVED, RunOutcome.SUCCEEDED, 0),
+        (FinalStatus.FAILED, RunOutcome.PROVIDER_ERROR, 20),
+        (FinalStatus.FAILED, RunOutcome.PROCESS_ERROR, 20),
+        (FinalStatus.FAILED, RunOutcome.PROTOCOL_ERROR, 20),
+        (FinalStatus.FAILED, RunOutcome.AGENT_REPORTED_FAILURE, 20),
+        (FinalStatus.FAILED, RunOutcome.REVIEW_CYCLES_EXHAUSTED, 20),
+        (FinalStatus.FAILED, RunOutcome.INTERRUPTED, 20),
+        (FinalStatus.FAILED, RunOutcome.GIT_SAFETY_ERROR, 30),
+        (FinalStatus.FAILED, RunOutcome.LOGGING_ERROR, 40),
+    ],
+)
+def test_render_issue_result_returns_the_exit_code_issue_result_already_carries(
+    final_status: FinalStatus, trigger_outcome: RunOutcome, expected_exit_code: int
+) -> None:
+    """`_render_issue_result` never recomputes precedence/the final gate --
+    it returns `IssueResult.expected_exit_code` verbatim (System Design
+    SS13.4's table, already resolved by `state_machine.resolve_exit_code`
+    inside `finalize_run`)."""
+
+    result = _issue_result(
+        final_status=final_status,
+        trigger_outcome=trigger_outcome,
+        expected_exit_code=expected_exit_code,
+        git_safety_status=(
+            GitSafetyStatus.SAFE
+            if trigger_outcome is not RunOutcome.GIT_SAFETY_ERROR
+            else GitSafetyStatus.UNSAFE
+        ),
+        persistence_status=(
+            PersistenceStatus.OK
+            if trigger_outcome is not RunOutcome.LOGGING_ERROR
+            else PersistenceStatus.FAILED
+        ),
+    )
+
+    exit_code = _render_issue_result(result, last_record=None)
+
+    assert exit_code == expected_exit_code
+
+
+def test_render_issue_result_reports_run_id_phase_outcome_and_artifact(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    result = _issue_result(trigger_outcome=RunOutcome.AGENT_REPORTED_FAILURE)
+
+    _render_issue_result(result, last_record=None)
+
+    err = capsys.readouterr().err
+    assert f"run_id: {result.run_id}" in err
+    assert "phase: FINISHED" in err
+    assert "terminal outcome: AGENT_REPORTED_FAILURE" in err
+    assert f"artifact: {result.artifact_path}" in err
+
+
+def test_render_issue_result_warns_when_final_persistence_failed(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """FR-046/SH-003: a logging failure must be surfaced explicitly as a
+    possibly-incomplete artifact, never silently reported as a clean run."""
+
+    result = _issue_result(
+        trigger_outcome=RunOutcome.LOGGING_ERROR,
+        expected_exit_code=40,
+        persistence_status=PersistenceStatus.FAILED,
+    )
+
+    _render_issue_result(result, last_record=None)
+
+    assert "may be incomplete" in capsys.readouterr().err
+
+
+def test_render_issue_result_omits_the_change_summary_without_a_last_record(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _render_issue_result(_issue_result(), last_record=None)
+
+    assert "changes" not in capsys.readouterr().err
+
+
+def test_render_issue_result_groups_preserved_changes_by_staged_unstaged_untracked(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """SH-007/System Design SS13.4: counts and paths, grouped -- never diff
+    content or quality -- read back from the last record `_CliRunStore`
+    remembered persisting (never a second Git probe)."""
+
+    workspace, target = _workspace_and_target(tmp_path)
+    state = GitState(
+        root=target.root,
+        branch="main",
+        head="deadbeef",
+        porcelain_summary="M  a.py\n M b.py\n?? c.py",
+        staged=("a.py",),
+        unstaged=("b.py",),
+        untracked=("c.py", "d.py"),
+        fingerprint="fp-1",
+    )
+    record = _run_record(
+        workspace=workspace,
+        target=target,
+        git_postflight=_git_check(sequence=1, purpose="postflight", state=state),
+    )
+
+    _render_issue_result(_issue_result(), last_record=record)
+
+    err = capsys.readouterr().err
+    assert "changes preserved: yes" in err
+    assert "staged=1 unstaged=1 untracked=2" in err
+    assert "staged: a.py" in err
+    assert "unstaged (tracked): b.py" in err
+    assert "untracked: c.py, d.py" in err
+
+
+def test_render_issue_result_falls_back_to_the_baseline_state_without_postflight(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A run that never reached a role's own checkpoint (e.g. it failed
+    during issue resolution) still has a Git baseline on the record --
+    `finalize_run` skips its own postflight probe only when there is no
+    accepted checkpoint to compare against (System Design SS11.3)."""
+
+    workspace, target = _workspace_and_target(tmp_path)
+    baseline = _git_state(target_root=target.root, fingerprint="fp-baseline")
+    record = _run_record(workspace=workspace, target=target, git_baseline=baseline)
+
+    _render_issue_result(_issue_result(), last_record=record)
+
+    assert "staged=0 unstaged=0 untracked=0" in capsys.readouterr().err
+
+
+def test_render_issue_result_surfaces_the_persisted_error_records(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Compatibility diagnosis (a version mismatch discovered during
+    `bootstrap_run`'s own OpenCode preflight, step 6) reaches the CLI only
+    through the last persisted `RunRecord.errors` -- `IssueResult` itself
+    carries no error detail, only `trigger_outcome`."""
+
+    workspace, target = _workspace_and_target(tmp_path)
+    record = _run_record(
+        workspace=workspace,
+        target=target,
+        errors=(
+            _error_record(
+                code="opencode.version_mismatch",
+                message=(
+                    "OpenCode reported a version other than the exact "
+                    "candidate 1.17.18."
+                ),
+                technical_detail="reported='1.17.17'",
+            ),
+        ),
+    )
+
+    _render_issue_result(_issue_result(), last_record=record)
+
+    err = capsys.readouterr().err
+    assert "opencode.version_mismatch" in err
+    assert "candidate 1.17.18" in err
+    assert "reported='1.17.17'" in err
+
+
+# --- _render_pre_init_failure: no artifact/FINAL_STATUS promised ---------
+
+
+def test_render_pre_init_failure_prints_nothing_promising_an_artifact_or_marker(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    error = ConfigError("config.workspace_not_found", "workspace does not exist")
+
+    exit_code = _render_pre_init_failure(error)
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "FINAL_STATUS" not in captured.err
+    assert "run.json" not in captured.err
+    assert "artifact: none" in captured.err
+    assert exit_code == 10
+
+
+@pytest.mark.parametrize(
+    ("error_type", "code", "expected_exit_code"),
+    [
+        (ConfigError, "config.workspace_not_found", 10),
+        (PreflightError, "git_safety.dirty_worktree", 10),
+    ],
+)
+def test_render_pre_init_failure_maps_the_pre_init_outcome_family(
+    error_type: type[ConfigError | PreflightError],
+    code: str,
+    expected_exit_code: int,
+) -> None:
+    """Only `CONFIG_ERROR`/`PREFLIGHT_ERROR` are reachable before a run
+    directory can exist (System Design SS8.2's bootstrap ordering); both
+    fall in the 10 family."""
+
+    error = error_type(code, "a pre-init failure")
+
+    exit_code = _render_pre_init_failure(error)
+
+    assert exit_code == expected_exit_code
+
+
+def test_render_pre_init_failure_names_the_detected_version_and_baseline(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """SH-005/the issue's own AC: a compatibility failure names the
+    detected version, the supported baseline, and remediation -- all
+    already sanitized by `opencode.py`'s own `PreflightError`, never
+    fabricated here."""
+
+    error = PreflightError(
+        "opencode.version_mismatch",
+        "OpenCode reported a version other than the exact candidate 1.17.18.",
+        technical_detail="reported='1.17.17'",
+    )
+
+    _render_pre_init_failure(error)
+
+    err = capsys.readouterr().err
+    assert "candidate 1.17.18" in err
+    assert "reported='1.17.17'" in err
+
+
+def test_render_pre_init_failure_renders_every_cause_earliest_first(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    root_cause = LoggingError("runlog.runtime_root_create_failed", "disk full")
+    wrapping_error = PreflightError(
+        "opencode.preflight_aborted",
+        "preflight could not proceed",
+        causes=(root_cause,),
+    )
+
+    _render_pre_init_failure(wrapping_error)
+
+    err = capsys.readouterr().err
+    assert err.index("runlog.runtime_root_create_failed") < err.index(
+        "opencode.preflight_aborted"
+    )
+
+
+def test_render_preinit_interrupted_returns_130_and_promises_nothing(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    exit_code = _render_preinit_interrupted()
+
+    captured = capsys.readouterr()
+    assert exit_code == 130
+    assert captured.out == ""
+    assert "FINAL_STATUS" not in captured.err
+    assert "run.json" not in captured.err
+
+
+# --- main(): wiring the renderers into the real entrypoint ---------------
+
+
+def test_main_returns_130_on_a_sigint_before_the_run_could_be_initialized(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A `KeyboardInterrupt` reaching `main` can only ever originate before a
+    run directory exists -- once one exists, `process.py`'s own signal
+    handling (installed only around a live subprocess) turns a SIGINT into
+    `RunOutcome.INTERRUPTED` on the pipeline itself, never a raw Python
+    exception -- so `main` maps it to exit 130 with no `FINAL_STATUS`
+    promise, per FR-047 and System Design SS13.4."""
+
+    from opencode_tools import runlog
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+
+    def _raise_keyboard_interrupt() -> None:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(runlog, "check_platform_baseline", _raise_keyboard_interrupt)
+
+    exit_code = main((*_VALID_ARGS[:2], str(workspace), *_VALID_ARGS[3:]))
+
+    captured = capsys.readouterr()
+    assert exit_code == 130
+    assert captured.out == ""
+    assert "FINAL_STATUS" not in captured.err

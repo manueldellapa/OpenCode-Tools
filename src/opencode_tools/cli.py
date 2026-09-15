@@ -15,9 +15,18 @@ and it never mutates Git or GitHub. `main` is the only place real adapters
 itself accepts every port already built, so a test can substitute fakes for
 all of them (NFR-006) without this module ever knowing the difference.
 
-Rendering `IssueResult`/pre-init errors into the canonical `FINAL_STATUS`
-line, stderr summary, and the full exit-code table is a later milestone's
-job; `main` returns only a minimal 0-success/1-failure placeholder for now.
+`main` renders the canonical terminal contract (System Design SS13.4;
+FR-047-FR-050): after a run was initialized, exactly one `FINAL_STATUS:
+APPROVED|FAILED` line on stdout and nothing else there ever; a concise,
+display-safe summary (run ID, last phase, terminal outcome, artifact path,
+persisted errors, and the preserved-changes inventory grouped by staged/
+unstaged/untracked) on stderr; and the canonical exit code -- `IssueResult.
+expected_exit_code` when a run was initialized, `state_machine.
+resolve_exit_code` applied to the raw error's own outcome otherwise. A
+failure before a run directory could ever exist (including a pre-init
+SIGINT) promises no artifact and prints no `FINAL_STATUS` line, per FR-047.
+This module never recomputes precedence, outcome, or the final gate --
+those stay `state_machine.py`/`orchestrator.py`'s alone.
 """
 
 from __future__ import annotations
@@ -43,6 +52,7 @@ from opencode_tools.domain import (
     AgentRole,
     AgentStatus,
     AppConfig,
+    ErrorRecord,
     FinalStatus,
     FrozenJsonValue,
     GitCheckRecord,
@@ -84,7 +94,7 @@ from opencode_tools.ports import (
 )
 from opencode_tools.process import SubprocessRunner
 from opencode_tools.protocol import parse_agent_response
-from opencode_tools.state_machine import classify_attempt_outcome
+from opencode_tools.state_machine import classify_attempt_outcome, resolve_exit_code
 
 _PROG = "opencode-tools"
 
@@ -303,10 +313,26 @@ class _GhCliIssueResolver:
 
 
 class _CliRunStore:
+    """Also remembers the last `RunRecord` it was asked to persist.
+
+    `finalize_run` always calls `persist` exactly once more, with the true
+    terminal record, before returning an `IssueResult` -- which itself
+    carries no phase, Git-state, or error detail (System Design SS15.3 vs.
+    the deliberately minimal `IssueResult`). `main`'s rendering reads that
+    remembered record back through `last_record` rather than re-deriving
+    any of it, so this stays a passive recollection, never a second
+    decision about phase, outcome, or the final gate.
+    """
+
     def __init__(self, *, runtime_root: Path, clock: Clock) -> None:
         self._runtime_root = runtime_root
         self._clock = clock
         self._run_directory: Path | None = None
+        self._last_record: RunRecord | None = None
+
+    @property
+    def last_record(self) -> RunRecord | None:
+        return self._last_record
 
     def initialize(self, workspace: Workspace, run_id: str) -> Path:
         del workspace
@@ -326,6 +352,7 @@ class _CliRunStore:
         return runlog.AttemptLogFileSink(self._run_directory, filename, self._clock)
 
     def persist(self, record: RunRecord) -> PersistenceStatus:
+        self._last_record = record
         try:
             runlog.persist_run_record(record)
         except LoggingError:
@@ -741,20 +768,144 @@ def run_composed_pipeline(
     )
 
 
+def _flatten_error_causes(
+    error: OpenCodeToolsError,
+) -> tuple[OpenCodeToolsError, ...]:
+    flattened: list[OpenCodeToolsError] = []
+    for cause in error.causes:
+        flattened.extend(_flatten_error_causes(cause))
+    flattened.append(error)
+    return tuple(flattened)
+
+
+def _render_error_line(*, code: str, message: str, technical_detail: str | None) -> str:
+    detail = f" ({technical_detail})" if technical_detail else ""
+    return f"error [{code}]: {message}{detail}"
+
+
+def _render_raw_error(error: OpenCodeToolsError) -> tuple[str, ...]:
+    """Render `error` and every cause, earliest first (never a traceback or
+    raw stderr -- `errors.py` already restricted these fields to sanitized,
+    action-oriented text, including a compatibility failure's detected
+    version and supported baseline)."""
+
+    return tuple(
+        _render_error_line(
+            code=item.code, message=item.message, technical_detail=item.technical_detail
+        )
+        for item in _flatten_error_causes(error)
+    )
+
+
+def _render_error_records(errors: tuple[ErrorRecord, ...]) -> tuple[str, ...]:
+    return tuple(
+        _render_error_line(
+            code=item.code, message=item.message, technical_detail=item.technical_detail
+        )
+        for item in errors
+    )
+
+
+def _render_git_state_summary(state: GitState) -> tuple[str, ...]:
+    """Group preserved changes by staged/unstaged/untracked -- counts and
+    paths only, per System Design SS13.4: never diff content or quality."""
+
+    counts = (
+        f"staged={len(state.staged)} unstaged={len(state.unstaged)} "
+        f"untracked={len(state.untracked)}"
+    )
+    lines = [f"changes: {counts}"]
+    if state.staged:
+        lines.append(f"  staged: {', '.join(state.staged)}")
+    if state.unstaged:
+        lines.append(f"  unstaged (tracked): {', '.join(state.unstaged)}")
+    if state.untracked:
+        lines.append(f"  untracked: {', '.join(state.untracked)}")
+    return tuple(lines)
+
+
+def _print_stderr_lines(lines: tuple[str, ...]) -> None:
+    for line in lines:
+        print(line, file=sys.stderr)
+
+
+def _render_pre_init_failure(error: OpenCodeToolsError) -> int:
+    """A failure before any run directory could exist (FR-047/AC-025): no
+    `FINAL_STATUS` line, no artifact promise -- only a stderr diagnosis."""
+
+    lines = (
+        f"phase: {PipelinePhase.PREFLIGHT.value}",
+        f"terminal outcome: {error.outcome.value}",
+        "artifact: none (failed before a run could be initialized)",
+        *_render_raw_error(error),
+    )
+    _print_stderr_lines(lines)
+    return resolve_exit_code(
+        final_status=FinalStatus.FAILED, terminal_outcome=error.outcome
+    )
+
+
+def _render_preinit_interrupted() -> int:
+    _print_stderr_lines(
+        ("interrupted before the run could be initialized; no artifact was created.",)
+    )
+    return 130
+
+
+def _render_issue_result(result: IssueResult, *, last_record: RunRecord | None) -> int:
+    """The canonical terminal contract for an initialized run: exactly one
+    `FINAL_STATUS` line on stdout, a display-safe summary on stderr, and
+    `IssueResult.expected_exit_code` (already the full precedence/gate
+    decision -- never recomputed here)."""
+
+    print(f"FINAL_STATUS: {result.final_status.value}")
+
+    lines = [
+        f"run_id: {result.run_id}",
+        f"phase: {PipelinePhase.FINISHED.value}",
+        f"terminal outcome: {result.trigger_outcome.value}",
+        f"artifact: {result.artifact_path}",
+    ]
+    if result.persistence_status is not PersistenceStatus.OK:
+        lines.append(
+            "warning: final persistence failed; the run artifact may be incomplete."
+        )
+
+    git_state: GitState | None = None
+    if last_record is not None:
+        if last_record.git_postflight is not None:
+            git_state = last_record.git_postflight.state
+        elif last_record.git_baseline is not None:
+            git_state = last_record.git_baseline
+    if git_state is not None:
+        lines.append(
+            f"changes preserved: {'yes' if result.changes_preserved else 'no'}"
+        )
+        lines.extend(_render_git_state_summary(git_state))
+
+    if last_record is not None and last_record.errors:
+        lines.extend(_render_error_records(last_record.errors))
+
+    _print_stderr_lines(tuple(lines))
+    return result.expected_exit_code
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     """CLI entrypoint: validate argv shape, compose adapters, run the pipeline.
 
     An invalid `argv` is rejected by `argparse` itself with exit code 2,
-    before anything else runs. On a syntactically valid parse, this builds
-    every real adapter and runs the single-issue pipeline through
-    `run_composed_pipeline`. The full canonical exit-code table (0/2/10/20/
-    30/40/130) and `FINAL_STATUS`/stderr rendering are a later milestone's
-    job; for now this returns only a minimal 0 (approved) / 1 (anything
-    else) placeholder.
+    before anything else runs -- and, like a pre-init SIGINT, promises
+    neither an artifact nor a `FINAL_STATUS` line. On a syntactically valid
+    parse, this builds every real adapter and runs the single-issue
+    pipeline through `run_composed_pipeline`, then renders its result via
+    `_render_issue_result` (a run was initialized) or `_render_pre_init_
+    failure` (it never got that far) for the full canonical exit-code table
+    (0/2/10/20/30/40/130; System Design SS13.4).
     """
 
     args = parse_args(argv)
     cwd = Path.cwd()
+    run_store: _CliRunStore | None = None
 
     try:
         run_request = build_run_request(
@@ -832,12 +983,15 @@ def main(argv: Sequence[str] | None = None) -> int:
             opencode_preflight=opencode_preflight,
             agent_runner=agent_runner,
         )
-    except OpenCodeToolsError:
-        return 1
+    except KeyboardInterrupt:
+        return _render_preinit_interrupted()
+    except OpenCodeToolsError as error:
+        return _render_pre_init_failure(error)
 
-    if isinstance(result, IssueResult) and result.final_status is FinalStatus.APPROVED:
-        return 0
-    return 1
+    if isinstance(result, IssueResult):
+        last_record = run_store.last_record if run_store is not None else None
+        return _render_issue_result(result, last_record=last_record)
+    return _render_pre_init_failure(result)
 
 
 __all__ = (
