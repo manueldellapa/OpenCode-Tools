@@ -13,6 +13,8 @@ from pathlib import Path
 from types import TracebackType
 from typing import Self
 
+import pytest
+
 from opencode_tools.domain import (
     AgentResult,
     AgentRole,
@@ -31,6 +33,7 @@ from opencode_tools.domain import (
     TargetRepository,
     Workspace,
 )
+from opencode_tools.errors import PreflightError, ProtocolError
 from opencode_tools.ports import (
     AgentRunner,
     AttemptLogSink,
@@ -38,6 +41,7 @@ from opencode_tools.ports import (
     GitSafetyPort,
     IssueResolver,
     LogChannel,
+    OpenCodePreflightPort,
     ProcessRunner,
     RunStorePort,
     Sleeper,
@@ -304,6 +308,38 @@ class RecordingIssueResolver:
         return self._locator
 
 
+class RecordingOpenCodePreflightPort:
+    """An `OpenCodePreflightPort` fake recording `verify()`/`recheck()`
+    calls, each independently scriptable to raise -- only the canonical
+    control-plane digest `verify` returns ever crosses this boundary,
+    matching the Protocol's own "no other evidence crosses this boundary"
+    contract."""
+
+    def __init__(
+        self,
+        *,
+        digest: str = "digest-001",
+        error: Exception | None = None,
+        recheck_error: Exception | None = None,
+    ) -> None:
+        self._digest = digest
+        self._error = error
+        self._recheck_error = recheck_error
+        self.calls = 0
+        self.recheck_calls: list[str] = []
+
+    def verify(self) -> str:
+        self.calls += 1
+        if self._error is not None:
+            raise self._error
+        return self._digest
+
+    def recheck(self, expected_digest: str) -> None:
+        self.recheck_calls.append(expected_digest)
+        if self._recheck_error is not None:
+            raise self._recheck_error
+
+
 class RecordingRunStorePort:
     """A `RunStorePort` fake recording every call without touching disk."""
 
@@ -476,6 +512,48 @@ def test_issue_resolver_port_resolves_repository_then_locates_the_issue() -> Non
     assert resolved_locator is locator
     assert fake.resolve_calls == [target]
     assert fake.locate_calls == [(identity, 6)]
+
+
+def test_opencode_preflight_port_verifies_once_and_returns_the_digest() -> None:
+    fake = RecordingOpenCodePreflightPort(digest="digest-001")
+    preflight: OpenCodePreflightPort = fake
+
+    digest = preflight.verify()
+
+    assert digest == "digest-001"
+    assert fake.calls == 1
+
+
+def test_opencode_preflight_port_propagates_a_failed_verification() -> None:
+    error = PreflightError("opencode.version_mismatch", "unexpected version")
+    fake = RecordingOpenCodePreflightPort(error=error)
+    preflight: OpenCodePreflightPort = fake
+
+    with pytest.raises(PreflightError):
+        preflight.verify()
+
+    assert fake.calls == 1
+
+
+def test_opencode_preflight_port_rechecks_the_same_digest() -> None:
+    fake = RecordingOpenCodePreflightPort(digest="digest-001")
+    preflight: OpenCodePreflightPort = fake
+
+    preflight.recheck("digest-001")
+    preflight.recheck("digest-001")
+
+    assert fake.recheck_calls == ["digest-001", "digest-001"]
+
+
+def test_opencode_preflight_port_propagates_a_control_plane_drift() -> None:
+    drift = ProtocolError("opencode.control_plane_drift", "the digest changed")
+    fake = RecordingOpenCodePreflightPort(recheck_error=drift)
+    preflight: OpenCodePreflightPort = fake
+
+    with pytest.raises(ProtocolError):
+        preflight.recheck("digest-001")
+
+    assert fake.recheck_calls == ["digest-001"]
 
 
 def test_run_store_port_initializes_opens_sinks_and_persists_records() -> None:

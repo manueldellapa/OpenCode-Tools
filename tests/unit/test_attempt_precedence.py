@@ -58,7 +58,7 @@ from opencode_tools.domain import (
     Workspace,
     to_primitive,
 )
-from opencode_tools.errors import LoggingError, RunInterruptedError
+from opencode_tools.errors import LoggingError, ProtocolError, RunInterruptedError
 from opencode_tools.orchestrator import (
     InvocationEvent,
     InvocationEventKind,
@@ -481,6 +481,39 @@ class RecordingGitSafetyPort:
         return self._results.pop(0)
 
 
+CONTROL_PLANE_DIGEST = "control-plane-digest-abc123"
+
+
+class RecordingOpenCodePreflightPort:
+    """An `OpenCodePreflightPort` fake that appends to a shared cross-port
+    call log. `verify()` is never exercised here -- `bootstrap_run` (M13-01)
+    calls it, not `IssueOrchestrator` -- only `recheck`, once per provider
+    attempt, scriptable to raise a drift on a specific call."""
+
+    def __init__(
+        self,
+        call_log: list[str],
+        *,
+        recheck_errors: list[Exception | None] | None = None,
+    ) -> None:
+        self._call_log = call_log
+        self._recheck_errors = (
+            list(recheck_errors) if recheck_errors is not None else None
+        )
+        self.recheck_calls: list[str] = []
+
+    def verify(self) -> str:
+        raise AssertionError("not exercised by this issue's orchestrator scope")
+
+    def recheck(self, expected_digest: str) -> None:
+        self._call_log.append("opencode_preflight.recheck")
+        self.recheck_calls.append(expected_digest)
+        if self._recheck_errors:
+            error = self._recheck_errors.pop(0)
+            if error is not None:
+                raise error
+
+
 class SteppingClock:
     """A `Clock` fake whose `now()` advances by one second on every call."""
 
@@ -521,11 +554,13 @@ def _orchestrator(
     fail_open: bool = False,
     sleeper: RecordingSleeper | None = None,
     provider_retry: ProviderRetryConfig | None = None,
+    recheck_errors: list[Exception | None] | None = None,
 ) -> tuple[
     IssueOrchestrator,
     RecordingRunStorePort,
     ScriptedAgentRunner,
     RecordingGitSafetyPort,
+    RecordingOpenCodePreflightPort,
 ]:
     resolved_target = target if target is not None else _target()
     run_store = RecordingRunStorePort(
@@ -533,18 +568,23 @@ def _orchestrator(
     )
     agent_runner = ScriptedAgentRunner(call_log, result=agent_result)
     git_safety = RecordingGitSafetyPort(call_log, git_results)
+    opencode_preflight = RecordingOpenCodePreflightPort(
+        call_log, recheck_errors=recheck_errors
+    )
     orchestrator = IssueOrchestrator(
         initial_record=_initial_record(run_id=run_id, target=resolved_target),
         agent_runner=agent_runner,
         run_store=run_store,
         git_safety=git_safety,
+        opencode_preflight=opencode_preflight,
+        control_plane_digest=CONTROL_PLANE_DIGEST,
         clock=clock,
         sleeper=sleeper if sleeper is not None else RecordingSleeper(),
         provider_retry=(
             provider_retry if provider_retry is not None else _provider_retry_config()
         ),
     )
-    return orchestrator, run_store, agent_runner, git_safety
+    return orchestrator, run_store, agent_runner, git_safety, opencode_preflight
 
 
 def _safe_pair(*, attempt_fingerprint: str = "fingerprint-1") -> list[GitCheckRecord]:
@@ -599,12 +639,14 @@ def test_orchestrator_is_constructed_entirely_from_injected_ports() -> None:
     )
     clock = SteppingClock(start=NOW)
 
-    orchestrator, run_store, agent_runner, git_safety = _orchestrator(
-        call_log=call_log,
-        sink=sink,
-        agent_result=result,
-        git_results=_safe_pair(),
-        clock=clock,
+    orchestrator, run_store, agent_runner, git_safety, _opencode_preflight = (
+        _orchestrator(
+            call_log=call_log,
+            sink=sink,
+            agent_result=result,
+            git_results=_safe_pair(),
+            clock=clock,
+        )
     )
 
     assert isinstance(orchestrator, IssueOrchestrator)
@@ -654,6 +696,8 @@ def test_orchestrator_rejects_an_initial_record_of_the_wrong_type() -> None:
             ),
             run_store=RecordingRunStorePort([], sink=RecordingAttemptLogSink()),
             git_safety=RecordingGitSafetyPort([], []),
+            opencode_preflight=RecordingOpenCodePreflightPort([]),
+            control_plane_digest=CONTROL_PLANE_DIGEST,
             clock=SteppingClock(start=NOW),
             sleeper=RecordingSleeper(),
             provider_retry=_provider_retry_config(),
@@ -672,6 +716,8 @@ def test_orchestrator_rejects_a_provider_retry_of_the_wrong_type() -> None:
             ),
             run_store=RecordingRunStorePort([], sink=RecordingAttemptLogSink()),
             git_safety=RecordingGitSafetyPort([], []),
+            opencode_preflight=RecordingOpenCodePreflightPort([]),
+            control_plane_digest=CONTROL_PLANE_DIGEST,
             clock=SteppingClock(start=NOW),
             sleeper=RecordingSleeper(),
             provider_retry=cast(ProviderRetryConfig, object()),
@@ -693,13 +739,15 @@ def test_run_logical_invocation_follows_the_canonical_order_when_safe() -> None:
     clock = SteppingClock(start=NOW)
     target = _target()
     git_results = _safe_pair()
-    orchestrator, run_store, agent_runner, git_safety = _orchestrator(
-        call_log=call_log,
-        sink=sink,
-        agent_result=agent_result,
-        git_results=git_results,
-        clock=clock,
-        target=target,
+    orchestrator, run_store, agent_runner, git_safety, opencode_preflight = (
+        _orchestrator(
+            call_log=call_log,
+            sink=sink,
+            agent_result=agent_result,
+            git_results=git_results,
+            clock=clock,
+            target=target,
+        )
     )
     workspace = _workspace()
 
@@ -714,6 +762,7 @@ def test_run_logical_invocation_follows_the_canonical_order_when_safe() -> None:
     assert call_log == [
         "run_store.open_attempt_sink",
         "git_safety.check",
+        "opencode_preflight.recheck",
         "agent_runner.run",
         "git_safety.check",
         "run_store.persist",
@@ -728,6 +777,8 @@ def test_run_logical_invocation_follows_the_canonical_order_when_safe() -> None:
         (target, AgentRole.CODER, git_results[0].state),
     ]
     assert result.git_before is git_results[0]
+    assert result.control_plane_error is None
+    assert opencode_preflight.recheck_calls == [CONTROL_PLANE_DIGEST]
     assert result.git_after is git_results[1]
     assert result.agent_result is agent_result
     assert result.retry_decision is not None
@@ -736,14 +787,15 @@ def test_run_logical_invocation_follows_the_canonical_order_when_safe() -> None:
         InvocationEventKind.INVOCATION_STARTED,
         InvocationEventKind.ATTEMPT_SINK_OPENED,
         InvocationEventKind.GIT_BEFORE_CHECKED,
+        InvocationEventKind.CONTROL_PLANE_RECHECKED,
         InvocationEventKind.AGENT_RESULT_RECEIVED,
         InvocationEventKind.GIT_AFTER_CHECKED,
         InvocationEventKind.ATTEMPT_SINK_CLOSED,
     ]
-    assert [event.sequence for event in result.events] == [0, 1, 2, 3, 4, 5]
+    assert [event.sequence for event in result.events] == [0, 1, 2, 3, 4, 5, 6]
     timestamps = [event.timestamp for event in result.events]
     assert timestamps == sorted(timestamps)
-    assert len(set(timestamps)) == 6
+    assert len(set(timestamps)) == 7
 
     # Exactly one persist call, carrying a distinct AttemptRecord for it.
     assert len(run_store.persist_calls) == 1
@@ -764,17 +816,19 @@ def test_run_logical_invocation_before_check_passes_role_none_and_after_passes_r
     None
 ):
     call_log: list[str] = []
-    orchestrator, _run_store, _agent_runner, git_safety = _orchestrator(
-        call_log=call_log,
-        sink=RecordingAttemptLogSink(),
-        agent_result=_agent_result(
-            role=AgentRole.ARCHITECT,
-            review_cycle=None,
-            provider_attempt=1,
-            terminal_response=_success_response(AgentRole.ARCHITECT),
-        ),
-        git_results=_safe_pair(),
-        clock=SteppingClock(start=NOW),
+    orchestrator, _run_store, _agent_runner, git_safety, _opencode_preflight = (
+        _orchestrator(
+            call_log=call_log,
+            sink=RecordingAttemptLogSink(),
+            agent_result=_agent_result(
+                role=AgentRole.ARCHITECT,
+                review_cycle=None,
+                provider_attempt=1,
+                terminal_response=_success_response(AgentRole.ARCHITECT),
+            ),
+            git_results=_safe_pair(),
+            clock=SteppingClock(start=NOW),
+        )
     )
 
     orchestrator.run_logical_invocation(
@@ -808,17 +862,19 @@ def test_run_logical_invocation_before_baseline_is_the_last_accepted_after_state
             state=_git_state(fingerprint="fingerprint-after-2"),
         ),
     ]
-    orchestrator, _run_store, agent_runner, git_safety = _orchestrator(
-        call_log=call_log,
-        sink=RecordingAttemptLogSink(),
-        agent_result=_agent_result(
-            role=AgentRole.CODER,
-            review_cycle=1,
-            provider_attempt=1,
-            terminal_response=_success_response(AgentRole.CODER),
-        ),
-        git_results=[*first_pair, *second_pair],
-        clock=clock,
+    orchestrator, _run_store, agent_runner, git_safety, _opencode_preflight = (
+        _orchestrator(
+            call_log=call_log,
+            sink=RecordingAttemptLogSink(),
+            agent_result=_agent_result(
+                role=AgentRole.CODER,
+                review_cycle=1,
+                provider_attempt=1,
+                terminal_response=_success_response(AgentRole.CODER),
+            ),
+            git_results=[*first_pair, *second_pair],
+            clock=clock,
+        )
     )
 
     orchestrator.run_logical_invocation(
@@ -864,17 +920,19 @@ def test_run_logical_invocation_does_not_accept_an_unsafe_after_as_the_new_basel
     after_2 = _git_check(
         sequence=3, purpose="after-2", state=_git_state(fingerprint="fingerprint-2")
     )
-    orchestrator, _run_store, agent_runner, git_safety = _orchestrator(
-        call_log=call_log,
-        sink=RecordingAttemptLogSink(),
-        agent_result=_agent_result(
-            role=AgentRole.ARCHITECT,
-            review_cycle=None,
-            provider_attempt=1,
-            terminal_response=_success_response(AgentRole.ARCHITECT),
-        ),
-        git_results=[before_1, drifted_after, before_2, after_2],
-        clock=SteppingClock(start=NOW),
+    orchestrator, _run_store, agent_runner, git_safety, _opencode_preflight = (
+        _orchestrator(
+            call_log=call_log,
+            sink=RecordingAttemptLogSink(),
+            agent_result=_agent_result(
+                role=AgentRole.ARCHITECT,
+                review_cycle=None,
+                provider_attempt=1,
+                terminal_response=_success_response(AgentRole.ARCHITECT),
+            ),
+            git_results=[before_1, drifted_after, before_2, after_2],
+            clock=SteppingClock(start=NOW),
+        )
     )
 
     orchestrator.run_logical_invocation(
@@ -916,14 +974,16 @@ def test_run_logical_invocation_blocks_the_agent_when_before_is_not_safe(
     call_log: list[str] = []
     sink = RecordingAttemptLogSink()
     before = _git_check(sequence=0, purpose="before", safety_status=before_status)
-    orchestrator, run_store, agent_runner, _git_safety = _orchestrator(
-        call_log=call_log,
-        sink=sink,
-        agent_result=_agent_result(
-            role=AgentRole.CODER, review_cycle=1, provider_attempt=1
-        ),
-        git_results=[before],
-        clock=SteppingClock(start=NOW),
+    orchestrator, run_store, agent_runner, _git_safety, _opencode_preflight = (
+        _orchestrator(
+            call_log=call_log,
+            sink=sink,
+            agent_result=_agent_result(
+                role=AgentRole.CODER, review_cycle=1, provider_attempt=1
+            ),
+            git_results=[before],
+            clock=SteppingClock(start=NOW),
+        )
     )
 
     result = orchestrator.run_logical_invocation(
@@ -953,6 +1013,111 @@ def test_run_logical_invocation_blocks_the_agent_when_before_is_not_safe(
     ]
 
 
+# --- Control-plane drift blocks the agent before it is ever invoked ---------
+
+
+def test_run_logical_invocation_blocks_the_agent_on_a_control_plane_drift() -> None:
+    """A `before` that is `SAFE` still never reaches `AgentRunner.run()` if
+    `OpenCodePreflightPort.recheck` detects a control-plane drift (System
+    Design SS18.2; ADR-005; the M12-02/#45 gap this closes): the recheck
+    runs after `before` is confirmed `SAFE` and strictly before the agent is
+    invoked, and a drift fails closed exactly like an unsafe `before` does
+    -- no agent call, no `git_after`, no precedence, no retry decision."""
+
+    call_log: list[str] = []
+    sink = RecordingAttemptLogSink()
+    before = _git_check(sequence=0, purpose="before")
+    drift = ProtocolError(
+        "opencode.control_plane_drift", "the control-plane digest changed"
+    )
+    orchestrator, run_store, agent_runner, _git_safety, opencode_preflight = (
+        _orchestrator(
+            call_log=call_log,
+            sink=sink,
+            agent_result=_agent_result(
+                role=AgentRole.CODER, review_cycle=1, provider_attempt=1
+            ),
+            git_results=[before],
+            clock=SteppingClock(start=NOW),
+            recheck_errors=[drift],
+        )
+    )
+
+    result = orchestrator.run_logical_invocation(
+        role=AgentRole.CODER,
+        review_cycle=1,
+        provider_attempt=1,
+        prompt="Implement the fix.",
+        workspace=_workspace(),
+    )
+
+    assert call_log == [
+        "run_store.open_attempt_sink",
+        "git_safety.check",
+        "opencode_preflight.recheck",
+    ]
+    assert opencode_preflight.recheck_calls == [CONTROL_PLANE_DIGEST]
+    assert run_store.sink_calls == [(AgentRole.CODER, 1, 1)]
+    assert run_store.persist_calls == []  # never persisted as an AttemptRecord
+    assert agent_runner.calls == []  # the agent is never invoked
+    assert sink.closed is True
+    assert result.git_before is before
+    assert result.control_plane_error is drift
+    assert result.agent_result is None
+    assert result.git_after is None
+    assert result.precedence is None
+    assert result.retry_decision is None
+    assert [event.kind for event in result.events] == [
+        InvocationEventKind.INVOCATION_STARTED,
+        InvocationEventKind.ATTEMPT_SINK_OPENED,
+        InvocationEventKind.GIT_BEFORE_CHECKED,
+        InvocationEventKind.ATTEMPT_SINK_CLOSED,
+        InvocationEventKind.BLOCKED_BY_CONTROL_PLANE_DRIFT,
+    ]
+
+
+def test_run_provider_attempts_stops_after_a_control_plane_drift_without_retrying() -> (
+    None
+):
+    """`retry_decision is None` on a drift-blocked attempt (mirroring the
+    git-safety-blocked case) means `run_provider_attempts` stops immediately
+    -- a drift is never retried, and the agent is never invoked at all."""
+
+    call_log: list[str] = []
+    before = _git_check(sequence=0, purpose="before")
+    drift = ProtocolError(
+        "opencode.control_plane_drift", "the control-plane digest changed"
+    )
+    sleeper = RecordingSleeper()
+    orchestrator, _run_store, agent_runner, _git_safety, opencode_preflight = (
+        _orchestrator(
+            call_log=call_log,
+            sink=RecordingAttemptLogSink(),
+            agent_result=_agent_result(
+                role=AgentRole.CODER, review_cycle=1, provider_attempt=1
+            ),
+            git_results=[before],
+            clock=SteppingClock(start=NOW),
+            sleeper=sleeper,
+            recheck_errors=[drift],
+        )
+    )
+
+    results = orchestrator.run_provider_attempts(
+        role=AgentRole.CODER,
+        review_cycle=1,
+        prompt="Implement the fix.",
+        workspace=_workspace(),
+    )
+
+    assert len(results) == 1
+    assert results[0].control_plane_error is drift
+    assert results[0].retry_decision is None
+    assert agent_runner.calls == []
+    assert sleeper.calls == []
+    assert opencode_preflight.recheck_calls == [CONTROL_PLANE_DIGEST]
+
+
 # --- ID / counter invariants -------------------------------------------------
 
 
@@ -961,18 +1126,20 @@ def test_run_logical_invocation_assigns_the_same_identity_across_provider_attemp
 ):
     call_log: list[str] = []
     workspace = _workspace()
-    orchestrator, _run_store, agent_runner, _git_safety = _orchestrator(
-        call_log=call_log,
-        sink=RecordingAttemptLogSink(),
-        agent_result=_agent_result(
-            role=AgentRole.CODER,
-            review_cycle=1,
-            provider_attempt=1,
-            outcome=RunOutcome.PROVIDER_ERROR,
-            provider_diagnostic=_provider_diagnostic(),
-        ),
-        git_results=[*_safe_pair_unchanged(), *_safe_pair()],
-        clock=SteppingClock(start=NOW),
+    orchestrator, _run_store, agent_runner, _git_safety, _opencode_preflight = (
+        _orchestrator(
+            call_log=call_log,
+            sink=RecordingAttemptLogSink(),
+            agent_result=_agent_result(
+                role=AgentRole.CODER,
+                review_cycle=1,
+                provider_attempt=1,
+                outcome=RunOutcome.PROVIDER_ERROR,
+                provider_diagnostic=_provider_diagnostic(),
+            ),
+            git_results=[*_safe_pair_unchanged(), *_safe_pair()],
+            clock=SteppingClock(start=NOW),
+        )
     )
 
     first = orchestrator.run_logical_invocation(
@@ -1009,14 +1176,16 @@ def test_run_logical_invocation_assigns_the_same_identity_across_provider_attemp
 
 
 def test_run_logical_invocation_rejects_architect_with_a_review_cycle() -> None:
-    orchestrator, _run_store, _agent_runner, _git_safety = _orchestrator(
-        call_log=[],
-        sink=RecordingAttemptLogSink(),
-        agent_result=_agent_result(
-            role=AgentRole.ARCHITECT, review_cycle=None, provider_attempt=1
-        ),
-        git_results=_safe_pair(),
-        clock=SteppingClock(start=NOW),
+    orchestrator, _run_store, _agent_runner, _git_safety, _opencode_preflight = (
+        _orchestrator(
+            call_log=[],
+            sink=RecordingAttemptLogSink(),
+            agent_result=_agent_result(
+                role=AgentRole.ARCHITECT, review_cycle=None, provider_attempt=1
+            ),
+            git_results=_safe_pair(),
+            clock=SteppingClock(start=NOW),
+        )
     )
 
     with pytest.raises(ValueError, match="review_cycle"):
@@ -1030,14 +1199,16 @@ def test_run_logical_invocation_rejects_architect_with_a_review_cycle() -> None:
 
 
 def test_run_logical_invocation_rejects_coder_without_a_review_cycle() -> None:
-    orchestrator, _run_store, _agent_runner, _git_safety = _orchestrator(
-        call_log=[],
-        sink=RecordingAttemptLogSink(),
-        agent_result=_agent_result(
-            role=AgentRole.CODER, review_cycle=1, provider_attempt=1
-        ),
-        git_results=_safe_pair(),
-        clock=SteppingClock(start=NOW),
+    orchestrator, _run_store, _agent_runner, _git_safety, _opencode_preflight = (
+        _orchestrator(
+            call_log=[],
+            sink=RecordingAttemptLogSink(),
+            agent_result=_agent_result(
+                role=AgentRole.CODER, review_cycle=1, provider_attempt=1
+            ),
+            git_results=_safe_pair(),
+            clock=SteppingClock(start=NOW),
+        )
     )
 
     with pytest.raises(ValueError, match="review_cycle"):
@@ -1051,14 +1222,16 @@ def test_run_logical_invocation_rejects_coder_without_a_review_cycle() -> None:
 
 
 def test_run_logical_invocation_rejects_non_positive_provider_attempt() -> None:
-    orchestrator, _run_store, _agent_runner, _git_safety = _orchestrator(
-        call_log=[],
-        sink=RecordingAttemptLogSink(),
-        agent_result=_agent_result(
-            role=AgentRole.CODER, review_cycle=1, provider_attempt=1
-        ),
-        git_results=_safe_pair(),
-        clock=SteppingClock(start=NOW),
+    orchestrator, _run_store, _agent_runner, _git_safety, _opencode_preflight = (
+        _orchestrator(
+            call_log=[],
+            sink=RecordingAttemptLogSink(),
+            agent_result=_agent_result(
+                role=AgentRole.CODER, review_cycle=1, provider_attempt=1
+            ),
+            git_results=_safe_pair(),
+            clock=SteppingClock(start=NOW),
+        )
     )
 
     with pytest.raises(ValueError, match="provider_attempt"):
@@ -1072,14 +1245,16 @@ def test_run_logical_invocation_rejects_non_positive_provider_attempt() -> None:
 
 
 def test_run_logical_invocation_rejects_wrong_types() -> None:
-    orchestrator, _run_store, _agent_runner, _git_safety = _orchestrator(
-        call_log=[],
-        sink=RecordingAttemptLogSink(),
-        agent_result=_agent_result(
-            role=AgentRole.CODER, review_cycle=1, provider_attempt=1
-        ),
-        git_results=_safe_pair(),
-        clock=SteppingClock(start=NOW),
+    orchestrator, _run_store, _agent_runner, _git_safety, _opencode_preflight = (
+        _orchestrator(
+            call_log=[],
+            sink=RecordingAttemptLogSink(),
+            agent_result=_agent_result(
+                role=AgentRole.CODER, review_cycle=1, provider_attempt=1
+            ),
+            git_results=_safe_pair(),
+            clock=SteppingClock(start=NOW),
+        )
     )
 
     with pytest.raises(TypeError, match="role"):
@@ -1112,12 +1287,14 @@ def test_precedence_classifies_a_pure_timeout() -> None:
             outcome=RunOutcome.TIMEOUT, timed_out=True, return_code=None
         ),
     )
-    orchestrator, _run_store, _agent_runner, _git_safety = _orchestrator(
-        call_log=[],
-        sink=RecordingAttemptLogSink(),
-        agent_result=agent_result,
-        git_results=_safe_pair(),
-        clock=SteppingClock(start=NOW),
+    orchestrator, _run_store, _agent_runner, _git_safety, _opencode_preflight = (
+        _orchestrator(
+            call_log=[],
+            sink=RecordingAttemptLogSink(),
+            agent_result=agent_result,
+            git_results=_safe_pair(),
+            clock=SteppingClock(start=NOW),
+        )
     )
 
     result = orchestrator.run_logical_invocation(
@@ -1140,12 +1317,14 @@ def test_precedence_classifies_a_pure_provider_error() -> None:
         provider_attempt=1,
         provider_diagnostic=_provider_diagnostic(),
     )
-    orchestrator, _run_store, _agent_runner, _git_safety = _orchestrator(
-        call_log=[],
-        sink=RecordingAttemptLogSink(),
-        agent_result=agent_result,
-        git_results=_safe_pair(),
-        clock=SteppingClock(start=NOW),
+    orchestrator, _run_store, _agent_runner, _git_safety, _opencode_preflight = (
+        _orchestrator(
+            call_log=[],
+            sink=RecordingAttemptLogSink(),
+            agent_result=agent_result,
+            git_results=_safe_pair(),
+            clock=SteppingClock(start=NOW),
+        )
     )
 
     result = orchestrator.run_logical_invocation(
@@ -1169,12 +1348,14 @@ def test_precedence_classifies_a_pure_process_error() -> None:
         provider_attempt=1,
         process=_agent_process_result(outcome=RunOutcome.PROCESS_ERROR, return_code=1),
     )
-    orchestrator, _run_store, _agent_runner, _git_safety = _orchestrator(
-        call_log=[],
-        sink=RecordingAttemptLogSink(),
-        agent_result=agent_result,
-        git_results=_safe_pair(),
-        clock=SteppingClock(start=NOW),
+    orchestrator, _run_store, _agent_runner, _git_safety, _opencode_preflight = (
+        _orchestrator(
+            call_log=[],
+            sink=RecordingAttemptLogSink(),
+            agent_result=agent_result,
+            git_results=_safe_pair(),
+            clock=SteppingClock(start=NOW),
+        )
     )
 
     result = orchestrator.run_logical_invocation(
@@ -1207,12 +1388,14 @@ def test_precedence_classifies_a_logging_error_process_outcome_as_process_error(
             outcome=RunOutcome.LOGGING_ERROR, return_code=None
         ),
     )
-    orchestrator, run_store, _agent_runner, _git_safety = _orchestrator(
-        call_log=[],
-        sink=RecordingAttemptLogSink(),
-        agent_result=agent_result,
-        git_results=_safe_pair(),
-        clock=SteppingClock(start=NOW),
+    orchestrator, run_store, _agent_runner, _git_safety, _opencode_preflight = (
+        _orchestrator(
+            call_log=[],
+            sink=RecordingAttemptLogSink(),
+            agent_result=agent_result,
+            git_results=_safe_pair(),
+            clock=SteppingClock(start=NOW),
+        )
     )
 
     result = orchestrator.run_logical_invocation(
@@ -1241,12 +1424,14 @@ def test_precedence_classifies_an_interrupted_process_outcome_as_process_error()
         provider_attempt=1,
         process=_agent_process_result(outcome=RunOutcome.INTERRUPTED, return_code=None),
     )
-    orchestrator, _run_store, _agent_runner, _git_safety = _orchestrator(
-        call_log=[],
-        sink=RecordingAttemptLogSink(),
-        agent_result=agent_result,
-        git_results=_safe_pair(),
-        clock=SteppingClock(start=NOW),
+    orchestrator, _run_store, _agent_runner, _git_safety, _opencode_preflight = (
+        _orchestrator(
+            call_log=[],
+            sink=RecordingAttemptLogSink(),
+            agent_result=agent_result,
+            git_results=_safe_pair(),
+            clock=SteppingClock(start=NOW),
+        )
     )
 
     result = orchestrator.run_logical_invocation(
@@ -1275,12 +1460,14 @@ def test_precedence_classifies_a_pure_protocol_error() -> None:
     agent_result = _agent_result(
         role=AgentRole.CODER, review_cycle=1, provider_attempt=1, terminal_response=None
     )
-    orchestrator, _run_store, _agent_runner, _git_safety = _orchestrator(
-        call_log=[],
-        sink=RecordingAttemptLogSink(),
-        agent_result=agent_result,
-        git_results=_safe_pair(),
-        clock=SteppingClock(start=NOW),
+    orchestrator, _run_store, _agent_runner, _git_safety, _opencode_preflight = (
+        _orchestrator(
+            call_log=[],
+            sink=RecordingAttemptLogSink(),
+            agent_result=agent_result,
+            git_results=_safe_pair(),
+            clock=SteppingClock(start=NOW),
+        )
     )
 
     result = orchestrator.run_logical_invocation(
@@ -1304,12 +1491,14 @@ def test_precedence_classifies_a_pure_agent_reported_failure() -> None:
         provider_attempt=1,
         terminal_response=_failure_response(AgentRole.CODER),
     )
-    orchestrator, _run_store, _agent_runner, _git_safety = _orchestrator(
-        call_log=[],
-        sink=RecordingAttemptLogSink(),
-        agent_result=agent_result,
-        git_results=_safe_pair(),
-        clock=SteppingClock(start=NOW),
+    orchestrator, _run_store, _agent_runner, _git_safety, _opencode_preflight = (
+        _orchestrator(
+            call_log=[],
+            sink=RecordingAttemptLogSink(),
+            agent_result=agent_result,
+            git_results=_safe_pair(),
+            clock=SteppingClock(start=NOW),
+        )
     )
 
     result = orchestrator.run_logical_invocation(
@@ -1333,12 +1522,14 @@ def test_precedence_classifies_a_pure_success() -> None:
         provider_attempt=1,
         terminal_response=_success_response(AgentRole.REVIEWER),
     )
-    orchestrator, _run_store, _agent_runner, _git_safety = _orchestrator(
-        call_log=[],
-        sink=RecordingAttemptLogSink(),
-        agent_result=agent_result,
-        git_results=_safe_pair(),
-        clock=SteppingClock(start=NOW),
+    orchestrator, _run_store, _agent_runner, _git_safety, _opencode_preflight = (
+        _orchestrator(
+            call_log=[],
+            sink=RecordingAttemptLogSink(),
+            agent_result=agent_result,
+            git_results=_safe_pair(),
+            clock=SteppingClock(start=NOW),
+        )
     )
 
     result = orchestrator.run_logical_invocation(
@@ -1368,12 +1559,14 @@ def test_precedence_keeps_timeout_over_a_concurrent_provider_signal() -> None:
         ),
         provider_diagnostic=_provider_diagnostic(),
     )
-    orchestrator, _run_store, _agent_runner, _git_safety = _orchestrator(
-        call_log=[],
-        sink=RecordingAttemptLogSink(),
-        agent_result=agent_result,
-        git_results=_safe_pair(),
-        clock=SteppingClock(start=NOW),
+    orchestrator, _run_store, _agent_runner, _git_safety, _opencode_preflight = (
+        _orchestrator(
+            call_log=[],
+            sink=RecordingAttemptLogSink(),
+            agent_result=agent_result,
+            git_results=_safe_pair(),
+            clock=SteppingClock(start=NOW),
+        )
     )
 
     result = orchestrator.run_logical_invocation(
@@ -1398,12 +1591,14 @@ def test_precedence_keeps_provider_error_over_a_concurrent_process_error() -> No
         process=_agent_process_result(outcome=RunOutcome.PROCESS_ERROR, return_code=1),
         provider_diagnostic=_provider_diagnostic(),
     )
-    orchestrator, _run_store, _agent_runner, _git_safety = _orchestrator(
-        call_log=[],
-        sink=RecordingAttemptLogSink(),
-        agent_result=agent_result,
-        git_results=_safe_pair(),
-        clock=SteppingClock(start=NOW),
+    orchestrator, _run_store, _agent_runner, _git_safety, _opencode_preflight = (
+        _orchestrator(
+            call_log=[],
+            sink=RecordingAttemptLogSink(),
+            agent_result=agent_result,
+            git_results=_safe_pair(),
+            clock=SteppingClock(start=NOW),
+        )
     )
 
     result = orchestrator.run_logical_invocation(
@@ -1435,12 +1630,14 @@ def test_precedence_never_reads_terminal_response_once_timeout_forbids_it() -> N
         ),
         terminal_response=_success_response(AgentRole.CODER),
     )
-    orchestrator, _run_store, _agent_runner, _git_safety = _orchestrator(
-        call_log=[],
-        sink=RecordingAttemptLogSink(),
-        agent_result=agent_result,
-        git_results=_safe_pair(),
-        clock=SteppingClock(start=NOW),
+    orchestrator, _run_store, _agent_runner, _git_safety, _opencode_preflight = (
+        _orchestrator(
+            call_log=[],
+            sink=RecordingAttemptLogSink(),
+            agent_result=agent_result,
+            git_results=_safe_pair(),
+            clock=SteppingClock(start=NOW),
+        )
     )
 
     result = orchestrator.run_logical_invocation(
@@ -1462,17 +1659,19 @@ def test_precedence_never_reads_terminal_response_once_timeout_forbids_it() -> N
 def test_multiple_attempts_accumulate_as_distinct_records_never_overwritten() -> None:
     call_log: list[str] = []
     workspace = _workspace()
-    orchestrator, run_store, agent_runner, _git_safety = _orchestrator(
-        call_log=call_log,
-        sink=RecordingAttemptLogSink(),
-        agent_result=_agent_result(
-            role=AgentRole.ARCHITECT,
-            review_cycle=None,
-            provider_attempt=1,
-            terminal_response=_success_response(AgentRole.ARCHITECT),
-        ),
-        git_results=[*_safe_pair(), *_safe_pair()],
-        clock=SteppingClock(start=NOW),
+    orchestrator, run_store, agent_runner, _git_safety, _opencode_preflight = (
+        _orchestrator(
+            call_log=call_log,
+            sink=RecordingAttemptLogSink(),
+            agent_result=_agent_result(
+                role=AgentRole.ARCHITECT,
+                review_cycle=None,
+                provider_attempt=1,
+                terminal_response=_success_response(AgentRole.ARCHITECT),
+            ),
+            git_results=[*_safe_pair(), *_safe_pair()],
+            clock=SteppingClock(start=NOW),
+        )
     )
 
     orchestrator.run_logical_invocation(
@@ -1511,17 +1710,19 @@ def test_multiple_attempts_accumulate_as_distinct_records_never_overwritten() ->
 
 def test_run_logical_invocation_never_persists_the_raw_prompt() -> None:
     secret_prompt = "SECRET-PROMPT-CONTENTS-42"
-    orchestrator, run_store, _agent_runner, _git_safety = _orchestrator(
-        call_log=[],
-        sink=RecordingAttemptLogSink(),
-        agent_result=_agent_result(
-            role=AgentRole.CODER,
-            review_cycle=1,
-            provider_attempt=1,
-            terminal_response=_success_response(AgentRole.CODER),
-        ),
-        git_results=_safe_pair(),
-        clock=SteppingClock(start=NOW),
+    orchestrator, run_store, _agent_runner, _git_safety, _opencode_preflight = (
+        _orchestrator(
+            call_log=[],
+            sink=RecordingAttemptLogSink(),
+            agent_result=_agent_result(
+                role=AgentRole.CODER,
+                review_cycle=1,
+                provider_attempt=1,
+                terminal_response=_success_response(AgentRole.CODER),
+            ),
+            git_results=_safe_pair(),
+            clock=SteppingClock(start=NOW),
+        )
     )
 
     orchestrator.run_logical_invocation(
@@ -1542,18 +1743,20 @@ def test_run_logical_invocation_never_persists_the_raw_prompt() -> None:
 
 def test_a_persist_failure_raises_and_blocks_the_next_invocation() -> None:
     call_log: list[str] = []
-    orchestrator, run_store, agent_runner, _git_safety = _orchestrator(
-        call_log=call_log,
-        sink=RecordingAttemptLogSink(),
-        agent_result=_agent_result(
-            role=AgentRole.CODER,
-            review_cycle=1,
-            provider_attempt=1,
-            terminal_response=_success_response(AgentRole.CODER),
-        ),
-        git_results=_safe_pair(),
-        clock=SteppingClock(start=NOW),
-        persist_results=[PersistenceStatus.FAILED],
+    orchestrator, run_store, agent_runner, _git_safety, _opencode_preflight = (
+        _orchestrator(
+            call_log=call_log,
+            sink=RecordingAttemptLogSink(),
+            agent_result=_agent_result(
+                role=AgentRole.CODER,
+                review_cycle=1,
+                provider_attempt=1,
+                terminal_response=_success_response(AgentRole.CODER),
+            ),
+            git_results=_safe_pair(),
+            clock=SteppingClock(start=NOW),
+            persist_results=[PersistenceStatus.FAILED],
+        )
     )
 
     with pytest.raises(LoggingError, match="persist"):
@@ -1584,15 +1787,17 @@ def test_a_persist_failure_raises_and_blocks_the_next_invocation() -> None:
 
 
 def test_a_sink_open_failure_raises_and_blocks_the_next_invocation() -> None:
-    orchestrator, _run_store, agent_runner, git_safety = _orchestrator(
-        call_log=[],
-        sink=RecordingAttemptLogSink(),
-        agent_result=_agent_result(
-            role=AgentRole.CODER, review_cycle=1, provider_attempt=1
-        ),
-        git_results=[],
-        clock=SteppingClock(start=NOW),
-        fail_open=True,
+    orchestrator, _run_store, agent_runner, git_safety, _opencode_preflight = (
+        _orchestrator(
+            call_log=[],
+            sink=RecordingAttemptLogSink(),
+            agent_result=_agent_result(
+                role=AgentRole.CODER, review_cycle=1, provider_attempt=1
+            ),
+            git_results=[],
+            clock=SteppingClock(start=NOW),
+            fail_open=True,
+        )
     )
 
     with pytest.raises(LoggingError):
@@ -1623,14 +1828,16 @@ def test_a_sink_open_failure_raises_and_blocks_the_next_invocation() -> None:
 def test_request_cancellation_blocks_a_subsequent_invocation_before_it_starts() -> None:
     """The "prima" (idle) cancellation case: no port is touched at all."""
 
-    orchestrator, run_store, agent_runner, git_safety = _orchestrator(
-        call_log=[],
-        sink=RecordingAttemptLogSink(),
-        agent_result=_agent_result(
-            role=AgentRole.CODER, review_cycle=1, provider_attempt=1
-        ),
-        git_results=[],
-        clock=SteppingClock(start=NOW),
+    orchestrator, run_store, agent_runner, git_safety, _opencode_preflight = (
+        _orchestrator(
+            call_log=[],
+            sink=RecordingAttemptLogSink(),
+            agent_result=_agent_result(
+                role=AgentRole.CODER, review_cycle=1, provider_attempt=1
+            ),
+            git_results=[],
+            clock=SteppingClock(start=NOW),
+        )
     )
 
     orchestrator.request_cancellation()
@@ -1661,12 +1868,14 @@ def test_an_interrupted_process_outcome_blocks_the_next_invocation() -> None:
         provider_attempt=1,
         process=_agent_process_result(outcome=RunOutcome.INTERRUPTED, return_code=None),
     )
-    orchestrator, run_store, _agent_runner, _git_safety = _orchestrator(
-        call_log=[],
-        sink=RecordingAttemptLogSink(),
-        agent_result=agent_result,
-        git_results=_safe_pair(),
-        clock=SteppingClock(start=NOW),
+    orchestrator, run_store, _agent_runner, _git_safety, _opencode_preflight = (
+        _orchestrator(
+            call_log=[],
+            sink=RecordingAttemptLogSink(),
+            agent_result=agent_result,
+            git_results=_safe_pair(),
+            clock=SteppingClock(start=NOW),
+        )
     )
 
     result = orchestrator.run_logical_invocation(
@@ -1718,6 +1927,8 @@ def test_cancellation_requested_during_the_attempt_suppresses_an_otherwise_autho
         agent_runner=cancelling_runner,
         run_store=run_store,
         git_safety=git_safety,
+        opencode_preflight=RecordingOpenCodePreflightPort(call_log),
+        control_plane_digest=CONTROL_PLANE_DIGEST,
         clock=SteppingClock(start=NOW),
         sleeper=RecordingSleeper(),
         provider_retry=_provider_retry_config(),
@@ -1763,11 +1974,14 @@ def test_run_provider_attempts_retries_a_trusted_error_then_recovers() -> None:
         [], [*_safe_pair_unchanged(), *_safe_pair_unchanged()]
     )
     agent_runner = QueuedAgentRunner([first_attempt, second_attempt])
+    opencode_preflight = RecordingOpenCodePreflightPort([])
     orchestrator = IssueOrchestrator(
         initial_record=_initial_record(run_id="run-001", target=_target()),
         agent_runner=agent_runner,
         run_store=run_store,
         git_safety=git_safety,
+        opencode_preflight=opencode_preflight,
+        control_plane_digest=CONTROL_PLANE_DIGEST,
         clock=SteppingClock(start=NOW),
         sleeper=sleeper,
         provider_retry=_provider_retry_config(),
@@ -1789,6 +2003,18 @@ def test_run_provider_attempts_retries_a_trusted_error_then_recovers() -> None:
     assert results[1].retry_decision.should_retry is False
     assert len(run_store.persist_calls) == 2
 
+    # The control-plane digest is rechecked once per provider attempt --
+    # including the retry -- always against the same, never-recomputed
+    # digest `verify` originally returned (System Design SS18.2; ADR-005).
+    # `verify()` itself is never called here: this fake raises if it ever
+    # is (see `RecordingOpenCodePreflightPort.verify`), so the retry loop
+    # completing at all already proves it stayed uncalled across both
+    # attempts -- `verify()` is `bootstrap_run`'s (M13-01) sole concern.
+    assert opencode_preflight.recheck_calls == [
+        CONTROL_PLANE_DIGEST,
+        CONTROL_PLANE_DIGEST,
+    ]
+
     # source/signature stay intact on the persisted attempt that carried them.
     first_persisted_attempt = run_store.persist_calls[0].attempts[0]
     assert first_persisted_attempt.agent_result.provider_diagnostic is not None
@@ -1808,19 +2034,21 @@ def test_run_provider_attempts_does_not_retry_an_untrusted_lookalike_diagnostic(
     marked retryable, so no retry is authorized."""
 
     sleeper = RecordingSleeper()
-    orchestrator, _run_store, agent_runner, _git_safety = _orchestrator(
-        call_log=[],
-        sink=RecordingAttemptLogSink(),
-        agent_result=_agent_result(
-            role=AgentRole.CODER,
-            review_cycle=1,
-            provider_attempt=1,
-            outcome=RunOutcome.PROVIDER_ERROR,
-            provider_diagnostic=_provider_diagnostic(retryable=False),
-        ),
-        git_results=_safe_pair_unchanged(),
-        clock=SteppingClock(start=NOW),
-        sleeper=sleeper,
+    orchestrator, _run_store, agent_runner, _git_safety, _opencode_preflight = (
+        _orchestrator(
+            call_log=[],
+            sink=RecordingAttemptLogSink(),
+            agent_result=_agent_result(
+                role=AgentRole.CODER,
+                review_cycle=1,
+                provider_attempt=1,
+                outcome=RunOutcome.PROVIDER_ERROR,
+                provider_diagnostic=_provider_diagnostic(retryable=False),
+            ),
+            git_results=_safe_pair_unchanged(),
+            clock=SteppingClock(start=NOW),
+            sleeper=sleeper,
+        )
     )
 
     results = orchestrator.run_provider_attempts(
@@ -1847,24 +2075,26 @@ def test_run_provider_attempts_stops_after_unconfirmed_termination() -> None:
     join as its own, separate retry guard."""
 
     sleeper = RecordingSleeper()
-    orchestrator, _run_store, agent_runner, _git_safety = _orchestrator(
-        call_log=[],
-        sink=RecordingAttemptLogSink(),
-        agent_result=_agent_result(
-            role=AgentRole.CODER,
-            review_cycle=1,
-            provider_attempt=1,
-            outcome=RunOutcome.PROVIDER_ERROR,
-            provider_diagnostic=_provider_diagnostic(retryable=True),
-            process=_agent_process_result(
-                outcome=RunOutcome.PROCESS_ERROR,
-                return_code=1,
-                termination_confirmed=False,
+    orchestrator, _run_store, agent_runner, _git_safety, _opencode_preflight = (
+        _orchestrator(
+            call_log=[],
+            sink=RecordingAttemptLogSink(),
+            agent_result=_agent_result(
+                role=AgentRole.CODER,
+                review_cycle=1,
+                provider_attempt=1,
+                outcome=RunOutcome.PROVIDER_ERROR,
+                provider_diagnostic=_provider_diagnostic(retryable=True),
+                process=_agent_process_result(
+                    outcome=RunOutcome.PROCESS_ERROR,
+                    return_code=1,
+                    termination_confirmed=False,
+                ),
             ),
-        ),
-        git_results=_safe_pair_unchanged(),
-        clock=SteppingClock(start=NOW),
-        sleeper=sleeper,
+            git_results=_safe_pair_unchanged(),
+            clock=SteppingClock(start=NOW),
+            sleeper=sleeper,
+        )
     )
 
     results = orchestrator.run_provider_attempts(
@@ -1894,19 +2124,21 @@ def test_run_provider_attempts_stops_after_an_unsafe_git_after() -> None:
             state=_git_state(fingerprint="fp-unchanged"),
         ),
     ]
-    orchestrator, _run_store, agent_runner, _git_safety = _orchestrator(
-        call_log=[],
-        sink=RecordingAttemptLogSink(),
-        agent_result=_agent_result(
-            role=AgentRole.CODER,
-            review_cycle=1,
-            provider_attempt=1,
-            outcome=RunOutcome.PROVIDER_ERROR,
-            provider_diagnostic=_provider_diagnostic(retryable=True),
-        ),
-        git_results=unsafe_after_pair,
-        clock=SteppingClock(start=NOW),
-        sleeper=sleeper,
+    orchestrator, _run_store, agent_runner, _git_safety, _opencode_preflight = (
+        _orchestrator(
+            call_log=[],
+            sink=RecordingAttemptLogSink(),
+            agent_result=_agent_result(
+                role=AgentRole.CODER,
+                review_cycle=1,
+                provider_attempt=1,
+                outcome=RunOutcome.PROVIDER_ERROR,
+                provider_diagnostic=_provider_diagnostic(retryable=True),
+            ),
+            git_results=unsafe_after_pair,
+            clock=SteppingClock(start=NOW),
+            sleeper=sleeper,
+        )
     )
 
     results = orchestrator.run_provider_attempts(
@@ -1930,19 +2162,21 @@ def test_run_provider_attempts_stops_and_preserves_output_on_a_coder_mutation() 
     attempt overwrite the coder's own partial work."""
 
     sleeper = RecordingSleeper()
-    orchestrator, _run_store, agent_runner, _git_safety = _orchestrator(
-        call_log=[],
-        sink=RecordingAttemptLogSink(),
-        agent_result=_agent_result(
-            role=AgentRole.CODER,
-            review_cycle=1,
-            provider_attempt=1,
-            outcome=RunOutcome.PROVIDER_ERROR,
-            provider_diagnostic=_provider_diagnostic(retryable=True),
-        ),
-        git_results=_safe_pair(),  # before/after fingerprints differ
-        clock=SteppingClock(start=NOW),
-        sleeper=sleeper,
+    orchestrator, _run_store, agent_runner, _git_safety, _opencode_preflight = (
+        _orchestrator(
+            call_log=[],
+            sink=RecordingAttemptLogSink(),
+            agent_result=_agent_result(
+                role=AgentRole.CODER,
+                review_cycle=1,
+                provider_attempt=1,
+                outcome=RunOutcome.PROVIDER_ERROR,
+                provider_diagnostic=_provider_diagnostic(retryable=True),
+            ),
+            git_results=_safe_pair(),  # before/after fingerprints differ
+            clock=SteppingClock(start=NOW),
+            sleeper=sleeper,
+        )
     )
 
     results = orchestrator.run_provider_attempts(
@@ -1987,11 +2221,14 @@ def test_run_provider_attempts_exhausts_the_budget_without_touching_review_cycle
         [*_safe_pair_unchanged(), *_safe_pair_unchanged(), *_safe_pair_unchanged()],
     )
     agent_runner = QueuedAgentRunner(agent_results)
+    opencode_preflight = RecordingOpenCodePreflightPort([])
     orchestrator = IssueOrchestrator(
         initial_record=_initial_record(run_id="run-001", target=_target()),
         agent_runner=agent_runner,
         run_store=run_store,
         git_safety=git_safety,
+        opencode_preflight=opencode_preflight,
+        control_plane_digest=CONTROL_PLANE_DIGEST,
         clock=SteppingClock(start=NOW),
         sleeper=sleeper,
         provider_retry=config,
@@ -2013,6 +2250,10 @@ def test_run_provider_attempts_exhausts_the_budget_without_touching_review_cycle
     assert results[-1].precedence is not None
     assert results[-1].precedence.outcome is RunOutcome.PROVIDER_ERROR
     assert len(run_store.persist_calls) == 3
+
+    # Rechecked once per attempt -- three attempts, three rechecks, every
+    # one against the exact same digest (never recomputed mid-run).
+    assert opencode_preflight.recheck_calls == [CONTROL_PLANE_DIGEST] * 3
 
 
 def test_run_provider_attempts_uses_the_exact_capped_backoff_delay() -> None:
@@ -2042,6 +2283,8 @@ def test_run_provider_attempts_uses_the_exact_capped_backoff_delay() -> None:
         agent_runner=agent_runner,
         run_store=run_store,
         git_safety=git_safety,
+        opencode_preflight=RecordingOpenCodePreflightPort([]),
+        control_plane_digest=CONTROL_PLANE_DIGEST,
         clock=SteppingClock(start=NOW),
         sleeper=sleeper,
         provider_retry=config,
@@ -2060,20 +2303,22 @@ def test_run_provider_attempts_uses_the_exact_capped_backoff_delay() -> None:
 
 def test_run_provider_attempts_raises_and_never_sleeps_on_a_persist_failure() -> None:
     sleeper = RecordingSleeper()
-    orchestrator, run_store, agent_runner, _git_safety = _orchestrator(
-        call_log=[],
-        sink=RecordingAttemptLogSink(),
-        agent_result=_agent_result(
-            role=AgentRole.CODER,
-            review_cycle=1,
-            provider_attempt=1,
-            outcome=RunOutcome.PROVIDER_ERROR,
-            provider_diagnostic=_provider_diagnostic(retryable=True),
-        ),
-        git_results=_safe_pair_unchanged(),
-        clock=SteppingClock(start=NOW),
-        sleeper=sleeper,
-        persist_results=[PersistenceStatus.FAILED],
+    orchestrator, run_store, agent_runner, _git_safety, _opencode_preflight = (
+        _orchestrator(
+            call_log=[],
+            sink=RecordingAttemptLogSink(),
+            agent_result=_agent_result(
+                role=AgentRole.CODER,
+                review_cycle=1,
+                provider_attempt=1,
+                outcome=RunOutcome.PROVIDER_ERROR,
+                provider_diagnostic=_provider_diagnostic(retryable=True),
+            ),
+            git_results=_safe_pair_unchanged(),
+            clock=SteppingClock(start=NOW),
+            sleeper=sleeper,
+            persist_results=[PersistenceStatus.FAILED],
+        )
     )
 
     with pytest.raises(LoggingError):
@@ -2111,6 +2356,8 @@ def test_run_provider_attempts_stops_after_cancellation_observed_mid_attempt() -
         agent_runner=cancelling_runner,
         run_store=run_store,
         git_safety=git_safety,
+        opencode_preflight=RecordingOpenCodePreflightPort(call_log),
+        control_plane_digest=CONTROL_PLANE_DIGEST,
         clock=SteppingClock(start=NOW),
         sleeper=sleeper,
         provider_retry=_provider_retry_config(),
@@ -2143,6 +2390,7 @@ def test_logical_invocation_result_requires_matching_phase_for_role() -> None:
             state=mismatched_state,
             provider_attempt=1,
             git_before=_git_check(sequence=0, purpose="before"),
+            control_plane_error=None,
             agent_result=_agent_result(
                 role=AgentRole.ARCHITECT, review_cycle=None, provider_attempt=1
             ),
@@ -2174,6 +2422,7 @@ def test_logical_invocation_result_requires_a_blocked_result_to_have_no_agent_da
             state=_pipeline_state(role=AgentRole.CODER, review_cycle=1),
             provider_attempt=1,
             git_before=unsafe_before,
+            control_plane_error=None,
             agent_result=_agent_result(
                 role=AgentRole.CODER, review_cycle=1, provider_attempt=1
             ),
@@ -2203,6 +2452,7 @@ def test_logical_invocation_result_requires_a_blocked_result_to_have_no_retry_de
             state=_pipeline_state(role=AgentRole.CODER, review_cycle=1),
             provider_attempt=1,
             git_before=unsafe_before,
+            control_plane_error=None,
             agent_result=None,
             git_after=None,
             precedence=None,
@@ -2228,6 +2478,7 @@ def test_logical_invocation_result_requires_an_unblocked_result_to_have_agent_da
             state=_pipeline_state(role=AgentRole.CODER, review_cycle=1),
             provider_attempt=1,
             git_before=safe_before,
+            control_plane_error=None,
             agent_result=None,
             git_after=None,
             precedence=None,
@@ -2253,6 +2504,7 @@ def test_logical_invocation_result_requires_an_unblocked_result_to_have_a_retry_
             state=_pipeline_state(role=AgentRole.CODER, review_cycle=1),
             provider_attempt=1,
             git_before=safe_before,
+            control_plane_error=None,
             agent_result=_agent_result(
                 role=AgentRole.CODER, review_cycle=1, provider_attempt=1
             ),
@@ -2279,6 +2531,7 @@ def test_logical_invocation_result_requires_agent_result_role_to_match() -> None
             state=_pipeline_state(role=AgentRole.CODER, review_cycle=1),
             provider_attempt=1,
             git_before=_git_check(sequence=0, purpose="before"),
+            control_plane_error=None,
             agent_result=_agent_result(
                 role=AgentRole.REVIEWER, review_cycle=1, provider_attempt=1
             ),
@@ -2305,6 +2558,7 @@ def test_logical_invocation_result_rejects_empty_events() -> None:
             state=_pipeline_state(role=AgentRole.CODER, review_cycle=1),
             provider_attempt=1,
             git_before=_git_check(sequence=0, purpose="before"),
+            control_plane_error=None,
             agent_result=_agent_result(
                 role=AgentRole.CODER, review_cycle=1, provider_attempt=1
             ),
@@ -2325,6 +2579,7 @@ def test_logical_invocation_result_rejects_non_sequential_events() -> None:
             state=_pipeline_state(role=AgentRole.CODER, review_cycle=1),
             provider_attempt=1,
             git_before=_git_check(sequence=0, purpose="before"),
+            control_plane_error=None,
             agent_result=_agent_result(
                 role=AgentRole.CODER, review_cycle=1, provider_attempt=1
             ),
@@ -2365,6 +2620,7 @@ def test_logical_invocation_result_keeps_git_and_technical_dimensions_orthogonal
         state=_pipeline_state(role=AgentRole.CODER, review_cycle=1),
         provider_attempt=1,
         git_before=_git_check(sequence=0, purpose="before"),
+        control_plane_error=None,
         agent_result=agent_result,
         git_after=unsafe_after,
         precedence=AttemptPrecedence(

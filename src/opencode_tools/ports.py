@@ -181,6 +181,44 @@ class IssueResolver(Protocol):
         ...
 
 
+class OpenCodePreflightPort(Protocol):
+    """Proves OpenCode's exact-version compatibility once per run, ahead of
+    any agent role invocation, and lets every later provider attempt
+    reconfirm the same control plane immediately before it spawns (System
+    Design SS10.4/SS18.2; ADR-005).
+
+    Mirrors `IssueResolver`'s own shape: the concrete adapter resolves its
+    own executable and timeouts at construction and keeps every other
+    diagnostic fact (the parsed version, the raw `debug` evidence) behind
+    its own boundary. The canonical control-plane digest `verify` returns
+    is the one exception -- it must cross into the caller, because
+    `recheck` needs it back to prove nothing has drifted since.
+    """
+
+    def verify(self) -> str:
+        """Verify the exact candidate version, `run` capability, and every
+        primary role's effective agent configuration, and return the
+        canonical control-plane digest -- in that order, exactly once,
+        before any agent role can ever be invoked. Raises `PreflightError`
+        on any unmet fact (an unexpected version, a missing capability, or
+        a rejected/mismatched agent); never retried and never silently
+        downgraded.
+        """
+        ...
+
+    def recheck(self, expected_digest: str) -> None:
+        """Reconfirm the control plane still matches `expected_digest`
+        immediately before spawning the next `opencode run` -- called once
+        per provider attempt, including every retry, always with the same
+        digest `verify` originally returned. Any drift -- including a
+        failure that prevents recomputing the digest at all -- raises
+        `ProtocolError`, blocking that attempt's own spawn; never silently
+        accepted, never downgraded back to `PreflightError` (ADR-005;
+        System Design SS18.2).
+        """
+        ...
+
+
 class RunStorePort(Protocol):
     """Runtime artifact layout, attempt sinks, and atomic `run.json` writes."""
 
@@ -275,6 +313,7 @@ __all__ = (
     "GitSafetyPort",
     "IssueResolver",
     "LogChannel",
+    "OpenCodePreflightPort",
     "ProcessRunner",
     "RunStorePort",
     "Sleeper",
