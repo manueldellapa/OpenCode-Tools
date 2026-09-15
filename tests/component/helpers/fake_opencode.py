@@ -37,6 +37,20 @@ scenario:
 Any call for which the relevant environment variable is unset prints
 nothing on stdout and exits 0, which is a valid "empty" default for tests
 that only care about a different call in the same sequence.
+
+For a scenario that drives more than one logical invocation across
+different agents (architect, then coder, then reviewer -- one `run`/
+`export` pair per role), each new process only sees the same static
+`FAKE_OPENCODE_RUN_OUTPUT_FILE`/`FAKE_OPENCODE_EXPORT_FILE`. Two optional,
+additive variables let a test serve a distinct file per call instead,
+without disturbing any scenario that only ever sets the static ones:
+
+- `FAKE_OPENCODE_RUN_OUTPUT_FILES`/`FAKE_OPENCODE_EXPORT_FILES`: an
+  `os.pathsep`-joined list consumed one entry per successive `run`/
+  `export` call (the last entry repeats once exhausted).
+- `FAKE_OPENCODE_RUN_OUTPUT_INDEX_FILE`/`FAKE_OPENCODE_EXPORT_INDEX_FILE`:
+  a scratch file this process uses to remember which entry is next, since
+  each call is a fresh process with no other shared state.
 """
 
 from __future__ import annotations
@@ -62,6 +76,26 @@ def _echo_file(path: str) -> None:
         sys.stdout.buffer.write(source.read())
 
 
+def _next_sequential_file(
+    *, list_env: str, index_env: str, fallback_env: str
+) -> str | None:
+    files_raw = os.environ.get(list_env)
+    if not files_raw:
+        return os.environ.get(fallback_env)
+
+    files = files_raw.split(os.pathsep)
+    index_path = os.environ.get(index_env)
+    index = 0
+    if index_path and os.path.exists(index_path):
+        with open(index_path, encoding="utf-8") as index_file:
+            index = int(index_file.read().strip() or "0")
+    if index_path:
+        with open(index_path, "w", encoding="utf-8") as index_file:
+            index_file.write(str(index + 1))
+
+    return files[min(index, len(files) - 1)]
+
+
 def main(argv: list[str]) -> int:
     _log_call(argv)
     sys.stdin.buffer.read()
@@ -83,11 +117,19 @@ def main(argv: list[str]) -> int:
         if agent_file:
             _echo_file(agent_file)
     elif argv and argv[0] == "run":
-        run_file = os.environ.get("FAKE_OPENCODE_RUN_OUTPUT_FILE")
+        run_file = _next_sequential_file(
+            list_env="FAKE_OPENCODE_RUN_OUTPUT_FILES",
+            index_env="FAKE_OPENCODE_RUN_OUTPUT_INDEX_FILE",
+            fallback_env="FAKE_OPENCODE_RUN_OUTPUT_FILE",
+        )
         if run_file:
             _echo_file(run_file)
     elif len(argv) == 3 and argv[0] == "export" and argv[2] == "--sanitize":
-        export_file = os.environ.get("FAKE_OPENCODE_EXPORT_FILE")
+        export_file = _next_sequential_file(
+            list_env="FAKE_OPENCODE_EXPORT_FILES",
+            index_env="FAKE_OPENCODE_EXPORT_INDEX_FILE",
+            fallback_env="FAKE_OPENCODE_EXPORT_FILE",
+        )
         if export_file:
             _echo_file(export_file)
 
