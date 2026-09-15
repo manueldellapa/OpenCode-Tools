@@ -33,6 +33,19 @@ A version only moves from *candidate* to *supported* after:
 3. the exact-version registry is updated to enable `1.17.18` as a supported
    runtime version.
 
+Step 1 is done: the CLI command (M14, see [`README.md`](../README.md))
+wires this adapter into `opencode_tools.cli.main` end to end -- composition
+root, pipeline
+execution, and terminal rendering are all implemented and covered by
+`tests/unit/test_cli.py` and `tests/component/test_cli_end_to_end.py`,
+including a full architect/coder/reviewer run against faked `opencode` and
+`gh` processes. None of that substitutes for step 2: every test that
+exercises the command does so against fixtures or a fake `opencode`
+executable, never a real, running OpenCode process, so it proves the
+command's own wiring and rendering, not OpenCode `1.17.18` compatibility.
+Steps 2 and 3 (M15-02, M15-03) are still open and are not blocked by, or
+required for, any milestone before M15.
+
 Until all three steps pass, the preflight in ADR-005 accepts no versions at
 all: there is no fallback to "best effort," to a nearby version, or to a
 default agent. If the identity proof or the smoke test ever fails for
@@ -62,3 +75,15 @@ with Python 3.13+, Git, the GitHub CLI, and a qualified OpenCode version all
 resolvable from `PATH`. Windows native and Windows-mounted WSL filesystems
 are not supported; an experimental WSL setup on a Linux filesystem does not
 by itself satisfy the v0.1 acceptance criteria.
+
+No macOS/Linux compatibility matrix (specific OS versions, architectures)
+has been run yet; this document will record one, with dates and smoke
+results, once M15-03 actually runs it. Until then, "should work on
+macOS/Linux" is not the same claim as "verified."
+
+## See also
+
+- [`README.md`](../README.md) -- the command this compatibility baseline
+  applies to.
+- [`docs/security-and-privacy.md`](security-and-privacy.md) -- what a real
+  OpenCode/provider run would see and log, once qualified.
