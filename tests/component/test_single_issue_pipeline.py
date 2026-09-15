@@ -430,7 +430,7 @@ def _git_probe_result(*, target_root: Path) -> ProcessResult:
 def _git_state(
     *,
     target_root: Path,
-    fingerprint: str,
+    fingerprint: str | None,
     staged: tuple[str, ...] = (),
     unstaged: tuple[str, ...] = (),
     untracked: tuple[str, ...] = (),
@@ -467,7 +467,11 @@ def _git_check(
 
 
 def _agent_process_result(
-    *, workspace_root: Path, outcome: RunOutcome = RunOutcome.SUCCEEDED
+    *,
+    workspace_root: Path,
+    outcome: RunOutcome = RunOutcome.SUCCEEDED,
+    timed_out: bool = False,
+    termination_confirmed: bool = True,
 ) -> ProcessResult:
     return ProcessResult(
         command=("/usr/bin/opencode", "run"),
@@ -476,8 +480,8 @@ def _agent_process_result(
         finished_at=NOW + timedelta(seconds=5),
         duration_ns=5_000_000_000,
         return_code=0 if outcome is RunOutcome.SUCCEEDED else None,
-        timed_out=False,
-        termination_confirmed=True,
+        timed_out=timed_out,
+        termination_confirmed=termination_confirmed,
         log_path=Path("attempt.log"),
         stdout_byte_count=0,
         stdout_sha256="stdout-digest",
@@ -505,6 +509,8 @@ def _agent_result(
     provider_attempt: int = 1,
     process_outcome: RunOutcome = RunOutcome.SUCCEEDED,
     provider_diagnostic: ProviderDiagnostic | None = None,
+    timed_out: bool = False,
+    termination_confirmed: bool = True,
 ) -> AgentResult:
     return AgentResult(
         role=role,
@@ -512,7 +518,10 @@ def _agent_result(
         review_cycle=review_cycle,
         provider_attempt=provider_attempt,
         process=_agent_process_result(
-            workspace_root=workspace_root, outcome=process_outcome
+            workspace_root=workspace_root,
+            outcome=process_outcome,
+            timed_out=timed_out,
+            termination_confirmed=termination_confirmed,
         ),
         terminal_response=terminal_response,
         session_id=(
@@ -601,6 +610,20 @@ def _termination_confirmed(result: IssuePipelineResult) -> bool | None:
     if not confirmed_values:
         return None
     return all(value is True for value in confirmed_values)
+
+
+def _interrupted(result: IssuePipelineResult) -> bool:
+    """Whether any attempt this pipeline ran was itself caught mid-signal
+    (`ProcessResult.outcome is RunOutcome.INTERRUPTED`) -- the raw evidence
+    `_classify_agent_result` folds into `PROCESS_ERROR` for attempt
+    precedence but never discards, and the signal a future composition root
+    would derive `finalize_run`'s own `interrupted` keyword from."""
+
+    return any(
+        attempt.agent_result.process.outcome is RunOutcome.INTERRUPTED
+        for attempt in _all_attempts(result)
+        if attempt.agent_result is not None
+    )
 
 
 def test_the_nominal_path_invokes_architect_coder_and_reviewer_in_canonical_order(
@@ -2508,6 +2531,406 @@ def test_an_architect_provider_error_recovers_on_retry_before_the_coder_runs(
     assert result.action is PipelineAction.ENTER_POSTFLIGHT
 
 
+def test_an_architect_provider_error_exhausts_the_budget_without_reaching_the_coder(
+    tmp_path: Path,
+) -> None:
+    """Provider-error exhaustion works identically for the architect: a
+    trusted, retryable provider error that never recovers exhausts exactly
+    the configured attempt budget, sleeping the exact capped backoff between
+    attempts, and never reaches the coder (System Design SS12.2, "provider
+    recovery/exhaustion per ogni ruolo")."""
+
+    workspace, target = _workspace_and_target(tmp_path)
+    git_baseline = _git_state(target_root=target.root, fingerprint="fp-0")
+    same_fingerprint = _git_state(target_root=target.root, fingerprint="fp-0")
+
+    agent_runner = SequencedAgentRunner(
+        [
+            _agent_result(
+                role=AgentRole.ARCHITECT,
+                review_cycle=None,
+                provider_attempt=attempt,
+                workspace_root=workspace.root,
+                terminal_response=None,
+                provider_diagnostic=_provider_diagnostic(retryable=True),
+            )
+            for attempt in (1, 2, 3)
+        ]
+    )
+    git_checks: list[GitCheckRecord] = []
+    for attempt in (1, 2, 3):
+        git_checks.append(
+            _git_check(
+                target_root=target.root,
+                sequence=len(git_checks),
+                purpose=f"ARCHITECT:0:{attempt}:before",
+                state=same_fingerprint,
+            )
+        )
+        git_checks.append(
+            _git_check(
+                target_root=target.root,
+                sequence=len(git_checks),
+                purpose=f"ARCHITECT:0:{attempt}:after",
+                state=same_fingerprint,
+            )
+        )
+    git_safety = SequencedGitSafetyPort(git_checks)
+    run_store = SequencedRunStorePort()
+    sleeper = RecordingSleeper()
+    orchestrator = _orchestrator(
+        workspace=workspace,
+        target=target,
+        agent_runner=agent_runner,
+        git_safety=git_safety,
+        run_store=run_store,
+        git_baseline=git_baseline,
+        sleeper=sleeper,
+    )
+
+    result = run_issue_pipeline(
+        orchestrator=orchestrator,
+        issue_locator=_issue_locator(),
+        workspace=workspace,
+        target=target,
+        max_review_cycles=MAX_REVIEW_CYCLES,
+    )
+
+    assert [call[0] for call in agent_runner.calls] == [AgentRole.ARCHITECT] * 3
+    assert [call[4] for call in agent_runner.calls] == [1, 2, 3]
+    assert sleeper.calls == [1.0, 2.0]  # capped exponential backoff, no jitter
+    assert len(result.architect) == 3
+    assert result.coder_cycles == ()
+    assert result.reviewer_cycles == ()
+    assert result.action is PipelineAction.ENTER_POSTFLIGHT
+    assert result.outcome is RunOutcome.PROVIDER_ERROR
+
+
+def test_a_reviewer_provider_error_exhausts_the_budget_without_invoking_the_coder_again(
+    tmp_path: Path,
+) -> None:
+    """Provider-error exhaustion works identically for the reviewer: the
+    exhausted retry stays within the reviewer's own logical invocation and
+    never re-invokes the coder (System Design SS12.2, "provider recovery/
+    exhaustion per ogni ruolo")."""
+
+    workspace, target = _workspace_and_target(tmp_path)
+    git_baseline = _git_state(target_root=target.root, fingerprint="fp-0")
+    issue_ref = _issue_ref()
+
+    architect_response = ParsedAgentResponse(
+        role=AgentRole.ARCHITECT,
+        body="plan",
+        agent_status=AgentStatus.READY,
+        issue_ref=issue_ref,
+    )
+    coder_response = ParsedAgentResponse(
+        role=AgentRole.CODER, body="done", agent_status=AgentStatus.COMPLETED
+    )
+    same_fingerprint = _git_state(target_root=target.root, fingerprint="fp-0")
+    coder_after = _git_state(target_root=target.root, fingerprint="fp-2")
+
+    agent_runner = SequencedAgentRunner(
+        [
+            _agent_result(
+                role=AgentRole.ARCHITECT,
+                review_cycle=None,
+                workspace_root=workspace.root,
+                terminal_response=architect_response,
+            ),
+            _agent_result(
+                role=AgentRole.CODER,
+                review_cycle=1,
+                workspace_root=workspace.root,
+                terminal_response=coder_response,
+            ),
+            *(
+                _agent_result(
+                    role=AgentRole.REVIEWER,
+                    review_cycle=1,
+                    provider_attempt=attempt,
+                    workspace_root=workspace.root,
+                    terminal_response=None,
+                    provider_diagnostic=_provider_diagnostic(retryable=True),
+                )
+                for attempt in (1, 2, 3)
+            ),
+        ]
+    )
+    git_checks = [
+        _git_check(
+            target_root=target.root,
+            sequence=0,
+            purpose="ARCHITECT:0:1:before",
+            state=same_fingerprint,
+        ),
+        _git_check(
+            target_root=target.root,
+            sequence=1,
+            purpose="ARCHITECT:0:1:after",
+            state=same_fingerprint,
+        ),
+        _git_check(
+            target_root=target.root,
+            sequence=2,
+            purpose="CODER:1:1:before",
+            state=same_fingerprint,
+        ),
+        _git_check(
+            target_root=target.root,
+            sequence=3,
+            purpose="CODER:1:1:after",
+            state=coder_after,
+        ),
+    ]
+    for attempt in (1, 2, 3):
+        git_checks.append(
+            _git_check(
+                target_root=target.root,
+                sequence=len(git_checks),
+                purpose=f"REVIEWER:1:{attempt}:before",
+                state=coder_after,
+            )
+        )
+        git_checks.append(
+            _git_check(
+                target_root=target.root,
+                sequence=len(git_checks),
+                purpose=f"REVIEWER:1:{attempt}:after",
+                state=coder_after,
+            )
+        )
+    git_safety = SequencedGitSafetyPort(git_checks)
+    run_store = SequencedRunStorePort()
+    sleeper = RecordingSleeper()
+    orchestrator = _orchestrator(
+        workspace=workspace,
+        target=target,
+        agent_runner=agent_runner,
+        git_safety=git_safety,
+        run_store=run_store,
+        git_baseline=git_baseline,
+        sleeper=sleeper,
+    )
+
+    result = run_issue_pipeline(
+        orchestrator=orchestrator,
+        issue_locator=_issue_locator(),
+        workspace=workspace,
+        target=target,
+        max_review_cycles=MAX_REVIEW_CYCLES,
+    )
+
+    assert [call[0] for call in agent_runner.calls] == [
+        AgentRole.ARCHITECT,
+        AgentRole.CODER,
+        AgentRole.REVIEWER,
+        AgentRole.REVIEWER,
+        AgentRole.REVIEWER,
+    ]
+    assert [call[4] for call in agent_runner.calls] == [1, 1, 1, 2, 3]
+    assert sleeper.calls == [1.0, 2.0]  # capped exponential backoff, no jitter
+    assert len(result.coder_cycles) == 1  # the coder was never invoked twice
+    assert len(result.reviewer_cycles) == 1
+    assert len(result.reviewer_cycles[0]) == 3
+    assert result.action is PipelineAction.ENTER_POSTFLIGHT
+    assert result.outcome is RunOutcome.PROVIDER_ERROR
+
+
+def test_a_timed_out_attempt_is_never_retried_and_reports_the_timeout_outcome(
+    tmp_path: Path,
+) -> None:
+    """`TIMEOUT` outranks every other attempt signal (System Design SS13.2)
+    and, unlike a provider error, is never retried regardless of budget --
+    a single attempt exhausts the whole logical invocation."""
+
+    workspace, target = _workspace_and_target(tmp_path)
+    git_baseline = _git_state(target_root=target.root, fingerprint="fp-0")
+    same_fingerprint = _git_state(target_root=target.root, fingerprint="fp-0")
+
+    agent_runner = SequencedAgentRunner(
+        [
+            _agent_result(
+                role=AgentRole.ARCHITECT,
+                review_cycle=None,
+                workspace_root=workspace.root,
+                terminal_response=None,
+                process_outcome=RunOutcome.TIMEOUT,
+                timed_out=True,
+            )
+        ]
+    )
+    git_safety = SequencedGitSafetyPort(
+        [
+            _git_check(
+                target_root=target.root,
+                sequence=0,
+                purpose="ARCHITECT:0:1:before",
+                state=same_fingerprint,
+            ),
+            _git_check(
+                target_root=target.root,
+                sequence=1,
+                purpose="ARCHITECT:0:1:after",
+                state=same_fingerprint,
+            ),
+        ]
+    )
+    run_store = SequencedRunStorePort()
+    sleeper = RecordingSleeper()
+    orchestrator = _orchestrator(
+        workspace=workspace,
+        target=target,
+        agent_runner=agent_runner,
+        git_safety=git_safety,
+        run_store=run_store,
+        git_baseline=git_baseline,
+        sleeper=sleeper,
+    )
+
+    result = run_issue_pipeline(
+        orchestrator=orchestrator,
+        issue_locator=_issue_locator(),
+        workspace=workspace,
+        target=target,
+        max_review_cycles=MAX_REVIEW_CYCLES,
+    )
+
+    assert [call[0] for call in agent_runner.calls] == [AgentRole.ARCHITECT]
+    assert sleeper.calls == []  # never retried, so never slept either
+    assert len(result.architect) == 1
+    assert result.architect[0].precedence is not None
+    assert result.architect[0].precedence.outcome is RunOutcome.TIMEOUT
+    assert result.coder_cycles == ()
+    assert result.outcome is RunOutcome.TIMEOUT
+
+
+def test_an_interrupted_attempt_halts_the_pipeline_and_outranks_the_folded_trigger_at_finalization(
+    tmp_path: Path,
+) -> None:
+    """A child caught by SIGINT/SIGTERM mid-attempt (`ProcessResult.outcome
+    is RunOutcome.INTERRUPTED`) is folded into the same technical
+    `PROCESS_ERROR` attempt precedence as any other process failure (never
+    retried), but the raw evidence survives on the persisted attempt and, at
+    finalization, `resolve_terminal_outcome`'s own `INTERRUPTED` precedence
+    still outranks that folded technical trigger -- exactly the composed,
+    end-to-end version of the interrupt scenario System Design SS13.3
+    guarantees only in isolation elsewhere."""
+
+    workspace, target = _workspace_and_target(tmp_path)
+    git_baseline = _git_state(target_root=target.root, fingerprint="fp-0")
+    issue_ref = _issue_ref()
+    same_fingerprint = _git_state(target_root=target.root, fingerprint="fp-0")
+
+    architect_response = ParsedAgentResponse(
+        role=AgentRole.ARCHITECT,
+        body="plan",
+        agent_status=AgentStatus.READY,
+        issue_ref=issue_ref,
+    )
+    agent_runner = SequencedAgentRunner(
+        [
+            _agent_result(
+                role=AgentRole.ARCHITECT,
+                review_cycle=None,
+                workspace_root=workspace.root,
+                terminal_response=architect_response,
+            ),
+            _agent_result(
+                role=AgentRole.CODER,
+                review_cycle=1,
+                workspace_root=workspace.root,
+                terminal_response=None,
+                process_outcome=RunOutcome.INTERRUPTED,
+            ),
+        ]
+    )
+    git_safety = SequencedGitSafetyPort(
+        [
+            _git_check(
+                target_root=target.root,
+                sequence=0,
+                purpose="ARCHITECT:0:1:before",
+                state=same_fingerprint,
+            ),
+            _git_check(
+                target_root=target.root,
+                sequence=1,
+                purpose="ARCHITECT:0:1:after",
+                state=same_fingerprint,
+            ),
+            _git_check(
+                target_root=target.root,
+                sequence=2,
+                purpose="CODER:1:1:before",
+                state=same_fingerprint,
+            ),
+            _git_check(
+                target_root=target.root,
+                sequence=3,
+                purpose="CODER:1:1:after",
+                state=same_fingerprint,
+            ),
+            _git_check(
+                target_root=target.root,
+                sequence=4,
+                purpose="postflight",
+                state=same_fingerprint,
+            ),
+        ]
+    )
+    run_store = SequencedRunStorePort()
+    lease = RecordingTargetLease()
+    sleeper = RecordingSleeper()
+    orchestrator = _orchestrator(
+        workspace=workspace,
+        target=target,
+        agent_runner=agent_runner,
+        git_safety=git_safety,
+        run_store=run_store,
+        git_baseline=git_baseline,
+        sleeper=sleeper,
+    )
+
+    result = run_issue_pipeline(
+        orchestrator=orchestrator,
+        issue_locator=_issue_locator(),
+        workspace=workspace,
+        target=target,
+        max_review_cycles=MAX_REVIEW_CYCLES,
+    )
+
+    assert [call[0] for call in agent_runner.calls] == [
+        AgentRole.ARCHITECT,
+        AgentRole.CODER,
+    ]
+    assert sleeper.calls == []  # never retried
+    assert result.reviewer_cycles == ()  # the reviewer never ran
+    assert _interrupted(result) is True
+    assert _trigger_outcome(result) is RunOutcome.PROCESS_ERROR  # folded, undiscarded
+
+    issue_result = finalize_run(
+        record=orchestrator.record,
+        target=target,
+        trigger_outcome=_trigger_outcome(result),
+        review_status=_last_review_status(result),
+        interrupted=_interrupted(result),
+        termination_confirmed=_termination_confirmed(result),
+        git_safety=git_safety,
+        run_store=run_store,
+        lease=lease,
+        clock=SteppingClock(),
+        max_review_cycles=MAX_REVIEW_CYCLES,
+    )
+
+    assert issue_result.final_status is FinalStatus.FAILED
+    assert (
+        issue_result.trigger_outcome is RunOutcome.INTERRUPTED
+    )  # outranks PROCESS_ERROR
+    assert issue_result.expected_exit_code == 20
+    assert lease.released is True
+
+
 def _happy_path_responses(
     issue_ref: IssueRef,
 ) -> tuple[ParsedAgentResponse, ParsedAgentResponse, ParsedAgentResponse]:
@@ -2901,6 +3324,73 @@ def test_finalize_run_quarantines_and_marks_indeterminate_when_termination_is_un
     assert final_record.git_postflight is not None
     assert final_record.git_postflight.safety_status is GitSafetyStatus.SAFE
     # ...even though the run's own overall status is downgraded.
+    assert final_record.git_safety_status is GitSafetyStatus.INDETERMINATE
+
+
+def test_finalize_run_reports_a_genuinely_ambiguous_postflight_probe_as_failed(
+    tmp_path: Path,
+) -> None:
+    """A postflight failure distinct from an unconfirmed termination: the
+    fresh Git probe itself comes back `INDETERMINATE` (an unresolved race,
+    a permission error, or an ambiguous read -- System Design SS11.2/11.3)
+    even though the child's own termination was cleanly confirmed. No
+    quarantine is warranted here -- that guard is scoped to an unconfirmed
+    termination alone -- but the run still fails closed."""
+
+    workspace, target = _workspace_and_target(tmp_path)
+    git_baseline = _git_state(target_root=target.root, fingerprint="fp-0")
+
+    checks = _happy_path_git_checks(target.root)
+    ambiguous_postflight = GitCheckRecord(
+        sequence=6,
+        purpose="postflight",
+        process_results=(),
+        state=GitState(
+            root=target.root,
+            branch=None,
+            head=None,
+            porcelain_summary="",
+            staged=(),
+            unstaged=(),
+            untracked=(),
+            fingerprint=None,
+        ),
+        safety_status=GitSafetyStatus.INDETERMINATE,
+    )
+    checks.append(ambiguous_postflight)
+    git_safety = SequencedGitSafetyPort(checks)
+    run_store = SequencedRunStorePort()
+    lease = RecordingTargetLease()
+
+    orchestrator, result = _run_happy_path(
+        workspace=workspace,
+        target=target,
+        git_baseline=git_baseline,
+        git_safety=git_safety,
+        run_store=run_store,
+    )
+
+    issue_result = finalize_run(
+        record=orchestrator.record,
+        target=target,
+        trigger_outcome=_trigger_outcome(result),
+        review_status=_last_review_status(result),
+        interrupted=False,
+        termination_confirmed=True,
+        git_safety=git_safety,
+        run_store=run_store,
+        lease=lease,
+        clock=SteppingClock(),
+        max_review_cycles=MAX_REVIEW_CYCLES,
+    )
+
+    assert lease.quarantine_reasons == []  # unconfirmed termination is a distinct guard
+    assert lease.released is True
+    assert issue_result.git_safety_status is GitSafetyStatus.INDETERMINATE
+    assert issue_result.final_status is FinalStatus.FAILED
+
+    final_record = run_store.persist_calls[-1]
+    assert final_record.git_postflight == ambiguous_postflight
     assert final_record.git_safety_status is GitSafetyStatus.INDETERMINATE
 
 

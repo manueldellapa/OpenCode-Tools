@@ -87,6 +87,30 @@ class ScriptedAgentRunner:
         raise AssertionError("bootstrap_run never invokes an agent role")
 
 
+class RecordingAgentRunner:
+    """An `AgentRunner` fake that records every call and returns one
+    scripted `AgentResult` -- unlike `ScriptedAgentRunner`, used only where a
+    test drives a real logical invocation past bootstrap, to prove *which*
+    value (`workspace`, never a target root) `IssueOrchestrator` hands it."""
+
+    def __init__(self, result: AgentResult) -> None:
+        self._result = result
+        self.calls: list[tuple[AgentRole, Workspace, int | None, int]] = []
+
+    def run(
+        self,
+        role: AgentRole,
+        prompt: str,
+        workspace: Workspace,
+        *,
+        review_cycle: int | None,
+        provider_attempt: int,
+        sink: AttemptLogSink,
+    ) -> AgentResult:
+        self.calls.append((role, workspace, review_cycle, provider_attempt))
+        return self._result
+
+
 class RecordingOpenCodePreflightPort:
     """An `OpenCodePreflightPort` fake that always succeeds, recording how
     many times each independent `bootstrap_run` call verified/rechecked it."""
@@ -143,6 +167,40 @@ def _baseline_check(*, target_root: Path, fingerprint: str) -> GitCheckRecord:
         process_results=(_git_probe_result(target_root=target_root),),
         state=_git_state(target_root=target_root, fingerprint=fingerprint),
         safety_status=GitSafetyStatus.SAFE,
+    )
+
+
+def _architect_process_error_result(*, workspace_root: Path) -> AgentResult:
+    """A minimal technical-failure `AgentResult` for the architect -- its
+    content is irrelevant to this file's tests, which never inspect
+    protocol precedence, only *which paths* the pipeline addressed."""
+
+    return AgentResult(
+        role=AgentRole.ARCHITECT,
+        phase=PipelinePhase.ARCHITECT,
+        review_cycle=None,
+        provider_attempt=1,
+        process=ProcessResult(
+            command=("/usr/bin/opencode", "run"),
+            cwd=workspace_root,
+            started_at=NOW,
+            finished_at=NOW + timedelta(seconds=1),
+            duration_ns=1_000_000_000,
+            return_code=None,
+            timed_out=False,
+            termination_confirmed=True,
+            log_path=Path("architect-attempt.log"),
+            stdout_byte_count=0,
+            stdout_sha256="stdout-digest",
+            stderr_byte_count=0,
+            stderr_sha256="stderr-digest",
+            outcome=RunOutcome.PROCESS_ERROR,
+        ),
+        terminal_response=None,
+        session_id=None,
+        verified_agent=None,
+        provider_diagnostic=None,
+        outcome=RunOutcome.PROCESS_ERROR,
     )
 
 
@@ -258,13 +316,35 @@ class RecordingAttemptLogSink:
         raise AssertionError("bootstrap_run never opens an attempt sink")
 
 
+class _NullAttemptLogSink:
+    """A no-op `AttemptLogSink`, only ever handed out when a test actually
+    drives a logical invocation past bootstrap (`allow_attempt_sink=True`)."""
+
+    def __init__(self, path: Path) -> None:
+        self._path = path
+
+    @property
+    def path(self) -> Path:
+        return self._path
+
+    def write(self, channel: LogChannel, payload: bytes, timestamp: datetime) -> None:
+        return None
+
+    def close(self) -> None:
+        return None
+
+
 class RecordingRunStorePort:
     """A `RunStorePort` fake sharing one real `tmp_path` workspace across
-    multiple, independently keyed runs (one per target)."""
+    multiple, independently keyed runs (one per target). `open_attempt_sink`
+    raises by default -- `bootstrap_run` itself never opens one -- unless
+    `allow_attempt_sink=True`, needed only by a test that drives a real
+    logical invocation past bootstrap."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, allow_attempt_sink: bool = False) -> None:
         self.initialize_calls: list[tuple[Workspace, str]] = []
         self.persist_calls: list[RunRecord] = []
+        self._allow_attempt_sink = allow_attempt_sink
 
     def initialize(self, workspace: Workspace, run_id: str) -> Path:
         self.initialize_calls.append((workspace, run_id))
@@ -275,7 +355,9 @@ class RecordingRunStorePort:
     def open_attempt_sink(
         self, role: AgentRole, review_cycle: int | None, provider_attempt: int
     ) -> AttemptLogSink:
-        raise AssertionError("bootstrap_run never opens an attempt sink")
+        if not self._allow_attempt_sink:
+            raise AssertionError("bootstrap_run never opens an attempt sink")
+        return _NullAttemptLogSink(Path(f"{role.value.lower()}-attempt.log"))
 
     def persist(self, record: RunRecord) -> PersistenceStatus:
         self.persist_calls.append(record)
@@ -483,3 +565,76 @@ def test_current_phase_reaches_architect_independently_for_each_target(
         assert outcome.record is not None
         assert outcome.record.current_phase is PipelinePhase.ARCHITECT
         assert outcome.record.target == target
+
+
+def test_a_logical_invocation_runs_opencode_in_the_workspace_and_git_on_the_explicit_target(
+    tmp_path: Path,
+) -> None:
+    """Bootstrapping alone only proves *resolution* stays distinct per
+    target (the tests above); once a role actually runs, `IssueOrchestrator`
+    must still hand `AgentRunner.run` the *workspace* -- OpenCode always
+    executes there -- while every `GitSafetyPort.check` call keeps
+    addressing the *specific* target repository, and Frontend, sharing the
+    same workspace, must stay completely untouched by a Backend-only
+    invocation (System Design AC-003: "OpenCode nel workspace, Git/diff sul
+    target esplicito")."""
+
+    workspace, backend, frontend = _multirepo_workspace(tmp_path)
+    config = _app_config(runtime_root=tmp_path / "runtime")
+
+    git_safety = MultiTargetGitSafetyPort(
+        targets={backend.root: backend, frontend.root: frontend}
+    )
+    issue_resolver = MultiTargetIssueResolver(
+        identities={
+            backend.root: RepositoryIdentity(
+                host="github.com", owner="acme", repository="Backend", source="origin"
+            ),
+            frontend.root: RepositoryIdentity(
+                host="github.com", owner="acme", repository="Frontend", source="origin"
+            ),
+        }
+    )
+    lease_factory = MultiTargetLeaseFactory()
+    run_store = RecordingRunStorePort(allow_attempt_sink=True)
+    agent_runner = RecordingAgentRunner(
+        result=_architect_process_error_result(workspace_root=workspace.root)
+    )
+
+    backend_outcome = bootstrap_run(
+        run_request=RunRequest(
+            issue_number=21, workspace=workspace, target_root=backend.root
+        ),
+        config=config,
+        run_id="20260915T090000.000000Z-000000000001",
+        config_snapshot={},
+        environment_snapshot={},
+        git_safety=git_safety,
+        issue_resolver=issue_resolver,
+        run_store=run_store,
+        lease_factory=lease_factory,
+        opencode_preflight=RecordingOpenCodePreflightPort(),
+        agent_runner=agent_runner,
+        clock=SteppingClock(),
+        sleeper=RecordingSleeper(),
+    )
+    assert backend_outcome.error is None
+    assert isinstance(backend_outcome.orchestrator, IssueOrchestrator)
+    git_check_count_before_invocation = len(git_safety.check_calls)
+
+    backend_outcome.orchestrator.run_logical_invocation(
+        role=AgentRole.ARCHITECT,
+        review_cycle=None,
+        provider_attempt=1,
+        prompt="Design the fix for issue 21.",
+        workspace=workspace,
+    )
+
+    # OpenCode ran against the shared *workspace* -- never Backend's own root.
+    assert agent_runner.calls == [(AgentRole.ARCHITECT, workspace, None, 1)]
+
+    # Every Git check this invocation made addressed Backend explicitly --
+    # Frontend, sharing the same workspace, was never touched by it.
+    invocation_checks = git_safety.check_calls[git_check_count_before_invocation:]
+    assert invocation_checks  # at least the before/after checkpoints ran
+    assert {root for root, _seq, _purpose in invocation_checks} == {backend.root}

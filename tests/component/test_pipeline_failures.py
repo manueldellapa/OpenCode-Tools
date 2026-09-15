@@ -1233,3 +1233,86 @@ def test_a_control_plane_failure_on_the_architects_first_attempt_never_reaches_c
     # The lease is still held: this composed failure is a normal terminal
     # attempt outcome, not something bootstrap_run (or this call) releases.
     assert lease.released is False
+
+
+def test_a_control_plane_digest_drift_blocks_the_attempt_before_the_agent_runs(
+    tmp_path: Path,
+) -> None:
+    """A control-plane digest drift caught by `OpenCodePreflightPort.
+    recheck` (System Design SS18.2; ADR-005) blocks the attempt entirely,
+    *before* the agent ever runs -- distinct from a technical failure *of*
+    an attempt that did run (the `PROCESS_ERROR` case above). `run_logical_
+    invocation` reports it via `control_plane_error`, never persists a
+    placeholder `AttemptRecord` for it, and the composed pipeline never
+    invokes the agent runner at all."""
+
+    workspace, target = _workspace_and_target(tmp_path)
+    config = _app_config(runtime_root=tmp_path / "runtime")
+    run_request = _run_request(workspace=workspace, target_root=target.root)
+
+    architect_before = GitCheckRecord(
+        sequence=1,
+        purpose="ARCHITECT:0:1:before",
+        process_results=(_git_probe_result(target_root=target.root),),
+        state=_git_state(target_root=target.root),
+        safety_status=GitSafetyStatus.SAFE,
+    )
+    git_safety = ScriptedGitSafetyPort(
+        target=target,
+        baseline_check=_baseline_check(target_root=target.root),
+        subsequent_checks=[architect_before],
+    )
+    lease = RecordingTargetLease()
+    lease_factory = ScriptedTargetLeaseFactory(lease=lease)
+    run_store = RecordingRunStorePort()
+    issue_resolver = ScriptedIssueResolver(
+        repository_identity=_repository_identity(), issue_locator=_issue_locator()
+    )
+    drift_error = ProtocolError(
+        "opencode.control_plane_drift",
+        "The OpenCode control-plane digest changed since the initial preflight.",
+    )
+    opencode_preflight = ScriptedOpenCodePreflightPort(recheck_errors=[drift_error])
+    agent_runner = ScriptedAgentRunner([])  # popping from this would raise IndexError
+
+    outcome = bootstrap_run(
+        run_request=run_request,
+        config=config,
+        run_id=RUN_ID,
+        config_snapshot={},
+        environment_snapshot={},
+        git_safety=git_safety,
+        issue_resolver=issue_resolver,
+        run_store=run_store,
+        lease_factory=lease_factory,
+        opencode_preflight=opencode_preflight,
+        agent_runner=agent_runner,
+        clock=SteppingClock(),
+        sleeper=RecordingSleeper(),
+    )
+    assert outcome.error is None
+    assert isinstance(outcome.orchestrator, IssueOrchestrator)
+    persist_calls_before_invocation = len(run_store.persist_calls)
+
+    result = outcome.orchestrator.run_logical_invocation(
+        role=AgentRole.ARCHITECT,
+        review_cycle=None,
+        provider_attempt=1,
+        prompt="Design the fix for issue 48.",
+        workspace=workspace,
+    )
+
+    assert result.control_plane_error is drift_error
+    assert result.agent_result is None
+    assert result.git_after is None
+    assert result.precedence is None
+    assert result.retry_decision is None
+    assert agent_runner.calls == []  # the agent never ran at all
+    assert len(opencode_preflight.recheck_calls) == 1
+
+    # A blocked invocation is never persisted as a placeholder AttemptRecord.
+    assert len(run_store.persist_calls) == persist_calls_before_invocation
+
+    # The lease is still held: this is a normal terminal attempt outcome,
+    # not something bootstrap_run (or this call) releases.
+    assert lease.released is False
