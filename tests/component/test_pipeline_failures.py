@@ -34,6 +34,7 @@ from opencode_tools.domain import (
     AppConfig,
     ConfigSource,
     ExecutionConfig,
+    FinalStatus,
     GitCheckRecord,
     GitSafetyStatus,
     GitState,
@@ -579,7 +580,7 @@ def test_bootstrap_succeeds_in_the_binding_order_and_never_touches_the_lease_aft
     assert lease.quarantine_reasons == []
 
 
-def test_an_ambiguous_control_plane_fails_closed_in_the_terminal_path_with_the_lease_held(
+def test_an_ambiguous_control_plane_fails_closed_and_converges_to_finalization(
     tmp_path: Path,
 ) -> None:
     """OpenCode's own exact-version/capability/effective-agent/control-plane
@@ -588,7 +589,9 @@ def test_an_ambiguous_control_plane_fails_closed_in_the_terminal_path_with_the_l
     (standing in for an ambiguous or rejected control plane, e.g. an agent
     identity mismatch) must fail closed into the same PREFLIGHT-phase
     terminal path as every other preflight step, never invoke any agent
-    role, and never release or quarantine the already-held lease."""
+    role, and -- since a run directory already exists -- converge through
+    `finalize_run` (M13-04), which alone releases the already-held lease
+    only once finalization itself completes."""
 
     workspace, target = _workspace_and_target(tmp_path)
     config = _app_config(runtime_root=tmp_path / "runtime")
@@ -598,8 +601,17 @@ def test_an_ambiguous_control_plane_fails_closed_in_the_terminal_path_with_the_l
         "opencode.debug_agent_identity_mismatch",
         "opencode debug agent coder did not identify itself as the requested role.",
     )
+    postflight_check = GitCheckRecord(
+        sequence=1,
+        purpose="postflight",
+        process_results=(_git_probe_result(target_root=target.root),),
+        state=_git_state(target_root=target.root),
+        safety_status=GitSafetyStatus.SAFE,
+    )
     git_safety = ScriptedGitSafetyPort(
-        target=target, baseline_check=_baseline_check(target_root=target.root)
+        target=target,
+        baseline_check=_baseline_check(target_root=target.root),
+        subsequent_checks=[postflight_check],
     )
     issue_resolver = ScriptedIssueResolver(
         repository_identity=_repository_identity(), issue_locator=_issue_locator()
@@ -638,7 +650,7 @@ def test_an_ambiguous_control_plane_fails_closed_in_the_terminal_path_with_the_l
     # Every fact already gathered before the control-plane check survives
     # into the failure record, and the run enters the same common terminal
     # path (PREFLIGHT -> POSTFLIGHT) as any other preflight failure.
-    assert len(run_store.persist_calls) == 2
+    assert len(run_store.persist_calls) == 3
     failure_record = run_store.persist_calls[1]
     assert failure_record.current_phase is PipelinePhase.POSTFLIGHT
     assert failure_record.errors[0].code == "opencode.debug_agent_identity_mismatch"
@@ -647,10 +659,22 @@ def test_an_ambiguous_control_plane_fails_closed_in_the_terminal_path_with_the_l
     assert failure_record.issue_locator == _issue_locator()
     assert outcome.record == failure_record
 
-    # The lease, already acquired well before this check ever ran, is still
-    # held -- bootstrap_run releases or quarantines it under no outcome.
+    # finalize_run re-checks Git once more against that same baseline, finds
+    # no drift, persists the fully-resolved final record, and only then
+    # releases the lease -- never before, and never left to a caller.
+    final_record = run_store.persist_calls[2]
+    assert final_record.current_phase is PipelinePhase.FINISHED
+    assert final_record.git_postflight == postflight_check
+    assert final_record.git_safety_status is GitSafetyStatus.SAFE
+    assert final_record.final_status is FinalStatus.FAILED
+    assert final_record.trigger_outcome is RunOutcome.PREFLIGHT_ERROR
+    assert outcome.issue_result is not None
+    assert outcome.issue_result.final_status is FinalStatus.FAILED
+    assert outcome.issue_result.trigger_outcome is RunOutcome.PREFLIGHT_ERROR
+    assert outcome.issue_result.expected_exit_code == 10
+
     assert outcome.lease is lease
-    assert lease.released is False
+    assert lease.released is True
     assert lease.quarantine_reasons == []
 
 
@@ -789,7 +813,11 @@ def test_a_first_persist_failure_blocks_everything_before_the_baseline(
     lease = RecordingTargetLease()
     lease_factory = ScriptedTargetLeaseFactory(lease=lease)
     run_store = RecordingRunStorePort(
-        persist_results=[PersistenceStatus.FAILED, PersistenceStatus.FAILED]
+        persist_results=[
+            PersistenceStatus.FAILED,
+            PersistenceStatus.FAILED,
+            PersistenceStatus.FAILED,
+        ]
     )
     issue_resolver = ScriptedIssueResolver(
         repository_identity=_repository_identity(), issue_locator=_issue_locator()
@@ -814,10 +842,19 @@ def test_a_first_persist_failure_blocks_everything_before_the_baseline(
     assert isinstance(outcome.error, LoggingError)
     assert outcome.orchestrator is None
     assert outcome.record is None  # never durably written, even the amend
-    assert outcome.lease is lease  # already acquired, still held
-    assert len(run_store.persist_calls) == 2  # the initial write, then the amend retry
+    assert outcome.lease is lease  # already acquired
+    # `latest_record` never had a baseline yet, so finalize_run's own
+    # postflight probe is skipped entirely; its own persist attempt (the
+    # third overall) is best-effort here too and also fails, so `record`
+    # stays `None` -- but this terminal path still converges and releases.
+    assert len(run_store.persist_calls) == 3
     assert git_safety.check_calls == []  # never reached the baseline
     assert issue_resolver.resolve_calls == []
+    assert outcome.issue_result is not None
+    assert outcome.issue_result.final_status is FinalStatus.FAILED
+    assert outcome.issue_result.persistence_status is PersistenceStatus.FAILED
+    assert outcome.issue_result.run_id == RUN_ID
+    assert lease.released is True
 
 
 def test_a_transient_first_persist_failure_still_records_the_error_on_retry(
@@ -838,7 +875,11 @@ def test_a_transient_first_persist_failure_still_records_the_error_on_retry(
     lease = RecordingTargetLease()
     lease_factory = ScriptedTargetLeaseFactory(lease=lease)
     run_store = RecordingRunStorePort(
-        persist_results=[PersistenceStatus.FAILED, PersistenceStatus.OK]
+        persist_results=[
+            PersistenceStatus.FAILED,
+            PersistenceStatus.OK,
+            PersistenceStatus.OK,
+        ]
     )
 
     outcome = bootstrap_run(
@@ -863,6 +904,17 @@ def test_a_transient_first_persist_failure_still_records_the_error_on_retry(
     assert len(outcome.record.errors) == 1
     assert outcome.record.errors[0].outcome is RunOutcome.LOGGING_ERROR
     assert git_safety.check_calls == []  # never reached the baseline
+
+    # finalize_run converges this too (M13-04): no baseline was ever
+    # captured, so its own postflight probe is skipped, but it still runs
+    # the gate, persists once more (the third write overall), and releases
+    # the lease.
+    assert len(run_store.persist_calls) == 3
+    assert outcome.issue_result is not None
+    assert outcome.issue_result.final_status is FinalStatus.FAILED
+    assert outcome.issue_result.persistence_status is PersistenceStatus.OK
+    assert outcome.issue_result.trigger_outcome is RunOutcome.LOGGING_ERROR
+    assert lease.released is True
 
 
 def test_an_indeterminate_baseline_fails_closed_and_persists_the_failure(
@@ -905,7 +957,16 @@ def test_an_indeterminate_baseline_fails_closed_and_persists_the_failure(
     assert outcome.lease is lease
     assert issue_resolver.resolve_calls == []  # never reached GitHub identity
 
-    assert len(run_store.persist_calls) == 2
+    # finalize_run converges this too (M13-04): the INDETERMINATE baseline
+    # never became `git_baseline`, so its own postflight probe is skipped,
+    # but it still runs the gate, persists once more, and releases the lease.
+    assert len(run_store.persist_calls) == 3
+    assert outcome.issue_result is not None
+    assert outcome.issue_result.final_status is FinalStatus.FAILED
+    assert outcome.issue_result.trigger_outcome is RunOutcome.GIT_SAFETY_ERROR
+    assert outcome.issue_result.persistence_status is PersistenceStatus.OK
+    assert lease.released is True
+
     failure_record = run_store.persist_calls[1]
     assert failure_record.current_phase is PipelinePhase.POSTFLIGHT
     assert len(failure_record.errors) == 1
@@ -933,8 +994,17 @@ def test_a_github_identity_failure_fails_closed_and_persists_the_failure(
     run_request = _run_request(workspace=workspace, target_root=target.root)
 
     error = PreflightError("github.no_unique_identity", "ambiguous repository identity")
+    postflight_check = GitCheckRecord(
+        sequence=1,
+        purpose="postflight",
+        process_results=(_git_probe_result(target_root=target.root),),
+        state=_git_state(target_root=target.root),
+        safety_status=GitSafetyStatus.SAFE,
+    )
     git_safety = ScriptedGitSafetyPort(
-        target=target, baseline_check=_baseline_check(target_root=target.root)
+        target=target,
+        baseline_check=_baseline_check(target_root=target.root),
+        subsequent_checks=[postflight_check],
     )
     lease = RecordingTargetLease()
     lease_factory = ScriptedTargetLeaseFactory(lease=lease)
@@ -975,6 +1045,19 @@ def test_a_github_identity_failure_fails_closed_and_persists_the_failure(
     assert failure_record.git_safety_status is GitSafetyStatus.SAFE
     assert failure_record.issue_locator is None  # never reached: the failure IS here
 
+    # finalize_run converges this too (M13-04): a baseline WAS captured, so
+    # its own fresh postflight probe runs (role=CODER, against that same
+    # baseline), finds no drift, persists once more, and releases the lease.
+    assert len(run_store.persist_calls) == 3
+    final_record = run_store.persist_calls[2]
+    assert final_record.current_phase is PipelinePhase.FINISHED
+    assert final_record.git_postflight == postflight_check
+    assert outcome.issue_result is not None
+    assert outcome.issue_result.final_status is FinalStatus.FAILED
+    assert outcome.issue_result.trigger_outcome is RunOutcome.PREFLIGHT_ERROR
+    assert outcome.issue_result.expected_exit_code == 10
+    assert lease.released is True
+
 
 def test_a_second_persist_failure_never_masks_the_original_preflight_error(
     tmp_path: Path,
@@ -998,7 +1081,11 @@ def test_a_second_persist_failure_never_masks_the_original_preflight_error(
     lease = RecordingTargetLease()
     lease_factory = ScriptedTargetLeaseFactory(lease=lease)
     run_store = RecordingRunStorePort(
-        persist_results=[PersistenceStatus.OK, PersistenceStatus.FAILED]
+        persist_results=[
+            PersistenceStatus.OK,
+            PersistenceStatus.FAILED,
+            PersistenceStatus.FAILED,
+        ]
     )
 
     outcome = bootstrap_run(
@@ -1020,10 +1107,23 @@ def test_a_second_persist_failure_never_masks_the_original_preflight_error(
     assert isinstance(outcome.error, GitSafetyError)  # never LoggingError
     assert outcome.orchestrator is None
     assert outcome.lease is lease
-    assert len(run_store.persist_calls) == 2  # the failed amend was attempted
+    assert (
+        len(run_store.persist_calls) == 3
+    )  # the failed amend, then finalize_run's own
     assert outcome.record == run_store.persist_calls[0]  # fell back to the earlier one
     assert outcome.record is not None
     assert outcome.record.current_phase is PipelinePhase.PREFLIGHT
+
+    # finalize_run's own final persist also fails on this persistently
+    # broken store; its IssueResult falls back to that same earlier record
+    # rather than ever reporting an unpersisted result, and the lease is
+    # still released regardless.
+    assert outcome.issue_result is not None
+    assert outcome.issue_result.final_status is FinalStatus.FAILED
+    assert outcome.issue_result.persistence_status is PersistenceStatus.FAILED
+    assert outcome.issue_result.run_id == outcome.record.run_id
+    assert outcome.issue_result.artifact_path == outcome.record.artifact_path
+    assert lease.released is True
 
 
 def test_a_control_plane_failure_on_the_architects_first_attempt_never_reaches_coder_or_reviewer(

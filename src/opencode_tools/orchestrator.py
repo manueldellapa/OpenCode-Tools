@@ -128,14 +128,44 @@ to `state_machine.transition`'s own `REVIEW_CYCLES_EXHAUSTED` outcome
 without ever invoking one more coder. A reviewer `APPROVED`, or any
 terminal failure at any step (architect, any coder cycle, any reviewer
 cycle, or cycle exhaustion), is resolved into `state_machine.transition`'s
-own verdict and returned to the caller without ever being acted on any
-further here: postflight, finalization, and any `FinalStatus`/exit-code
-decision (M13-04) remain deliberately out of scope, so `APPROVED` is
-reported as the *action* the caller must take next, never as an early
-approval and never rendered as CLI/`FINAL_STATUS` output.
+own verdict and returned to the caller: `IssuePipelineResult` itself never
+marks a reviewer `APPROVED` as an early approval and never renders
+CLI/`FINAL_STATUS` output -- `finalize_run` (M13-04) is the single place
+that turns any such terminal verdict into one converged, best-effort
+postflight/finalization outcome.
 
-Postflight, finalization, and the `cli.py` composition root (System Design
-SS5.3, SS8.2) remain out of scope here.
+`finalize_run` converges every terminal path this module can reach --
+`bootstrap_run`'s own preflight failures once a run directory exists, and
+every stop `run_issue_pipeline` reports -- into one postflight/finalization
+step, never invoking another agent role (System Design SS8.4, SS11.3,
+SS13.3, SS16.3; M13-04). It re-checks Git exactly once more as a pure
+continuity probe -- `role=None`, against the *last checkpoint the pipeline
+itself accepted*, never the run's original baseline -- since no further
+delta of any kind is authorized once the last role has stopped running; a
+content-only change slipped in after the last accepted checkpoint is
+exactly the drift this continuity check exists to catch, and comparing
+against the original baseline with the coder's own tolerance would instead
+mask it. The original baseline stays reserved for `evaluate_final_gate`'s
+own, separate branch/HEAD-unchanged-for-the-whole-run comparison. Applies
+`state_machine.resolve_terminal_outcome` and `evaluate_final_gate` -- so
+`FinalStatus.APPROVED` remains possible only after a reviewer's historical
+`APPROVED`, a `SAFE` postflight, an unchanged branch/HEAD since the run's
+original baseline, and `OK` persistence, and a Git/logging/interrupt cause
+already observed is never cancelled by a later, lower-precedence one --
+quarantines
+the target *before* releasing the lease whenever a child's termination
+could not be confirmed (treating the postflight itself as `INDETERMINATE`
+in that case, since a still-possibly-live process makes any fresh probe
+unreliable), and persists exactly one final, fully-resolved `RunRecord`.
+When even that last write fails, the `IssueResult` it returns falls back to
+the last snapshot already known durable (System Design SS15.4) rather than
+ever reporting an unpersisted `APPROVED` as genuine. The lease, whenever
+one was ever acquired, is always released here, and only after this last
+persist attempt -- never before, never left to a caller.
+
+The `cli.py` composition root -- parsing argv, sequencing `bootstrap_run` /
+`run_issue_pipeline` / `finalize_run`, rendering console/exit-code output
+(System Design SS5.3, SS8.2; M14) -- remains out of scope here.
 """
 
 from __future__ import annotations
@@ -151,11 +181,13 @@ from opencode_tools.domain import (
     AgentStatus,
     AppConfig,
     AttemptRecord,
+    FinalStatus,
     FrozenJsonValue,
     GitCheckRecord,
     GitSafetyStatus,
     GitState,
     IssueLocator,
+    IssueResult,
     ParsedAgentResponse,
     PersistenceStatus,
     PipelinePhase,
@@ -200,6 +232,9 @@ from opencode_tools.state_machine import (
     TransitionEvent,
     TransitionEventKind,
     classify_attempt_outcome,
+    evaluate_final_gate,
+    resolve_exit_code,
+    resolve_terminal_outcome,
     transition,
 )
 
@@ -513,6 +548,17 @@ class IssueOrchestrator:
         )
         self._cancellation_requested = False
 
+    @property
+    def record(self) -> RunRecord:
+        """The latest `RunRecord` snapshot this instance has itself durably
+        persisted -- exactly the last one `run_store.persist` accepted, so a
+        caller can hand it to `finalize_run` (M13-04) once the pipeline
+        itself has stopped, without this class exposing any further
+        internal state.
+        """
+
+        return self._record
+
     def request_cancellation(self) -> None:
         """Record an external cancellation request (System Design SH-001).
 
@@ -809,18 +855,26 @@ class BootstrapOutcome:
 
     `lease` is present whenever `TargetLeaseFactory.acquire` succeeded --
     on a full success and on any later-stage failure alike -- so the
-    caller can keep holding it through postflight/finalization (System
-    Design SS16.2; out of scope here) or release/quarantine it; it is
-    `None` only when acquisition itself never ran or itself failed.
-    `orchestrator` and `issue_locator` are present if and only if `error`
-    is `None`: every bootstrap/preflight step succeeded, and this call has
-    not invoked -- and will never invoke -- any agent role itself (System
-    Design SS8.2: "nessun agent parte su preflight non verde"). `record` is
-    the last `RunRecord` snapshot this call itself durably persisted: the
-    fully preflighted one on success, a best-effort failure snapshot when a
-    run directory already existed to update, or `None` when the failure
-    happened before one could ever be created (System Design SS8.2 point 3:
-    these errors "possono precedere run.json").
+    caller can keep holding it through the pipeline (System Design SS16.2)
+    on success, or, on failure, exactly until `finalize_run` -- already
+    called by this function whenever `issue_result` is set -- has released
+    it. `orchestrator` and `issue_locator` are present if and only if
+    `error` is `None`: every bootstrap/preflight step succeeded, and this
+    call has not invoked -- and will never invoke -- any agent role itself
+    (System Design SS8.2: "nessun agent parte su preflight non verde").
+    `record` is the last `RunRecord` snapshot this call itself durably
+    persisted: the fully preflighted one on success, a best-effort failure
+    snapshot when a run directory already existed to update, or `None` when
+    the failure happened before one could ever be created (System Design
+    SS8.2 point 3: these errors "possono precedere run.json"). `issue_result`
+    is `finalize_run`'s own converged outcome, always produced whenever a
+    failure reaches that same "run directory already existed" point
+    (M13-04) -- `record` being `None` there only means this call's own
+    amend-persist never made it to disk (System Design SS15.4), not that
+    `finalize_run` was skipped. It is `None` on success (the run is not
+    over: postflight/finalization apply once the pipeline itself has run,
+    not here) and `None` for a failure too early to ever finalize -- before
+    a run directory (and the lease it follows) ever existed.
     """
 
     lease: TargetLease | None
@@ -828,6 +882,7 @@ class BootstrapOutcome:
     orchestrator: IssueOrchestrator | None
     issue_locator: IssueLocator | None
     record: RunRecord | None
+    issue_result: IssueResult | None = None
 
     def __post_init__(self) -> None:
         if self.error is None:
@@ -839,6 +894,8 @@ class BootstrapOutcome:
                 raise TypeError("issue_locator must be IssueLocator when error is None")
             if type(self.record) is not RunRecord:
                 raise TypeError("record must be RunRecord when error is None")
+            if self.issue_result is not None:
+                raise ValueError("issue_result must be None when error is None")
         else:
             if not isinstance(self.error, OpenCodeToolsError):
                 raise TypeError("error must be OpenCodeToolsError or None")
@@ -848,6 +905,11 @@ class BootstrapOutcome:
                 raise ValueError("issue_locator must be None when error is set")
             if self.record is not None and type(self.record) is not RunRecord:
                 raise TypeError("record must be RunRecord or None")
+            if (
+                self.issue_result is not None
+                and type(self.issue_result) is not IssueResult
+            ):
+                raise TypeError("issue_result must be IssueResult or None")
 
 
 def _persist_or_raise(run_store: RunStorePort, record: RunRecord) -> None:
@@ -861,10 +923,19 @@ def _persist_or_raise(run_store: RunStorePort, record: RunRecord) -> None:
 
 
 def _bootstrap_failure(
-    *, lease: TargetLease | None, error: OpenCodeToolsError, record: RunRecord | None
+    *,
+    lease: TargetLease | None,
+    error: OpenCodeToolsError,
+    record: RunRecord | None,
+    issue_result: IssueResult | None = None,
 ) -> BootstrapOutcome:
     return BootstrapOutcome(
-        lease=lease, error=error, orchestrator=None, issue_locator=None, record=record
+        lease=lease,
+        error=error,
+        orchestrator=None,
+        issue_locator=None,
+        record=record,
+        issue_result=issue_result,
     )
 
 
@@ -1060,7 +1131,32 @@ def bootstrap_run(
             persisted_record = failure_record
         except OpenCodeToolsError:
             pass
-        return _bootstrap_failure(lease=lease, error=error, record=persisted_record)
+
+        # A run directory (and a lease) already existed: this failure is a
+        # terminal path "successivo alla run init" and converges through the
+        # same finalize_run every other one does (M13-04), rather than
+        # leaving postflight/the lease to a caller. No agent role has ever
+        # run yet, so there is nothing to confirm terminated and no reviewer
+        # verdict to weigh.
+        finalize_record = (
+            persisted_record if persisted_record is not None else latest_record
+        )
+        issue_result = finalize_run(
+            record=finalize_record,
+            target=target,
+            trigger_outcome=error.outcome,
+            review_status=None,
+            interrupted=False,
+            termination_confirmed=None,
+            git_safety=git_safety,
+            run_store=run_store,
+            lease=lease,
+            clock=clock,
+            max_review_cycles=config.execution.max_review_cycles,
+        )
+        return _bootstrap_failure(
+            lease=lease, error=error, record=persisted_record, issue_result=issue_result
+        )
 
     orchestrator = IssueOrchestrator(
         initial_record=ready_record,
@@ -1432,6 +1528,244 @@ def run_issue_pipeline(
         review_cycle = next_review_cycle
 
 
+_POSTFLIGHT_CHECK_PURPOSE = "postflight"
+
+_TERMINATION_UNCONFIRMED_QUARANTINE_REASON = (
+    "orchestrator.termination_unconfirmed: a child process group's "
+    "termination could not be confirmed before releasing this target's "
+    "lease (System Design SS16.3; ADR-006)."
+)
+
+
+def _last_accepted_git_state(record: RunRecord) -> GitState | None:
+    """Reconstruct the last checkpoint `IssueOrchestrator` itself accepted.
+
+    Mirrors `IssueOrchestrator`'s own `_last_accepted_git_state` bookkeeping
+    exactly (System Design SS8.3): starts at `record.git_baseline` and
+    advances to an attempt's `git_after.state` only when that check was
+    itself `SAFE`, in `record.attempts`' own chronological order -- an
+    `AttemptRecord` only ever exists for a completed attempt (a `before`
+    blocked by Git safety or control-plane drift is never persisted as one),
+    so every `git_after` here is a real, completed checkpoint. An `UNSAFE`
+    or `INDETERMINATE` `after` leaves the last accepted state exactly where
+    it was, since that role's own drift was never accepted as a new
+    checkpoint in the first place.
+    """
+
+    state = record.git_baseline
+    for attempt in record.attempts:
+        if attempt.git_after.safety_status is GitSafetyStatus.SAFE:
+            state = attempt.git_after.state
+    return state
+
+
+def finalize_run(
+    *,
+    record: RunRecord,
+    target: TargetRepository,
+    trigger_outcome: RunOutcome,
+    review_status: ReviewStatus | None,
+    interrupted: bool,
+    termination_confirmed: bool | None,
+    git_safety: GitSafetyPort,
+    run_store: RunStorePort,
+    lease: TargetLease | None,
+    clock: Clock,
+    max_review_cycles: int,
+) -> IssueResult:
+    """Converge one terminal path into postflight and finalization (M13-04).
+
+    Called once, whenever any terminal path -- `bootstrap_run`'s own
+    preflight failures once a run directory exists, or every stop
+    `run_issue_pipeline` reports -- has nothing left to do but reach
+    `FINISHED`; never invokes an agent role.
+
+    Re-checks Git exactly once more (`GitSafetyPort.check`, `role=None`, as
+    a pure continuity probe) against the *last checkpoint the pipeline
+    itself accepted* -- never `record.git_baseline`, the run's original
+    baseline, which `evaluate_final_gate` still compares separately for the
+    run's own overall branch/HEAD inventory -- whenever such a checkpoint
+    exists; skipped, and treated as `GitSafetyStatus.INDETERMINATE`, when it
+    does not (System Design SS11.3). Since no further delta is authorized
+    once the last role has stopped running, `role=None` means even a
+    content-only change is `UNSAFE` here, unlike a role's own `after` check.
+    A `termination_confirmed` of `False` -- a child process
+    group that might still be alive -- likewise forces this postflight
+    determination to `INDETERMINATE` for gate/precedence purposes even when
+    the fresh probe itself came back clean (a live survivor makes any
+    contemporaneous probe unreliable); the real probe evidence, whatever it
+    was, is still preserved verbatim on the persisted `git_postflight`.
+    `False` also quarantines the target (`TargetLease.quarantine`) *before*
+    the lease is ever released (System Design SS16.3; ADR-006) -- a
+    quarantine write failure is folded into the persisted record's own
+    `errors` (System Design SS15.4) rather than raised or swallowed, so it
+    stays visible without masking `trigger_outcome`.
+
+    `state_machine.resolve_terminal_outcome` and `evaluate_final_gate` are
+    the only two places that decide the resolved terminal category and
+    `FinalStatus`, exactly as frozen elsewhere in this module (SS8.4,
+    SS13.3): `review_status` is the reviewer's own last, *historical* verdict
+    (never rewritten, never overridden by a later drift -- it is the gate,
+    not the record of what the reviewer said, that denies approval on
+    drift), and every already-observed cause (Git safety, persistence,
+    interruption) keeps its place in `resolve_terminal_outcome`'s precedence
+    without cancelling `trigger_outcome`, the technical reason this path
+    reached postflight in the first place.
+
+    Persists exactly one final `RunRecord`, advancing `current_phase`
+    through `POSTFLIGHT`/`FINALIZATION` to `FINISHED` via
+    `state_machine.transition` like any other phase change, and marking
+    `changes_preserved=True` unconditionally -- Python never mutates or
+    recovers the target, on success or failure alike (FR-050). The lease,
+    if there is one, is released only after this attempt, regardless of its
+    outcome. If it fails, the returned `IssueResult` falls back to `record`
+    -- the last snapshot already known durable -- with `FinalStatus.FAILED`
+    and the freshly-resolved `LOGGING_ERROR`-inclusive terminal outcome,
+    never reporting an unpersisted `APPROVED` as genuine (System Design
+    SS15.4).
+    """
+
+    if type(record) is not RunRecord:
+        raise TypeError("record must be RunRecord")
+    if not isinstance(target, TargetRepository):
+        raise TypeError("target must be TargetRepository")
+    _require_exact_enum(trigger_outcome, RunOutcome, "trigger_outcome")
+    if review_status is not None:
+        _require_exact_enum(review_status, ReviewStatus, "review_status")
+    if type(interrupted) is not bool:
+        raise TypeError("interrupted must be a boolean")
+    if termination_confirmed is not None and type(termination_confirmed) is not bool:
+        raise TypeError("termination_confirmed must be a boolean or None")
+    _require_int(max_review_cycles, "max_review_cycles", minimum=1)
+
+    next_sequence = max((check.sequence for check in record.git_checks), default=-1) + 1
+    last_accepted_state = _last_accepted_git_state(record)
+    postflight: GitCheckRecord | None = None
+    if last_accepted_state is not None:
+        postflight = git_safety.check(
+            target,
+            sequence=next_sequence,
+            purpose=_POSTFLIGHT_CHECK_PURPOSE,
+            role=None,
+            baseline=last_accepted_state,
+        )
+
+    effective_git_safety_status = (
+        GitSafetyStatus.INDETERMINATE
+        if postflight is None or termination_confirmed is False
+        else postflight.safety_status
+    )
+
+    errors = record.errors
+    if lease is not None and termination_confirmed is False:
+        try:
+            lease.quarantine(_TERMINATION_UNCONFIRMED_QUARANTINE_REASON)
+        except LoggingError as quarantine_error:
+            errors = (
+                *errors,
+                *to_error_records(
+                    quarantine_error,
+                    phase=PipelinePhase.POSTFLIGHT,
+                    timestamp=clock.now(),
+                    first_sequence=(errors[-1].sequence + 1 if errors else 0),
+                ),
+            )
+
+    terminal_precedence = resolve_terminal_outcome(
+        trigger_outcome=trigger_outcome,
+        git_safety_status=effective_git_safety_status,
+        interrupted=interrupted,
+        persistence_status=record.persistence_status,
+    )
+    final_status = evaluate_final_gate(
+        review_status=review_status,
+        postflight_git_safety_status=effective_git_safety_status,
+        baseline_branch=record.git_baseline.branch if record.git_baseline else None,
+        baseline_head=record.git_baseline.head if record.git_baseline else None,
+        postflight_branch=postflight.state.branch if postflight is not None else None,
+        postflight_head=postflight.state.head if postflight is not None else None,
+        persistence_status=record.persistence_status,
+    )
+    expected_exit_code = resolve_exit_code(
+        final_status=final_status,
+        terminal_outcome=terminal_precedence.terminal_outcome,
+    )
+
+    postflight_transition = transition(
+        PipelineState(phase=PipelinePhase.POSTFLIGHT),
+        TransitionEvent(kind=TransitionEventKind.POSTFLIGHT_COMPLETED),
+        max_review_cycles=max_review_cycles,
+    )
+    finalization_transition = transition(
+        postflight_transition.state,
+        TransitionEvent(kind=TransitionEventKind.FINALIZATION_COMPLETED),
+        max_review_cycles=max_review_cycles,
+    )
+
+    finished_at = clock.now()
+    duration_ns = max(
+        int((finished_at - record.started_at).total_seconds() * 1_000_000_000), 0
+    )
+
+    final_record = replace(
+        record,
+        current_phase=finalization_transition.state.phase,
+        finished_at=finished_at,
+        duration_ns=duration_ns,
+        terminal_outcome=terminal_precedence.terminal_outcome,
+        git_postflight=postflight,
+        git_safety_status=effective_git_safety_status,
+        errors=errors,
+        trigger_outcome=terminal_precedence.terminal_outcome,
+        final_status=final_status,
+        expected_exit_code=expected_exit_code,
+        changes_preserved=True,
+        termination_confirmed=termination_confirmed,
+    )
+
+    persist_status = run_store.persist(final_record)
+
+    if lease is not None:
+        lease.__exit__(None, None, None)
+
+    if persist_status is PersistenceStatus.OK:
+        return IssueResult(
+            run_id=final_record.run_id,
+            artifact_path=final_record.artifact_path,
+            final_status=final_status,
+            expected_exit_code=expected_exit_code,
+            trigger_outcome=terminal_precedence.terminal_outcome,
+            git_safety_status=effective_git_safety_status,
+            persistence_status=PersistenceStatus.OK,
+            changes_preserved=True,
+            termination_confirmed=termination_confirmed,
+        )
+
+    # The final write itself failed: `record` -- already durable when this
+    # function was called -- remains the last valid run.json (System Design
+    # SS15.4); an unpersisted APPROVED is never reported as genuine.
+    fallback_precedence = resolve_terminal_outcome(
+        trigger_outcome=trigger_outcome,
+        git_safety_status=effective_git_safety_status,
+        interrupted=interrupted,
+        persistence_status=persist_status,
+    )
+    return IssueResult(
+        run_id=record.run_id,
+        artifact_path=record.artifact_path,
+        final_status=FinalStatus.FAILED,
+        expected_exit_code=resolve_exit_code(
+            final_status=FinalStatus.FAILED,
+            terminal_outcome=fallback_precedence.terminal_outcome,
+        ),
+        trigger_outcome=fallback_precedence.terminal_outcome,
+        git_safety_status=effective_git_safety_status,
+        persistence_status=persist_status,
+        changes_preserved=True,
+        termination_confirmed=termination_confirmed,
+    )
+
+
 __all__ = (
     "BootstrapOutcome",
     "InvocationEvent",
@@ -1440,5 +1774,6 @@ __all__ = (
     "IssuePipelineResult",
     "LogicalInvocationResult",
     "bootstrap_run",
+    "finalize_run",
     "run_issue_pipeline",
 )

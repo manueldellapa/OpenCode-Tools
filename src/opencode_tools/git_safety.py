@@ -35,11 +35,13 @@ uses to suppress a coder's provider retry.
 Every checkpoint also carries a deterministic, display-safe change
 inventory -- `GitState.staged`/`unstaged`/`untracked` -- parsed from the
 same porcelain evidence (M09-05); postflight is `check_git_state` itself,
-called with the run's original baseline and `role=AgentRole.CODER` so an
-expected coder delta stays `SAFE` while branch/HEAD drift still fails it,
-attempted on every path including a failure, and never followed by any
-recovery command. Neither `run.json` nor this module ever holds full file
-content, only paths and hashes.
+called with the last checkpoint the pipeline itself accepted (never the
+run's original baseline, which a caller keeps separately for its own
+overall-inventory comparison) and `role=None`, so no further delta of any
+kind -- including a content-only one -- is authorized once the last role
+has stopped running, attempted on every path including a failure, and
+never followed by any recovery command. Neither `run.json` nor this module
+ever holds full file content, only paths and hashes.
 
 `classify_runtime_root_containment` and `check_runtime_location` implement
 this module's other System Design SS6 responsibility, the runtime ignore

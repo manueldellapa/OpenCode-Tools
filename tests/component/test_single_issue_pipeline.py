@@ -1,4 +1,5 @@
-"""Component tests for `orchestrator.run_issue_pipeline` (M13-02, M13-03).
+"""Component tests for `orchestrator.run_issue_pipeline` and
+`orchestrator.finalize_run` (M13-02, M13-03, M13-04).
 
 Drives the full nominal-through-rework path against an `IssueOrchestrator`
 built directly from deterministic port fakes -- a `SequencedAgentRunner`,
@@ -18,19 +19,32 @@ invokes one more coder, and that the provider-retry loop `IssueOrchestrator.
 run_provider_attempts` already owns (M12, unchanged) -- recovery,
 exhaustion, an untrusted diagnostic, and a coder's own target-change
 suppression -- composes correctly through every role without ever calling a
-fourth agent or acting on a reviewer's verdict as a final status (that
-remains M13-04).
+fourth agent or acting on a reviewer's verdict as a final status.
+
+The `finalize_run` tests pick up exactly where `run_issue_pipeline` stops --
+using its own `IssuePipelineResult` and `IssueOrchestrator.record` to derive
+`finalize_run`'s inputs, exactly as a future composition root would -- and
+prove the M13-04 convergence: a reviewer's historical `APPROVED` never
+survives a later Git drift, cycle exhaustion/provider exhaustion/
+interruption all finalize `FAILED` with the matching exit code, an
+unconfirmed termination forces an `INDETERMINATE` postflight and quarantines
+the target before the lease is ever released, a quarantine failure stays
+visible without masking the original cause, and a failure of `finalize_run`'s
+own last write falls back to the last snapshot already known durable rather
+than ever reporting an unpersisted `APPROVED`.
 """
 
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Self
 
 from opencode_tools.domain import (
     AgentResult,
     AgentRole,
     AgentStatus,
+    FinalStatus,
     GitCheckRecord,
     GitSafetyStatus,
     GitState,
@@ -49,8 +63,15 @@ from opencode_tools.domain import (
     TargetRepository,
     Workspace,
 )
-from opencode_tools.orchestrator import IssueOrchestrator, run_issue_pipeline
-from opencode_tools.ports import AttemptLogSink, LogChannel
+from opencode_tools.errors import LoggingError
+from opencode_tools.orchestrator import (
+    IssueOrchestrator,
+    IssuePipelineResult,
+    LogicalInvocationResult,
+    finalize_run,
+    run_issue_pipeline,
+)
+from opencode_tools.ports import AttemptLogSink, GitSafetyPort, LogChannel
 from opencode_tools.prompting import (
     build_architect_prompt,
     build_coder_prompt,
@@ -90,12 +111,24 @@ class RecordingAttemptLogSink:
 
 
 class SequencedRunStorePort:
-    """A `RunStorePort` fake: one fresh sink per attempt, every `persist` OK."""
+    """A `RunStorePort` fake: one fresh sink per attempt. `persist` returns
+    `OK` unless `persist_results` scripts otherwise for that call; `order_log`,
+    when given, records a tag per call so a test can assert this port's
+    calls interleave correctly with every other port's own."""
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        persist_results: list[PersistenceStatus] | None = None,
+        order_log: list[str] | None = None,
+    ) -> None:
         self.sink_calls: list[tuple[AgentRole, int | None, int]] = []
         self.opened_sinks: list[RecordingAttemptLogSink] = []
         self.persist_calls: list[RunRecord] = []
+        self._persist_results = (
+            list(persist_results) if persist_results is not None else None
+        )
+        self._order_log = order_log
 
     def initialize(self, workspace: Workspace, run_id: str) -> Path:
         raise AssertionError("bootstrap concern, not exercised here")
@@ -112,7 +145,11 @@ class SequencedRunStorePort:
         return sink
 
     def persist(self, record: RunRecord) -> PersistenceStatus:
+        if self._order_log is not None:
+            self._order_log.append(f"persist:{record.current_phase.value}")
         self.persist_calls.append(record)
+        if self._persist_results is not None:
+            return self._persist_results.pop(0)
         return PersistenceStatus.OK
 
 
@@ -138,13 +175,17 @@ class SequencedAgentRunner:
 
 
 class SequencedGitSafetyPort:
-    """A `GitSafetyPort` fake returning one scripted checkpoint per call."""
+    """A `GitSafetyPort` fake returning one scripted checkpoint per call.
+    `order_log`, when given, records a tag per call (see `SequencedRunStorePort`)."""
 
-    def __init__(self, results: list[GitCheckRecord]) -> None:
+    def __init__(
+        self, results: list[GitCheckRecord], *, order_log: list[str] | None = None
+    ) -> None:
         self._results = list(results)
         self.calls: list[
             tuple[TargetRepository, int, str, AgentRole | None, GitState | None]
         ] = []
+        self._order_log = order_log
 
     def check_runtime_location(self, runtime_root: Path) -> None:
         raise AssertionError("not exercised by this issue's orchestrator scope")
@@ -163,8 +204,69 @@ class SequencedGitSafetyPort:
         role: AgentRole | None = None,
         baseline: GitState | None = None,
     ) -> GitCheckRecord:
+        if self._order_log is not None:
+            self._order_log.append(f"git_check:{purpose}")
         self.calls.append((target, sequence, purpose, role, baseline))
         return self._results.pop(0)
+
+
+class ComparingGitSafetyPort:
+    """A `GitSafetyPort` fake that computes each checkpoint's `safety_status`
+    the same way the real `check_git_state` does -- branch/HEAD drift is
+    `UNSAFE` regardless of `role`; a fingerprint delta is `SAFE` only for
+    `AgentRole.CODER` -- from a scripted sequence of fresh captures.
+
+    Unlike `SequencedGitSafetyPort`, which hands back a pre-baked verdict no
+    matter what `baseline`/`role` it is given, this fake actually reacts to
+    them: it is the only way to prove `finalize_run`'s postflight probe
+    compares against the *correct* baseline with the *correct* role, rather
+    than merely forwarding whatever a scripted fake happens to return.
+    """
+
+    def __init__(self, states: list[GitState]) -> None:
+        self._states = list(states)
+        self.calls: list[tuple[int, str, AgentRole | None, GitState | None]] = []
+
+    def check_runtime_location(self, runtime_root: Path) -> None:
+        raise AssertionError("not exercised by this issue's orchestrator scope")
+
+    def resolve_target(
+        self, workspace: Workspace, target_root: Path
+    ) -> TargetRepository:
+        raise AssertionError("not exercised by this issue's orchestrator scope")
+
+    def check(
+        self,
+        target: TargetRepository,
+        *,
+        sequence: int,
+        purpose: str,
+        role: AgentRole | None = None,
+        baseline: GitState | None = None,
+    ) -> GitCheckRecord:
+        self.calls.append((sequence, purpose, role, baseline))
+        state = self._states.pop(0)
+        if baseline is None:
+            safety_status = GitSafetyStatus.SAFE
+        else:
+            drifted = state.branch != baseline.branch or state.head != baseline.head
+            fingerprint_delta_unsafe = (
+                state.fingerprint != baseline.fingerprint
+                and role is not AgentRole.CODER
+            )
+            safety_status = (
+                GitSafetyStatus.UNSAFE
+                if drifted or fingerprint_delta_unsafe
+                else GitSafetyStatus.SAFE
+            )
+        return GitCheckRecord(
+            sequence=sequence,
+            purpose=purpose,
+            process_results=(),
+            state=state,
+            safety_status=safety_status,
+            compared_to=baseline.fingerprint if baseline is not None else None,
+        )
 
 
 class RecordingOpenCodePreflightPort:
@@ -179,6 +281,40 @@ class RecordingOpenCodePreflightPort:
 
     def recheck(self, expected_digest: str) -> None:
         self.recheck_calls.append(expected_digest)
+
+
+class RecordingTargetLease:
+    """A `TargetLease` fake: records release/quarantine without OS locking.
+    `quarantine_error`, when given, is raised by `quarantine` after still
+    recording the attempt (`LoggingError`, never swallowed by this fake --
+    the caller decides what to do with it). `order_log`, when given, records
+    a tag per call (see `SequencedRunStorePort`)."""
+
+    def __init__(
+        self,
+        *,
+        quarantine_error: LoggingError | None = None,
+        order_log: list[str] | None = None,
+    ) -> None:
+        self.released = False
+        self.quarantine_reasons: list[str] = []
+        self._quarantine_error = quarantine_error
+        self._order_log = order_log
+
+    def __enter__(self) -> Self:
+        return self
+
+    def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
+        if self._order_log is not None:
+            self._order_log.append("lease_release")
+        self.released = True
+
+    def quarantine(self, reason: str) -> None:
+        if self._order_log is not None:
+            self._order_log.append("lease_quarantine")
+        self.quarantine_reasons.append(reason)
+        if self._quarantine_error is not None:
+            raise self._quarantine_error
 
 
 class SteppingClock:
@@ -397,7 +533,7 @@ def _orchestrator(
     workspace: Workspace,
     target: TargetRepository,
     agent_runner: SequencedAgentRunner,
-    git_safety: SequencedGitSafetyPort,
+    git_safety: GitSafetyPort,
     run_store: SequencedRunStorePort,
     git_baseline: GitState,
     sleeper: RecordingSleeper | None = None,
@@ -415,6 +551,56 @@ def _orchestrator(
         sleeper=sleeper if sleeper is not None else RecordingSleeper(),
         provider_retry=_provider_retry_config(),
     )
+
+
+def _trigger_outcome(result: IssuePipelineResult) -> RunOutcome:
+    """Derive `finalize_run`'s own `trigger_outcome` input the way a future
+    composition root would: `IssuePipelineResult.outcome` whenever the
+    pipeline itself named one, or `SUCCEEDED` for an ordinary reviewer
+    `APPROVED` advance (the only case it leaves `None`)."""
+
+    return result.outcome if result.outcome is not None else RunOutcome.SUCCEEDED
+
+
+def _last_review_status(result: IssuePipelineResult) -> ReviewStatus | None:
+    """The reviewer's own last, historical verdict -- never re-derived
+    through `_attempt_result`'s Git-safety gating, which is a different
+    question (whether the *next* phase may run), not what the reviewer
+    itself claimed."""
+
+    if not result.reviewer_cycles:
+        return None
+    last_attempt = result.reviewer_cycles[-1][-1]
+    if (
+        last_attempt.agent_result is None
+        or last_attempt.agent_result.terminal_response is None
+    ):
+        return None
+    return last_attempt.agent_result.terminal_response.review_status
+
+
+def _all_attempts(result: IssuePipelineResult) -> tuple[LogicalInvocationResult, ...]:
+    return (
+        *result.architect,
+        *(attempt for cycle in result.coder_cycles for attempt in cycle),
+        *(attempt for cycle in result.reviewer_cycles for attempt in cycle),
+    )
+
+
+def _termination_confirmed(result: IssuePipelineResult) -> bool | None:
+    """Whether every attempt this pipeline ran had its own process group's
+    termination confirmed -- `None` if no attempt with a technical
+    `AgentResult` ever ran (never the case here: the architect always
+    does), `False` if even one did not."""
+
+    confirmed_values = [
+        attempt.agent_result.process.termination_confirmed
+        for attempt in _all_attempts(result)
+        if attempt.agent_result is not None
+    ]
+    if not confirmed_values:
+        return None
+    return all(value is True for value in confirmed_values)
 
 
 def test_the_nominal_path_invokes_architect_coder_and_reviewer_in_canonical_order(
@@ -2320,3 +2506,864 @@ def test_an_architect_provider_error_recovers_on_retry_before_the_coder_runs(
     assert len(result.coder_cycles) == 1
     assert result.outcome is None
     assert result.action is PipelineAction.ENTER_POSTFLIGHT
+
+
+def _happy_path_responses(
+    issue_ref: IssueRef,
+) -> tuple[ParsedAgentResponse, ParsedAgentResponse, ParsedAgentResponse]:
+    return (
+        ParsedAgentResponse(
+            role=AgentRole.ARCHITECT,
+            body="plan",
+            agent_status=AgentStatus.READY,
+            issue_ref=issue_ref,
+        ),
+        ParsedAgentResponse(
+            role=AgentRole.CODER, body="done", agent_status=AgentStatus.COMPLETED
+        ),
+        ParsedAgentResponse(
+            role=AgentRole.REVIEWER, body="", review_status=ReviewStatus.APPROVED
+        ),
+    )
+
+
+def _happy_path_git_checks(target_root: Path) -> list[GitCheckRecord]:
+    before_coder = _git_state(target_root=target_root, fingerprint="fp-0")
+    after_coder = _git_state(target_root=target_root, fingerprint="fp-2")
+    return [
+        _git_check(
+            target_root=target_root,
+            sequence=0,
+            purpose="ARCHITECT:0:1:before",
+            state=before_coder,
+        ),
+        _git_check(
+            target_root=target_root,
+            sequence=1,
+            purpose="ARCHITECT:0:1:after",
+            state=before_coder,
+        ),
+        _git_check(
+            target_root=target_root,
+            sequence=2,
+            purpose="CODER:1:1:before",
+            state=before_coder,
+        ),
+        _git_check(
+            target_root=target_root,
+            sequence=3,
+            purpose="CODER:1:1:after",
+            state=after_coder,
+        ),
+        _git_check(
+            target_root=target_root,
+            sequence=4,
+            purpose="REVIEWER:1:1:before",
+            state=after_coder,
+        ),
+        _git_check(
+            target_root=target_root,
+            sequence=5,
+            purpose="REVIEWER:1:1:after",
+            state=after_coder,
+        ),
+    ]
+
+
+def _run_happy_path(
+    *,
+    workspace: Workspace,
+    target: TargetRepository,
+    git_baseline: GitState,
+    git_safety: GitSafetyPort,
+    run_store: SequencedRunStorePort,
+) -> tuple[IssueOrchestrator, IssuePipelineResult]:
+    issue_ref = _issue_ref()
+    architect_response, coder_response, reviewer_response = _happy_path_responses(
+        issue_ref
+    )
+    agent_runner = SequencedAgentRunner(
+        [
+            _agent_result(
+                role=AgentRole.ARCHITECT,
+                review_cycle=None,
+                workspace_root=workspace.root,
+                terminal_response=architect_response,
+            ),
+            _agent_result(
+                role=AgentRole.CODER,
+                review_cycle=1,
+                workspace_root=workspace.root,
+                terminal_response=coder_response,
+            ),
+            _agent_result(
+                role=AgentRole.REVIEWER,
+                review_cycle=1,
+                workspace_root=workspace.root,
+                terminal_response=reviewer_response,
+            ),
+        ]
+    )
+    orchestrator = _orchestrator(
+        workspace=workspace,
+        target=target,
+        agent_runner=agent_runner,
+        git_safety=git_safety,
+        run_store=run_store,
+        git_baseline=git_baseline,
+    )
+    result = run_issue_pipeline(
+        orchestrator=orchestrator,
+        issue_locator=_issue_locator(),
+        workspace=workspace,
+        target=target,
+        max_review_cycles=MAX_REVIEW_CYCLES,
+    )
+    return orchestrator, result
+
+
+def test_finalize_run_approves_after_a_clean_reviewer_approval_in_the_correct_order(
+    tmp_path: Path,
+) -> None:
+    """The canonical success path: a `SAFE` postflight continuity check
+    against the *last checkpoint the pipeline itself accepted*, an unchanged
+    branch/HEAD since the run's original baseline, and `OK` persistence
+    together with the reviewer's own historical `APPROVED` produce
+    `FinalStatus.APPROVED` and exit code 0 (System Design SS8.4) -- and the
+    postflight probe, the final persist, and the lease release happen
+    strictly after the pipeline itself finished, and in that order (M13-04)."""
+
+    workspace, target = _workspace_and_target(tmp_path)
+    git_baseline = _git_state(target_root=target.root, fingerprint="fp-0")
+
+    order_log: list[str] = []
+    checks = _happy_path_git_checks(target.root)
+    checks.append(
+        _git_check(
+            target_root=target.root,
+            sequence=6,
+            purpose="postflight",
+            state=_git_state(target_root=target.root, fingerprint="fp-9"),
+        )
+    )
+    git_safety = SequencedGitSafetyPort(checks, order_log=order_log)
+    run_store = SequencedRunStorePort(order_log=order_log)
+    lease = RecordingTargetLease(order_log=order_log)
+
+    orchestrator, result = _run_happy_path(
+        workspace=workspace,
+        target=target,
+        git_baseline=git_baseline,
+        git_safety=git_safety,
+        run_store=run_store,
+    )
+
+    issue_result = finalize_run(
+        record=orchestrator.record,
+        target=target,
+        trigger_outcome=_trigger_outcome(result),
+        review_status=_last_review_status(result),
+        interrupted=False,
+        termination_confirmed=_termination_confirmed(result),
+        git_safety=git_safety,
+        run_store=run_store,
+        lease=lease,
+        clock=SteppingClock(),
+        max_review_cycles=MAX_REVIEW_CYCLES,
+    )
+
+    assert _last_review_status(result) is ReviewStatus.APPROVED
+    assert issue_result.final_status is FinalStatus.APPROVED
+    assert issue_result.expected_exit_code == 0
+    assert issue_result.trigger_outcome is RunOutcome.SUCCEEDED
+    assert issue_result.persistence_status is PersistenceStatus.OK
+    assert issue_result.changes_preserved is True
+
+    final_record = run_store.persist_calls[-1]
+    assert final_record.current_phase is PipelinePhase.FINISHED
+    assert final_record.final_status is FinalStatus.APPROVED
+    assert final_record.git_postflight == checks[-1]
+
+    # The postflight probe, the final persist, and the lease release happen
+    # strictly after every pipeline-owned call, and in exactly that order.
+    assert order_log[-3:] == [
+        "git_check:postflight",
+        "persist:FINISHED",
+        "lease_release",
+    ]
+    assert lease.released is True
+
+
+def test_finalize_run_denies_approval_when_postflight_drifts_after_a_historical_approval(
+    tmp_path: Path,
+) -> None:
+    """System Design SS8.4: the reviewer's own `APPROVED` "resta un dato
+    storico e non viene riscritto" -- but a branch drift discovered only at
+    the final postflight still denies approval; the historical verdict is
+    reported to the gate unchanged, the gate is what says no."""
+
+    workspace, target = _workspace_and_target(tmp_path)
+    git_baseline = _git_state(target_root=target.root, fingerprint="fp-0")
+
+    checks = _happy_path_git_checks(target.root)
+    checks.append(
+        _git_check(
+            target_root=target.root,
+            sequence=6,
+            purpose="postflight",
+            state=_git_state(
+                target_root=target.root, fingerprint="fp-9", branch="other-branch"
+            ),
+            safety_status=GitSafetyStatus.UNSAFE,
+        )
+    )
+    git_safety = SequencedGitSafetyPort(checks)
+    run_store = SequencedRunStorePort()
+    lease = RecordingTargetLease()
+
+    orchestrator, result = _run_happy_path(
+        workspace=workspace,
+        target=target,
+        git_baseline=git_baseline,
+        git_safety=git_safety,
+        run_store=run_store,
+    )
+
+    issue_result = finalize_run(
+        record=orchestrator.record,
+        target=target,
+        trigger_outcome=_trigger_outcome(result),
+        review_status=_last_review_status(result),
+        interrupted=False,
+        termination_confirmed=_termination_confirmed(result),
+        git_safety=git_safety,
+        run_store=run_store,
+        lease=lease,
+        clock=SteppingClock(),
+        max_review_cycles=MAX_REVIEW_CYCLES,
+    )
+
+    assert _last_review_status(result) is ReviewStatus.APPROVED  # unchanged, historical
+    assert issue_result.final_status is FinalStatus.FAILED
+    assert issue_result.trigger_outcome is RunOutcome.GIT_SAFETY_ERROR
+    assert issue_result.expected_exit_code == 30
+    assert lease.released is True
+
+
+def test_finalize_run_reports_review_cycles_exhausted_as_failed(tmp_path: Path) -> None:
+    workspace, target = _workspace_and_target(tmp_path)
+    git_baseline = _git_state(target_root=target.root, fingerprint="fp-0")
+    issue_ref = _issue_ref()
+
+    architect_response = ParsedAgentResponse(
+        role=AgentRole.ARCHITECT,
+        body="plan",
+        agent_status=AgentStatus.READY,
+        issue_ref=issue_ref,
+    )
+    coder_response = ParsedAgentResponse(
+        role=AgentRole.CODER, body="done", agent_status=AgentStatus.COMPLETED
+    )
+    reviewer_response = ParsedAgentResponse(
+        role=AgentRole.REVIEWER,
+        body="Not quite right yet.",
+        review_status=ReviewStatus.CHANGES_REQUIRED,
+    )
+    agent_runner = SequencedAgentRunner(
+        [
+            _agent_result(
+                role=AgentRole.ARCHITECT,
+                review_cycle=None,
+                workspace_root=workspace.root,
+                terminal_response=architect_response,
+            ),
+            _agent_result(
+                role=AgentRole.CODER,
+                review_cycle=1,
+                workspace_root=workspace.root,
+                terminal_response=coder_response,
+            ),
+            _agent_result(
+                role=AgentRole.REVIEWER,
+                review_cycle=1,
+                workspace_root=workspace.root,
+                terminal_response=reviewer_response,
+            ),
+        ]
+    )
+    checks = _happy_path_git_checks(target.root)
+    checks.append(
+        _git_check(
+            target_root=target.root,
+            sequence=6,
+            purpose="postflight",
+            state=_git_state(target_root=target.root, fingerprint="fp-9"),
+        )
+    )
+    git_safety = SequencedGitSafetyPort(checks)
+    run_store = SequencedRunStorePort()
+    lease = RecordingTargetLease()
+    orchestrator = _orchestrator(
+        workspace=workspace,
+        target=target,
+        agent_runner=agent_runner,
+        git_safety=git_safety,
+        run_store=run_store,
+        git_baseline=git_baseline,
+    )
+
+    result = run_issue_pipeline(
+        orchestrator=orchestrator,
+        issue_locator=_issue_locator(),
+        workspace=workspace,
+        target=target,
+        max_review_cycles=1,
+    )
+    assert result.outcome is RunOutcome.REVIEW_CYCLES_EXHAUSTED
+
+    issue_result = finalize_run(
+        record=orchestrator.record,
+        target=target,
+        trigger_outcome=_trigger_outcome(result),
+        review_status=_last_review_status(result),
+        interrupted=False,
+        termination_confirmed=_termination_confirmed(result),
+        git_safety=git_safety,
+        run_store=run_store,
+        lease=lease,
+        clock=SteppingClock(),
+        max_review_cycles=1,
+    )
+
+    assert _last_review_status(result) is ReviewStatus.CHANGES_REQUIRED
+    assert issue_result.final_status is FinalStatus.FAILED
+    assert issue_result.trigger_outcome is RunOutcome.REVIEW_CYCLES_EXHAUSTED
+    assert issue_result.expected_exit_code == 20
+    assert lease.released is True
+
+
+def test_finalize_run_quarantines_and_marks_indeterminate_when_termination_is_unconfirmed(
+    tmp_path: Path,
+) -> None:
+    """A child process group that might still be alive makes a
+    contemporaneous Git probe unreliable: the postflight determination is
+    forced to `INDETERMINATE` for gate purposes even though the fresh probe
+    itself came back clean, and the target is quarantined before the lease
+    is released (System Design SS16.3; ADR-006) -- but the raw probe
+    evidence is still preserved verbatim on `git_postflight`."""
+
+    workspace, target = _workspace_and_target(tmp_path)
+    git_baseline = _git_state(target_root=target.root, fingerprint="fp-0")
+
+    checks = _happy_path_git_checks(target.root)
+    raw_postflight = _git_check(
+        target_root=target.root,
+        sequence=6,
+        purpose="postflight",
+        state=_git_state(target_root=target.root, fingerprint="fp-9"),
+        safety_status=GitSafetyStatus.SAFE,
+    )
+    checks.append(raw_postflight)
+    git_safety = SequencedGitSafetyPort(checks)
+    run_store = SequencedRunStorePort()
+    lease = RecordingTargetLease()
+
+    orchestrator, result = _run_happy_path(
+        workspace=workspace,
+        target=target,
+        git_baseline=git_baseline,
+        git_safety=git_safety,
+        run_store=run_store,
+    )
+
+    issue_result = finalize_run(
+        record=orchestrator.record,
+        target=target,
+        trigger_outcome=_trigger_outcome(result),
+        review_status=_last_review_status(result),
+        interrupted=False,
+        termination_confirmed=False,
+        git_safety=git_safety,
+        run_store=run_store,
+        lease=lease,
+        clock=SteppingClock(),
+        max_review_cycles=MAX_REVIEW_CYCLES,
+    )
+
+    assert lease.quarantine_reasons != []
+    assert lease.released is True
+    assert issue_result.final_status is FinalStatus.FAILED
+    assert issue_result.git_safety_status is GitSafetyStatus.INDETERMINATE
+
+    final_record = run_store.persist_calls[-1]
+    # The raw probe evidence survives untouched...
+    assert final_record.git_postflight == raw_postflight
+    assert final_record.git_postflight is not None
+    assert final_record.git_postflight.safety_status is GitSafetyStatus.SAFE
+    # ...even though the run's own overall status is downgraded.
+    assert final_record.git_safety_status is GitSafetyStatus.INDETERMINATE
+
+
+def test_finalize_run_records_a_visible_error_when_quarantine_itself_fails(
+    tmp_path: Path,
+) -> None:
+    """A quarantine write failure (System Design SS16.3) is never raised out
+    of `finalize_run` and never silently swallowed either -- it stays
+    visible on the persisted record's own `errors`, and finalization still
+    completes and releases the lease."""
+
+    workspace, target = _workspace_and_target(tmp_path)
+    git_baseline = _git_state(target_root=target.root, fingerprint="fp-0")
+
+    checks = _happy_path_git_checks(target.root)
+    checks.append(
+        _git_check(
+            target_root=target.root,
+            sequence=6,
+            purpose="postflight",
+            state=_git_state(target_root=target.root, fingerprint="fp-9"),
+        )
+    )
+    git_safety = SequencedGitSafetyPort(checks)
+    run_store = SequencedRunStorePort()
+    quarantine_error = LoggingError(
+        "locking.quarantine_write_failed", "could not write the quarantine marker"
+    )
+    lease = RecordingTargetLease(quarantine_error=quarantine_error)
+
+    orchestrator, result = _run_happy_path(
+        workspace=workspace,
+        target=target,
+        git_baseline=git_baseline,
+        git_safety=git_safety,
+        run_store=run_store,
+    )
+
+    issue_result = finalize_run(
+        record=orchestrator.record,
+        target=target,
+        trigger_outcome=_trigger_outcome(result),
+        review_status=_last_review_status(result),
+        interrupted=False,
+        termination_confirmed=False,
+        git_safety=git_safety,
+        run_store=run_store,
+        lease=lease,
+        clock=SteppingClock(),
+        max_review_cycles=MAX_REVIEW_CYCLES,
+    )
+
+    assert lease.quarantine_reasons != []
+    assert lease.released is True  # still released despite the failed quarantine
+    assert issue_result.final_status is FinalStatus.FAILED
+
+    final_record = run_store.persist_calls[-1]
+    assert any(
+        error.code == "locking.quarantine_write_failed" for error in final_record.errors
+    )
+
+
+def test_finalize_run_falls_back_to_the_last_durable_record_when_its_own_persist_fails(
+    tmp_path: Path,
+) -> None:
+    """When `finalize_run`'s own last write fails, its `IssueResult` falls
+    back to the record it was given -- already durable when this call was
+    made -- rather than ever reporting an unpersisted `APPROVED` as genuine
+    (System Design SS15.4)."""
+
+    workspace, target = _workspace_and_target(tmp_path)
+    git_baseline = _git_state(target_root=target.root, fingerprint="fp-0")
+
+    checks = _happy_path_git_checks(target.root)
+    checks.append(
+        _git_check(
+            target_root=target.root,
+            sequence=6,
+            purpose="postflight",
+            state=_git_state(target_root=target.root, fingerprint="fp-9"),
+        )
+    )
+    git_safety = SequencedGitSafetyPort(checks)
+    run_store = SequencedRunStorePort(
+        persist_results=[
+            PersistenceStatus.OK,
+            PersistenceStatus.OK,
+            PersistenceStatus.OK,
+            PersistenceStatus.FAILED,
+        ]
+    )
+    lease = RecordingTargetLease()
+
+    orchestrator, result = _run_happy_path(
+        workspace=workspace,
+        target=target,
+        git_baseline=git_baseline,
+        git_safety=git_safety,
+        run_store=run_store,
+    )
+    last_durable_record = orchestrator.record
+
+    issue_result = finalize_run(
+        record=orchestrator.record,
+        target=target,
+        trigger_outcome=_trigger_outcome(result),
+        review_status=_last_review_status(result),
+        interrupted=False,
+        termination_confirmed=_termination_confirmed(result),
+        git_safety=git_safety,
+        run_store=run_store,
+        lease=lease,
+        clock=SteppingClock(),
+        max_review_cycles=MAX_REVIEW_CYCLES,
+    )
+
+    assert len(run_store.persist_calls) == 4
+    assert issue_result.final_status is FinalStatus.FAILED
+    assert issue_result.persistence_status is PersistenceStatus.FAILED
+    assert issue_result.run_id == last_durable_record.run_id
+    assert issue_result.artifact_path == last_durable_record.artifact_path
+    assert lease.released is True  # still released even though this write failed
+
+
+def test_finalize_run_reports_a_provider_exhaustion_trigger_as_failed(
+    tmp_path: Path,
+) -> None:
+    workspace, target = _workspace_and_target(tmp_path)
+    git_baseline = _git_state(target_root=target.root, fingerprint="fp-0")
+    issue_ref = _issue_ref()
+
+    architect_response = ParsedAgentResponse(
+        role=AgentRole.ARCHITECT,
+        body="plan",
+        agent_status=AgentStatus.READY,
+        issue_ref=issue_ref,
+    )
+    same_fingerprint = _git_state(target_root=target.root, fingerprint="fp-0")
+    agent_runner = SequencedAgentRunner(
+        [
+            _agent_result(
+                role=AgentRole.ARCHITECT,
+                review_cycle=None,
+                workspace_root=workspace.root,
+                terminal_response=architect_response,
+            ),
+            _agent_result(
+                role=AgentRole.CODER,
+                review_cycle=1,
+                provider_attempt=1,
+                workspace_root=workspace.root,
+                terminal_response=None,
+                provider_diagnostic=_provider_diagnostic(retryable=True),
+            ),
+            _agent_result(
+                role=AgentRole.CODER,
+                review_cycle=1,
+                provider_attempt=2,
+                workspace_root=workspace.root,
+                terminal_response=None,
+                provider_diagnostic=_provider_diagnostic(retryable=True),
+            ),
+            _agent_result(
+                role=AgentRole.CODER,
+                review_cycle=1,
+                provider_attempt=3,
+                workspace_root=workspace.root,
+                terminal_response=None,
+                provider_diagnostic=_provider_diagnostic(retryable=True),
+            ),
+        ]
+    )
+    checks = [
+        _git_check(
+            target_root=target.root,
+            sequence=0,
+            purpose="ARCHITECT:0:1:before",
+            state=same_fingerprint,
+        ),
+        _git_check(
+            target_root=target.root,
+            sequence=1,
+            purpose="ARCHITECT:0:1:after",
+            state=same_fingerprint,
+        ),
+    ]
+    for attempt in (1, 2, 3):
+        checks.append(
+            _git_check(
+                target_root=target.root,
+                sequence=len(checks),
+                purpose=f"CODER:1:{attempt}:before",
+                state=same_fingerprint,
+            )
+        )
+        checks.append(
+            _git_check(
+                target_root=target.root,
+                sequence=len(checks),
+                purpose=f"CODER:1:{attempt}:after",
+                state=same_fingerprint,
+            )
+        )
+    checks.append(
+        _git_check(
+            target_root=target.root,
+            sequence=len(checks),
+            purpose="postflight",
+            state=same_fingerprint,
+        )
+    )
+    git_safety = SequencedGitSafetyPort(checks)
+    run_store = SequencedRunStorePort()
+    lease = RecordingTargetLease()
+    orchestrator = _orchestrator(
+        workspace=workspace,
+        target=target,
+        agent_runner=agent_runner,
+        git_safety=git_safety,
+        run_store=run_store,
+        git_baseline=git_baseline,
+        sleeper=RecordingSleeper(),
+    )
+
+    result = run_issue_pipeline(
+        orchestrator=orchestrator,
+        issue_locator=_issue_locator(),
+        workspace=workspace,
+        target=target,
+        max_review_cycles=MAX_REVIEW_CYCLES,
+    )
+    assert result.outcome is RunOutcome.PROVIDER_ERROR
+    assert result.reviewer_cycles == ()  # the reviewer never ran
+
+    issue_result = finalize_run(
+        record=orchestrator.record,
+        target=target,
+        trigger_outcome=_trigger_outcome(result),
+        review_status=_last_review_status(result),
+        interrupted=False,
+        termination_confirmed=_termination_confirmed(result),
+        git_safety=git_safety,
+        run_store=run_store,
+        lease=lease,
+        clock=SteppingClock(),
+        max_review_cycles=MAX_REVIEW_CYCLES,
+    )
+
+    assert _last_review_status(result) is None  # no reviewer verdict to weigh
+    assert issue_result.final_status is FinalStatus.FAILED
+    assert issue_result.trigger_outcome is RunOutcome.PROVIDER_ERROR
+    assert issue_result.expected_exit_code == 20
+    assert lease.released is True
+
+
+def test_finalize_run_lets_an_interruption_outrank_the_original_trigger(
+    tmp_path: Path,
+) -> None:
+    """`interrupted=True` outranks a plain technical trigger in
+    `resolve_terminal_outcome`'s own precedence (System Design SS13.3),
+    exactly as it would for any other terminal path this function converges."""
+
+    workspace, target = _workspace_and_target(tmp_path)
+    git_baseline = _git_state(target_root=target.root, fingerprint="fp-0")
+
+    architect_response = ParsedAgentResponse(
+        role=AgentRole.ARCHITECT,
+        body="Could not access the issue.",
+        agent_status=AgentStatus.FAILED,
+    )
+    agent_runner = SequencedAgentRunner(
+        [
+            _agent_result(
+                role=AgentRole.ARCHITECT,
+                review_cycle=None,
+                workspace_root=workspace.root,
+                terminal_response=architect_response,
+            )
+        ]
+    )
+    same_fingerprint = _git_state(target_root=target.root, fingerprint="fp-0")
+    git_safety = SequencedGitSafetyPort(
+        [
+            _git_check(
+                target_root=target.root,
+                sequence=0,
+                purpose="ARCHITECT:0:1:before",
+                state=same_fingerprint,
+            ),
+            _git_check(
+                target_root=target.root,
+                sequence=1,
+                purpose="ARCHITECT:0:1:after",
+                state=same_fingerprint,
+            ),
+            _git_check(
+                target_root=target.root,
+                sequence=2,
+                purpose="postflight",
+                state=same_fingerprint,
+            ),
+        ]
+    )
+    run_store = SequencedRunStorePort()
+    lease = RecordingTargetLease()
+    orchestrator = _orchestrator(
+        workspace=workspace,
+        target=target,
+        agent_runner=agent_runner,
+        git_safety=git_safety,
+        run_store=run_store,
+        git_baseline=git_baseline,
+    )
+
+    result = run_issue_pipeline(
+        orchestrator=orchestrator,
+        issue_locator=_issue_locator(),
+        workspace=workspace,
+        target=target,
+        max_review_cycles=MAX_REVIEW_CYCLES,
+    )
+    assert result.outcome is RunOutcome.AGENT_REPORTED_FAILURE
+
+    issue_result = finalize_run(
+        record=orchestrator.record,
+        target=target,
+        trigger_outcome=_trigger_outcome(result),
+        review_status=_last_review_status(result),
+        interrupted=True,
+        termination_confirmed=_termination_confirmed(result),
+        git_safety=git_safety,
+        run_store=run_store,
+        lease=lease,
+        clock=SteppingClock(),
+        max_review_cycles=MAX_REVIEW_CYCLES,
+    )
+
+    assert issue_result.final_status is FinalStatus.FAILED
+    assert issue_result.trigger_outcome is RunOutcome.INTERRUPTED
+    assert lease.released is True
+
+
+def test_finalize_run_reports_a_content_only_drift_after_approval_as_git_safety_error(
+    tmp_path: Path,
+) -> None:
+    """The postflight continuity check compares against the *last checkpoint
+    the pipeline itself accepted* -- the reviewer's own `SAFE` `after` -- not
+    the run's original baseline with the coder's own tolerance. A
+    content-only change to a file the coder never touched, slipped in after
+    the reviewer's `APPROVED` and before finalization, changes nothing about
+    branch/HEAD but is still `UNSAFE`: comparing against the *original*
+    baseline with `role=CODER` would instead tolerate it as an ordinary
+    coder delta and mask it entirely (the bug this test guards against)."""
+
+    workspace, target = _workspace_and_target(tmp_path)
+    baseline_state = _git_state(target_root=target.root, fingerprint="fp-0")
+    after_coder_state = _git_state(target_root=target.root, fingerprint="fp-a")
+    drifted_after_approval_state = _git_state(
+        target_root=target.root, fingerprint="fp-ab"
+    )
+
+    git_safety = ComparingGitSafetyPort(
+        [
+            baseline_state,  # architect before: no drift yet
+            baseline_state,  # architect after: architect changes nothing
+            baseline_state,  # coder before: continuity holds
+            after_coder_state,  # coder after: A changes, tolerated for CODER
+            after_coder_state,  # reviewer before: continuity holds
+            after_coder_state,  # reviewer after: reviewer changes nothing
+            drifted_after_approval_state,  # postflight: B changes, content-only
+        ]
+    )
+    run_store = SequencedRunStorePort()
+    lease = RecordingTargetLease()
+
+    orchestrator, result = _run_happy_path(
+        workspace=workspace,
+        target=target,
+        git_baseline=baseline_state,
+        git_safety=git_safety,
+        run_store=run_store,
+    )
+    assert _last_review_status(result) is ReviewStatus.APPROVED
+
+    issue_result = finalize_run(
+        record=orchestrator.record,
+        target=target,
+        trigger_outcome=_trigger_outcome(result),
+        review_status=_last_review_status(result),
+        interrupted=False,
+        termination_confirmed=_termination_confirmed(result),
+        git_safety=git_safety,
+        run_store=run_store,
+        lease=lease,
+        clock=SteppingClock(),
+        max_review_cycles=MAX_REVIEW_CYCLES,
+    )
+
+    postflight_call = git_safety.calls[-1]
+    _, purpose, role, compared_baseline = postflight_call
+    assert purpose == "postflight"
+    assert role is None
+    assert compared_baseline == after_coder_state  # the last *accepted* checkpoint...
+    assert compared_baseline != baseline_state  # ...never the original baseline
+
+    assert _last_review_status(result) is ReviewStatus.APPROVED  # unchanged, historical
+    assert issue_result.git_safety_status is GitSafetyStatus.UNSAFE
+    assert issue_result.final_status is FinalStatus.FAILED
+    assert issue_result.trigger_outcome is RunOutcome.GIT_SAFETY_ERROR
+    assert issue_result.expected_exit_code == 30
+    assert issue_result.changes_preserved is True  # A and B both stay on disk
+    assert lease.released is True
+
+
+def test_finalize_run_postflight_stays_safe_with_no_new_delta_after_approval(
+    tmp_path: Path,
+) -> None:
+    """The mirror image of the drift case above: when nothing at all changes
+    between the reviewer's `APPROVED` and finalization, the postflight
+    continuity check against the last accepted checkpoint still comes back
+    `SAFE`, and the run finalizes `APPROVED`."""
+
+    workspace, target = _workspace_and_target(tmp_path)
+    baseline_state = _git_state(target_root=target.root, fingerprint="fp-0")
+    after_coder_state = _git_state(target_root=target.root, fingerprint="fp-a")
+
+    git_safety = ComparingGitSafetyPort(
+        [
+            baseline_state,  # architect before
+            baseline_state,  # architect after
+            baseline_state,  # coder before
+            after_coder_state,  # coder after: A changes, tolerated for CODER
+            after_coder_state,  # reviewer before
+            after_coder_state,  # reviewer after
+            after_coder_state,  # postflight: nothing changed since approval
+        ]
+    )
+    run_store = SequencedRunStorePort()
+    lease = RecordingTargetLease()
+
+    orchestrator, result = _run_happy_path(
+        workspace=workspace,
+        target=target,
+        git_baseline=baseline_state,
+        git_safety=git_safety,
+        run_store=run_store,
+    )
+
+    issue_result = finalize_run(
+        record=orchestrator.record,
+        target=target,
+        trigger_outcome=_trigger_outcome(result),
+        review_status=_last_review_status(result),
+        interrupted=False,
+        termination_confirmed=_termination_confirmed(result),
+        git_safety=git_safety,
+        run_store=run_store,
+        lease=lease,
+        clock=SteppingClock(),
+        max_review_cycles=MAX_REVIEW_CYCLES,
+    )
+
+    assert issue_result.git_safety_status is GitSafetyStatus.SAFE
+    assert issue_result.final_status is FinalStatus.APPROVED
+    assert issue_result.expected_exit_code == 0
+    assert lease.released is True
