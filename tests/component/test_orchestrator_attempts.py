@@ -269,6 +269,31 @@ class SequencedGitSafetyPort:
         return self._results.pop(0)
 
 
+CONTROL_PLANE_DIGEST = "control-plane-digest-abc123"
+
+
+class SequencedOpenCodePreflightPort:
+    """An `OpenCodePreflightPort` fake: `verify()` is never exercised here
+    (M13-01's `bootstrap_run` calls it, not `IssueOrchestrator`); `recheck`
+    is scripted to succeed unless a drift is queued for a specific call."""
+
+    def __init__(self, *, recheck_errors: list[Exception | None] | None = None) -> None:
+        self.recheck_calls: list[str] = []
+        self._recheck_errors = (
+            list(recheck_errors) if recheck_errors is not None else None
+        )
+
+    def verify(self) -> str:
+        raise AssertionError("not exercised by this issue's orchestrator scope")
+
+    def recheck(self, expected_digest: str) -> None:
+        self.recheck_calls.append(expected_digest)
+        if self._recheck_errors:
+            error = self._recheck_errors.pop(0)
+            if error is not None:
+                raise error
+
+
 class SteppingClock:
     """A `Clock` fake whose `now()` advances by one second on every call."""
 
@@ -442,6 +467,8 @@ def test_logical_invocations_across_a_rework_cycle_keep_checkpoint_continuity(
         agent_runner=agent_runner,
         run_store=run_store,
         git_safety=git_safety,
+        opencode_preflight=SequencedOpenCodePreflightPort(),
+        control_plane_digest=CONTROL_PLANE_DIGEST,
         clock=SteppingClock(start=NOW),
         sleeper=RecordingSleeper(),
         provider_retry=_provider_retry_config(),
@@ -537,11 +564,12 @@ def test_logical_invocations_across_a_rework_cycle_keep_checkpoint_continuity(
             InvocationEventKind.INVOCATION_STARTED,
             InvocationEventKind.ATTEMPT_SINK_OPENED,
             InvocationEventKind.GIT_BEFORE_CHECKED,
+            InvocationEventKind.CONTROL_PLANE_RECHECKED,
             InvocationEventKind.AGENT_RESULT_RECEIVED,
             InvocationEventKind.GIT_AFTER_CHECKED,
             InvocationEventKind.ATTEMPT_SINK_CLOSED,
         ]
-        assert [event.sequence for event in outcome.events] == [0, 1, 2, 3, 4, 5]
+        assert [event.sequence for event in outcome.events] == [0, 1, 2, 3, 4, 5, 6]
         timestamps = [event.timestamp for event in outcome.events]
         assert timestamps == sorted(timestamps)
 
@@ -585,6 +613,8 @@ def test_a_git_before_drift_blocks_the_agent_and_the_run_store_still_opened_a_si
         agent_runner=agent_runner,
         run_store=run_store,
         git_safety=git_safety,
+        opencode_preflight=SequencedOpenCodePreflightPort(),
+        control_plane_digest=CONTROL_PLANE_DIGEST,
         clock=SteppingClock(start=NOW),
         sleeper=RecordingSleeper(),
         provider_retry=_provider_retry_config(),
@@ -680,6 +710,8 @@ def test_a_run_store_persist_failure_blocks_every_later_invocation(
         agent_runner=agent_runner,
         run_store=run_store,
         git_safety=git_safety,
+        opencode_preflight=SequencedOpenCodePreflightPort(),
+        control_plane_digest=CONTROL_PLANE_DIGEST,
         clock=SteppingClock(start=NOW),
         sleeper=RecordingSleeper(),
         provider_retry=_provider_retry_config(),
@@ -772,6 +804,8 @@ def test_cancellation_observed_during_an_attempt_blocks_the_next_invocation(
         agent_runner=agent_runner,
         run_store=run_store,
         git_safety=git_safety,
+        opencode_preflight=SequencedOpenCodePreflightPort(),
+        control_plane_digest=CONTROL_PLANE_DIGEST,
         clock=SteppingClock(start=NOW),
         sleeper=RecordingSleeper(),
         provider_retry=_provider_retry_config(),
@@ -862,6 +896,7 @@ def test_run_provider_attempts_recovers_after_a_transient_provider_error(
     agent_runner = SequencedAgentRunner([first_attempt, second_attempt])
     git_safety = SequencedGitSafetyPort(git_results)
     sleeper = RecordingSleeper()
+    opencode_preflight = SequencedOpenCodePreflightPort()
     orchestrator = IssueOrchestrator(
         initial_record=_initial_record(
             run_id="run-2026-09-15-qrst", workspace=workspace, target=target
@@ -869,6 +904,8 @@ def test_run_provider_attempts_recovers_after_a_transient_provider_error(
         agent_runner=agent_runner,
         run_store=run_store,
         git_safety=git_safety,
+        opencode_preflight=opencode_preflight,
+        control_plane_digest=CONTROL_PLANE_DIGEST,
         clock=SteppingClock(start=NOW),
         sleeper=sleeper,
         provider_retry=_provider_retry_config(),
@@ -891,6 +928,12 @@ def test_run_provider_attempts_recovers_after_a_transient_provider_error(
     # continuity held across the retry: attempt 2's before is attempt 1's after
     before_calls = [call for call in git_safety.calls if call[2].endswith(":before")]
     assert before_calls[1][4] is git_results[1].state
+    # the control plane is rechecked once per attempt, including the retry,
+    # always against the same digest bootstrap_run originally obtained.
+    assert opencode_preflight.recheck_calls == [
+        CONTROL_PLANE_DIGEST,
+        CONTROL_PLANE_DIGEST,
+    ]
 
     assert len(run_store.persist_calls) == 2
     persisted_first_attempt = run_store.persist_calls[0].attempts[0]
@@ -956,6 +999,7 @@ def test_run_provider_attempts_exhausts_the_budget_with_capped_backoff(
     agent_runner = SequencedAgentRunner(agent_results)
     git_safety = SequencedGitSafetyPort(git_results)
     sleeper = RecordingSleeper()
+    opencode_preflight = SequencedOpenCodePreflightPort()
     orchestrator = IssueOrchestrator(
         initial_record=_initial_record(
             run_id="run-2026-09-15-uvwx", workspace=workspace, target=target
@@ -963,6 +1007,8 @@ def test_run_provider_attempts_exhausts_the_budget_with_capped_backoff(
         agent_runner=agent_runner,
         run_store=run_store,
         git_safety=git_safety,
+        opencode_preflight=opencode_preflight,
+        control_plane_digest=CONTROL_PLANE_DIGEST,
         clock=SteppingClock(start=NOW),
         sleeper=sleeper,
         provider_retry=config,
@@ -986,3 +1032,6 @@ def test_run_provider_attempts_exhausts_the_budget_with_capped_backoff(
     assert results[-1].precedence.outcome is RunOutcome.PROVIDER_ERROR
     assert len(run_store.persist_calls) == 3
     assert len(run_store.persist_calls[-1].attempts) == 3
+    # rechecked once per attempt -- three attempts, three rechecks, always
+    # against the exact same digest.
+    assert opencode_preflight.recheck_calls == [CONTROL_PLANE_DIGEST] * 3
