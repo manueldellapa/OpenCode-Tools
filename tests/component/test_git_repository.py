@@ -631,6 +631,24 @@ def test_git_state_v1_exceeded_deadline_on_a_large_repository_is_indeterminate(
     """An exceeded deadline fails closed to `INDETERMINATE` -- never a
     less-safe fallback to porcelain-only hashing -- even for a large
     corpus (AC-036, System Design SS11.2).
+
+    `SubprocessRunner`'s own per-probe deadline check
+    (`_wait_for_exit_or_deadline`) polls on a fixed interval and asks "has
+    the child already exited" before "was the deadline missed" -- so at a
+    real, race-the-clock deadline shorter than that poll interval, whether
+    a probe is caught as timed out depends on exactly how fast this
+    machine's `git` forks and exits relative to Python's own polling
+    cadence, not on the deadline itself. `utility_timeout_seconds=0.001` is
+    also three orders of magnitude below `ExecutionConfig`'s validated
+    floor of 1 second (`domain.py`), so production can never construct a
+    value anywhere near this edge in the first place. `SubprocessRunner`
+    is driven by `_FakeDeadlineClock` here (like
+    `test_capture_git_state_does_not_retry_past_the_deadline` above, for
+    the same reason) so the *first* probe's deadline check deterministically
+    reports "already exceeded" regardless of real `git` timing, rather than
+    racing a real clock against a real subprocess the way the module
+    docstring already says this file avoids for every other deadline
+    scenario.
     """
 
     workspace = _workspace(tmp_path / "workspace")
@@ -638,7 +656,7 @@ def test_git_state_v1_exceeded_deadline_on_a_large_repository_is_indeterminate(
     target = _resolve(workspace, repo)
 
     capture = capture_git_state(
-        SubprocessRunner(RealClock()),
+        SubprocessRunner(_FakeDeadlineClock()),
         git_executable=GIT_EXECUTABLE,
         target=target,
         clock=RealClock(),
