@@ -8,17 +8,14 @@ PRD, System Design, and ADRs listed in `CLAUDE.md`.
 
 ## OpenCode `1.17.18`
 
-**Status: candidate, not supported.**
+**Status: supported (M15-03, issue #59), 2026-09-17.**
 
-`1.17.18` is the only version OpenCode-Tools targets in v0.1. It became a
-candidate when the offline fixture pack in
+`1.17.18` is the only version OpenCode-Tools targets in v0.1, and the only
+one the exact-version registry now enables. It became a *candidate* when
+the offline fixture pack in
 [`tests/fixtures/opencode/1.17.18/`](../tests/fixtures/opencode/1.17.18/)
-was built (work package M07-01, issue #21). A candidate version has offline
-evidence for the transport, capability, and identity contract described in
-System Design SS10, but has not yet been proven against a real, running
-OpenCode process.
-
-A version only moves from *candidate* to *supported* after:
+was built (work package M07-01, issue #21), then moved to *supported* after
+all three of the following passed:
 
 1. the OpenCode adapter (`src/opencode_tools/opencode.py`, M07-02 through
    M07-06) is implemented and passes its full unit/component suite against
@@ -26,35 +23,56 @@ A version only moves from *candidate* to *supported* after:
    control-plane preflight, the command builder and flag deny-list, the
    NDJSON transport decoder, sanitized-export agent identity verification,
    and the provider classifier;
-2. the compatibility smoke test (M15-03, AC-027) runs a disposable,
-   opt-in-only invocation against a real, locally installed `1.17.18` binary
-   and inspects the resulting artifacts, with no automatic publication or
-   GitHub mutation;
-3. the exact-version registry is updated to enable `1.17.18` as a supported
-   runtime version.
+2. the compatibility smoke test (M15-03, AC-027) ran a disposable,
+   opt-in-only invocation against a real, locally installed `1.17.18`
+   binary and the resulting artifacts were inspected, with no automatic
+   publication or GitHub mutation;
+3. the exact-version registry
+   (`tests/fixtures/opencode/1.17.18/MANIFEST.json`'s `compatibility_status`)
+   is updated to `"supported"`.
 
-Step 1 is done: the CLI command (M14, see [`README.md`](../README.md))
-wires this adapter into `opencode_tools.cli.main` end to end -- composition
-root, pipeline
-execution, and terminal rendering are all implemented and covered by
-`tests/unit/test_cli.py` and `tests/component/test_cli_end_to_end.py`,
-including a full architect/coder/reviewer run against faked `opencode` and
-`gh` processes. None of that substitutes for step 2: every test that
-exercises the command does so against fixtures or a fake `opencode`
-executable, never a real, running OpenCode process, so it proves the
-command's own wiring and rendering, not OpenCode `1.17.18` compatibility.
-Steps 2 and 3 above are both M15-03's gate and are still open; neither is
-blocked by, or required for, any milestone before M15. (M15-02, covered
-below under "Platform baseline," qualifies the deterministic QG and
-acceptance suite on macOS and Linux -- a separate gate from OpenCode
-`1.17.18` candidacy, and on its own it does not move `1.17.18` any closer
-to *supported*.)
+Step 1 was already done by the CLI command (M14, see
+[`README.md`](../README.md)), which wires this adapter into
+`opencode_tools.cli.main` end to end -- composition root, pipeline
+execution, and terminal rendering, covered by `tests/unit/test_cli.py` and
+`tests/component/test_cli_end_to_end.py` including a full
+architect/coder/reviewer run against faked `opencode` and `gh` processes.
+That alone never substituted for step 2, since every one of those tests
+exercises a fixture or a fake `opencode` executable, never a real, running
+OpenCode process. Step 2 is what actually happened on 2026-09-17: two
+independent full runs of `tests/integration/test_opencode_1_17_18_smoke.py
+-m live`, against a disposable private GitHub repository and a single
+controlled issue on this project's own macOS (darwin) development machine,
+both `PASSED` with an identical evidence shape:
 
-Until all three steps pass, the preflight in ADR-005 accepts no versions at
-all: there is no fallback to "best effort," to a nearby version, or to a
-default agent. If the identity proof or the smoke test ever fails for
-`1.17.18`, the version reverts to unsupported and ADR-005 must be
-re-reviewed; a fallback is not an acceptable workaround.
+- exact version `1.17.18` (`opencode --version`), no nearby-version
+  fallback;
+- the real, project-local `architect`/`coder`/`reviewer` agent definitions
+  and their own configured provider/model (openrouter-hosted), resolved
+  with zero fallback to a default agent, model, or provider -- confirmed
+  both via `opencode debug agent <role>` preflight and via each attempt's
+  sanitized-export `verified_agent` matching the requested role exactly;
+- three distinct `session_id`s, one per role, never reused across attempts;
+- `git_safety_status: SAFE` throughout, and the disposable target's remote
+  `HEAD`, local `HEAD`, and commit count were all unchanged after the run
+  -- no publication, no push, no GitHub mutation was observed;
+- `final_status: APPROVED`, `terminal_outcome: SUCCEEDED` on both runs: the
+  architect retrieved the real issue via the single `gh issue view`
+  command its own least-privilege bash policy allows, the coder made the
+  requested single-file change, and the reviewer approved it.
+
+This evidence is macOS (darwin) only -- the live smoke was not re-run on
+Linux in this qualification. That does not narrow v0.1's declared platform
+support (ADR-009 already covers macOS and Linux, and the deterministic QG
+and acceptance suite are independently qualified on both, see "Platform
+baseline" below); it means the *live OpenCode process* half of AC-027
+specifically has direct evidence from macOS only.
+
+The preflight in ADR-005 still accepts no version other than the one
+recorded here as supported: there is no fallback to "best effort," to a
+nearby version, or to a default agent. If the identity proof or the smoke
+test ever fails for `1.17.18` again, the version reverts to unsupported and
+ADR-005 must be re-reviewed; a fallback is not an acceptable workaround.
 
 ### Fixture pack
 
@@ -83,9 +101,10 @@ by itself satisfy the v0.1 acceptance criteria.
 **Deterministic QG and acceptance suite: qualified separately on macOS and
 Linux (M15-02, issue #58), 2026-09-16.** This qualifies the full quality
 gate and deterministic acceptance suite on each platform's own local POSIX
-filesystem -- it does not qualify OpenCode `1.17.18` itself (that stays
-"candidate, not supported" until M15-03 above passes), and it is not a
-smoke test against a real OpenCode process.
+filesystem -- it is a separate gate from OpenCode `1.17.18` itself (covered
+above under "OpenCode `1.17.18`", M15-03), and it is not a smoke test
+against a real OpenCode process; the live smoke's own direct evidence
+remains macOS-only, as noted above.
 
 | | macOS | Linux |
 |---|---|---|
@@ -132,11 +151,12 @@ reasoning.
 
 Excluded scope, unchanged and not declared supported: Windows native;
 WSL on a Windows-mounted filesystem; remote or otherwise non-POSIX
-filesystems; a Windows adapter; OpenCode's live compatibility smoke
-(AC-027, M15-03). Each platform's result above was measured directly and
-independently -- neither is inferred from the other's outcome, and this
-qualification does not widen v0.1's declared support scope beyond what
-ADR-009 already states.
+filesystems; a Windows adapter. Each platform's result above was measured
+directly and independently -- neither is inferred from the other's
+outcome, and this qualification does not widen v0.1's declared support
+scope beyond what ADR-009 already states. (OpenCode's live compatibility
+smoke, AC-027/M15-03, is a separate gate, covered above under "OpenCode
+`1.17.18`" -- its own direct evidence is macOS-only, not excluded.)
 
 ## See also
 

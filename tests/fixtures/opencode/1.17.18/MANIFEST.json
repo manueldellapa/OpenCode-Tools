@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "opencode_version": "1.17.18",
-  "compatibility_status": "candidate",
+  "compatibility_status": "supported",
   "provenance": {
     "method": "Hand-authored offline evidence pack modeling the documented OpenCode 1.17.18 CLI, NDJSON transport, and debug/export JSON contract. No live OpenCode process, network access, or real provider/model was used; every fixture is a static, version-pinned test double checked into the repository.",
     "authored_for": "OpenCode-Tools GitHub issue #21 (work package M07-01)",
@@ -63,6 +63,12 @@
           "debug/agent-architect-permissive-edit.json",
           "debug/agent-architect-permissive-bash.json"
         ]
+      },
+      {
+        "date": "2026-09-17",
+        "authored_for": "OpenCode-Tools GitHub issue #59 (work package M15-03)",
+        "reason": "AC-027 live re-qualification PASSED twice, independently, against a disposable private GitHub repository and a controlled issue on this project's own macOS (darwin) development machine, using the real, project-local architect/coder/reviewer agent definitions and their own configured openrouter provider/model with zero fallback. Both runs: exact version 1.17.18, verified_agent matching the requested role for every attempt via sanitized export, three distinct session_id values, git_safety_status SAFE, no remote/local HEAD or commit-count change, final_status APPROVED. compatibility_status moves from 'candidate' to 'supported' per ADR-005's three-step gate; the corresponding prose lives in docs/compatibility.md.",
+        "affected_fixtures": []
       }
     ]
   },

@@ -143,10 +143,10 @@ def _all_fixture_files() -> tuple[Path, ...]:
 # --- version and status attribution -----------------------------------------
 
 
-def test_manifest_declares_the_exact_candidate_version() -> None:
+def test_manifest_declares_the_exact_supported_version() -> None:
     manifest = _load_manifest()
     assert manifest["opencode_version"] == OPENCODE_VERSION
-    assert manifest["compatibility_status"] == "candidate"
+    assert manifest["compatibility_status"] == "supported"
 
 
 def test_manifest_records_verifiable_pack_wide_provenance() -> None:
@@ -308,11 +308,10 @@ def test_no_fixture_contains_an_obvious_secret_pattern() -> None:
 # --- compatibility documentation ------------------------------------------------
 
 
-def test_compatibility_doc_declares_the_version_candidate_not_supported() -> None:
+def test_compatibility_doc_declares_the_version_supported() -> None:
     doc = COMPATIBILITY_DOC_PATH.read_text(encoding="utf-8")
     assert OPENCODE_VERSION in doc
-    assert "candidate" in doc.lower()
-    assert "not yet supported" in doc.lower() or "not supported" in doc.lower()
+    assert "status: supported" in doc.lower()
 
 
 # =============================================================================
