@@ -1,0 +1,2 @@
+{"type": "tool_use", "sessionID": "ses_provider_nested_overload", "part": {"id": "prt_1", "messageID": "msg_1", "type": "tool", "tool": "edit", "state": {"status": "completed", "output": "1 file changed, 3 insertions(+)"}}}
+{"type": "error", "sessionID": "ses_provider_nested_overload", "error": {"name": "UnknownError", "data": {"message": "{\"code\":503,\"message\":\"Upstream error from Nvidia: Service temporarily overloaded\",\"metadata\":{\"error_type\":\"provider_overloaded\"}}"}}}

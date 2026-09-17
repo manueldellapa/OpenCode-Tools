@@ -33,6 +33,7 @@ from opencode_tools.domain import (
     AgentRole,
     AgentStatus,
     AppConfig,
+    AttemptRecord,
     ConfigSource,
     ErrorRecord,
     ExecutionConfig,
@@ -46,6 +47,7 @@ from opencode_tools.domain import (
     PersistenceStatus,
     PipelinePhase,
     ProcessResult,
+    ProviderDiagnostic,
     ProviderRetryConfig,
     RepositoryIdentity,
     RunOutcome,
@@ -55,7 +57,7 @@ from opencode_tools.domain import (
     Workspace,
 )
 from opencode_tools.errors import ConfigError, LoggingError, PreflightError
-from opencode_tools.opencode import open_run_capture_sink
+from opencode_tools.opencode import classify_provider_signal, open_run_capture_sink
 from opencode_tools.ports import (
     AgentRunner,
     AttemptLogSink,
@@ -897,6 +899,61 @@ def test_agent_runner_reports_a_provider_error_and_never_parses(tmp_path: Path) 
     assert len(process_runner.specs) == 1
 
 
+def test_agent_runner_reports_the_nested_error_shape_as_a_provider_error(
+    tmp_path: Path,
+) -> None:
+    """Regression for GitHub issue #80: the exact OpenCode 1.17.18 evidence
+    from run `20260917T124944.374451Z-bfee6257f6f8` -- a top-level `error`
+    event carrying a serialized-JSON Nvidia/OpenRouter overload payload,
+    emitted after the coder had already edited the target -- must resolve
+    to PROVIDER_ERROR, not PROCESS_ERROR with a null diagnostic. The
+    underlying process outcome is itself PROCESS_ERROR here (the real
+    `opencode` child also exited non-zero), so this proves the fixed
+    classifier's PROVIDER_ERROR now outranks that lower-precedence signal
+    (System Design SS13.2), matching the actual v0.1.0 regression -- not
+    just that a diagnostic is present in isolation."""
+
+    nested_error_bytes = (
+        Path(__file__).resolve().parents[1]
+        / "fixtures"
+        / "opencode"
+        / "1.17.18"
+        / "provider"
+        / "nested-error-provider-overloaded.ndjson"
+    ).read_bytes()
+    runner, process_runner = _agent_runner(
+        [
+            (
+                nested_error_bytes,
+                _process_result(
+                    stdout_bytes=nested_error_bytes, outcome=RunOutcome.PROCESS_ERROR
+                ),
+            )
+        ]
+    )
+    workspace = Workspace(root=tmp_path)
+
+    result = runner.run(
+        AgentRole.CODER,
+        "prompt",
+        workspace,
+        review_cycle=1,
+        provider_attempt=1,
+        sink=_RecordingSink(path=Path("coder.log")),
+    )
+
+    assert result.provider_diagnostic is not None
+    assert result.provider_diagnostic.source == "error"
+    assert result.provider_diagnostic.signature == "overload"
+    assert result.provider_diagnostic.status_code == 503
+    assert result.provider_diagnostic.code == "provider_overloaded"
+    assert result.provider_diagnostic.retryable is True
+    assert result.outcome is RunOutcome.PROVIDER_ERROR
+    assert result.terminal_response is None
+    assert result.session_id is None
+    assert len(process_runner.specs) == 1
+
+
 def test_agent_runner_a_timeout_takes_precedence_over_everything_else(
     tmp_path: Path,
 ) -> None:
@@ -982,6 +1039,7 @@ def _run_record(
     git_baseline: GitState | None = None,
     git_postflight: GitCheckRecord | None = None,
     errors: tuple[ErrorRecord, ...] = (),
+    attempts: tuple[AttemptRecord, ...] = (),
 ) -> RunRecord:
     return RunRecord(
         schema_version=1,
@@ -998,6 +1056,59 @@ def _run_record(
         git_baseline=git_baseline,
         git_postflight=git_postflight,
         errors=errors,
+        attempts=attempts,
+    )
+
+
+_PHASE_BY_ROLE: dict[AgentRole, PipelinePhase] = {
+    AgentRole.ARCHITECT: PipelinePhase.ARCHITECT,
+    AgentRole.CODER: PipelinePhase.CODER,
+    AgentRole.REVIEWER: PipelinePhase.REVIEWER,
+}
+
+
+def _attempt_record(
+    *,
+    target_root: Path,
+    role: AgentRole = AgentRole.CODER,
+    review_cycle: int | None = 1,
+    provider_attempt: int = 1,
+    terminal_response: ParsedAgentResponse | None = None,
+    provider_diagnostic: ProviderDiagnostic | None = None,
+) -> AttemptRecord:
+    """Build a minimal, valid `AttemptRecord` for `_render_issue_result`
+    tests -- only the two fields that drive the provider-diagnostic summary
+    line (`terminal_response`, `provider_diagnostic`) vary; everything else
+    is a plausible, structurally valid filler."""
+
+    agent_result = AgentResult(
+        role=role,
+        phase=_PHASE_BY_ROLE[role],
+        review_cycle=review_cycle,
+        provider_attempt=provider_attempt,
+        process=_process_result(stdout_bytes=b"", outcome=RunOutcome.SUCCEEDED),
+        terminal_response=terminal_response,
+        session_id=None,
+        verified_agent=None,
+        provider_diagnostic=provider_diagnostic,
+        outcome=(
+            RunOutcome.PROVIDER_ERROR
+            if provider_diagnostic is not None
+            else RunOutcome.SUCCEEDED
+        ),
+    )
+    check = _git_check(
+        sequence=0, purpose="check", state=_git_state(target_root=target_root)
+    )
+    return AttemptRecord(
+        logical_invocation_id=f"run:{role.value}:{review_cycle or 0}",
+        role=role,
+        review_cycle=review_cycle,
+        provider_attempt=provider_attempt,
+        git_before=check,
+        git_after=check,
+        agent_result=agent_result,
+        retry_decision=False,
     )
 
 
@@ -1201,6 +1312,182 @@ def test_render_issue_result_surfaces_the_persisted_error_records(
     assert "opencode.version_mismatch" in err
     assert "candidate 1.17.18" in err
     assert "reported='1.17.17'" in err
+
+
+# --- _render_issue_result: the last attempt's provider diagnostic (#80) --
+
+
+def test_render_issue_result_surfaces_the_last_attempts_provider_diagnostic(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Regression for GitHub issue #80's remaining acceptance criterion:
+    when the last attempt left no terminal agent response, its
+    `ProviderDiagnostic` -- here the real classifier's own output for the
+    genuine nested top-level `error` event, not a synthetic one -- must
+    reach the operator through the final stderr summary."""
+
+    nested_error_text = (
+        Path(__file__).resolve().parents[1]
+        / "fixtures"
+        / "opencode"
+        / "1.17.18"
+        / "provider"
+        / "nested-error-provider-overloaded.ndjson"
+    ).read_text(encoding="utf-8")
+    diagnostic = classify_provider_signal(nested_error_text)
+    assert diagnostic is not None
+
+    workspace, target = _workspace_and_target(tmp_path)
+    record = _run_record(
+        workspace=workspace,
+        target=target,
+        attempts=(
+            _attempt_record(
+                target_root=target.root,
+                terminal_response=None,
+                provider_diagnostic=diagnostic,
+            ),
+        ),
+    )
+
+    _render_issue_result(
+        _issue_result(trigger_outcome=RunOutcome.PROVIDER_ERROR), last_record=record
+    )
+
+    err = capsys.readouterr().err
+    assert "provider diagnostic: overload" in err
+    assert "source=error" in err
+    assert "code=provider_overloaded" in err
+    assert "status=503" in err
+
+
+def test_render_issue_result_omits_the_provider_diagnostic_line_without_attempts(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    workspace, target = _workspace_and_target(tmp_path)
+    record = _run_record(workspace=workspace, target=target)
+
+    _render_issue_result(_issue_result(), last_record=record)
+
+    assert "provider diagnostic" not in capsys.readouterr().err
+
+
+def test_render_issue_result_omits_the_provider_diagnostic_line_without_a_last_record(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _render_issue_result(_issue_result(), last_record=None)
+
+    assert "provider diagnostic" not in capsys.readouterr().err
+
+
+def test_render_issue_result_omits_the_provider_diagnostic_line_when_a_terminal_response_exists(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The gate is "no terminal agent response", read directly off the
+    persisted attempt -- not merely "a provider_diagnostic is present" --
+    so a diagnostic accompanied by a terminal response is never surfaced
+    here (never recomputed precedence: a plain, defensive field read)."""
+
+    workspace, target = _workspace_and_target(tmp_path)
+    record = _run_record(
+        workspace=workspace,
+        target=target,
+        attempts=(
+            _attempt_record(
+                target_root=target.root,
+                terminal_response=ParsedAgentResponse(
+                    role=AgentRole.CODER,
+                    body="done",
+                    agent_status=AgentStatus.COMPLETED,
+                ),
+                provider_diagnostic=ProviderDiagnostic(
+                    source="session.error", signature="429", retryable=True
+                ),
+            ),
+        ),
+    )
+
+    _render_issue_result(_issue_result(), last_record=record)
+
+    assert "provider diagnostic" not in capsys.readouterr().err
+
+
+def test_render_issue_result_uses_only_the_most_recent_attempts_diagnostic(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A provider error retried and then recovered must not still show the
+    stale diagnostic from the earlier, non-final attempt -- only the last
+    `AttemptRecord` is ever consulted, matching `_render_issue_result`'s own
+    reliance on the pipeline's already-decided terminal state."""
+
+    workspace, target = _workspace_and_target(tmp_path)
+    record = _run_record(
+        workspace=workspace,
+        target=target,
+        attempts=(
+            _attempt_record(
+                target_root=target.root,
+                provider_attempt=1,
+                terminal_response=None,
+                provider_diagnostic=ProviderDiagnostic(
+                    source="session.error", signature="429", retryable=True
+                ),
+            ),
+            _attempt_record(
+                target_root=target.root,
+                provider_attempt=2,
+                terminal_response=ParsedAgentResponse(
+                    role=AgentRole.CODER,
+                    body="done",
+                    agent_status=AgentStatus.COMPLETED,
+                ),
+                provider_diagnostic=None,
+            ),
+        ),
+    )
+
+    _render_issue_result(
+        _issue_result(final_status=FinalStatus.APPROVED, expected_exit_code=0),
+        last_record=record,
+    )
+
+    assert "provider diagnostic" not in capsys.readouterr().err
+
+
+def test_render_issue_result_keeps_the_stdout_contract_with_a_provider_diagnostic(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The provider-diagnostic line is stderr-only: stdout must still carry
+    exactly the one `FINAL_STATUS` line and nothing else (System Design
+    SS13.4's stdout contract is unaffected by this addition)."""
+
+    workspace, target = _workspace_and_target(tmp_path)
+    record = _run_record(
+        workspace=workspace,
+        target=target,
+        attempts=(
+            _attempt_record(
+                target_root=target.root,
+                terminal_response=None,
+                provider_diagnostic=ProviderDiagnostic(
+                    source="error",
+                    signature="overload",
+                    retryable=True,
+                    status_code=503,
+                    code="provider_overloaded",
+                ),
+            ),
+        ),
+    )
+
+    _render_issue_result(
+        _issue_result(final_status=FinalStatus.FAILED, expected_exit_code=20),
+        last_record=record,
+    )
+
+    captured = capsys.readouterr()
+    assert captured.out.splitlines() == ["FINAL_STATUS: FAILED"]
+    assert "provider diagnostic: overload" in captured.err
 
 
 # --- _render_pre_init_failure: no artifact/FINAL_STATUS promised ---------

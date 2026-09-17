@@ -90,6 +90,27 @@ Adding a new OpenCode version never edits this pack: it gets its own
 `tests/fixtures/opencode/<version>/` directory and its own manifest, so the
 `1.17.18` evidence and expectations stay immutable.
 
+**Provider classifier: a second trusted transport shape (issue #80),
+2026-09-17.** The first production-like run against a real target (issue
+#80's own evidence, run `20260917T124944.374451Z-bfee6257f6f8`) surfaced a
+genuine `1.17.18` event `classify_provider_signal` did not yet recognize:
+a top-level `error` event -- `session.error`'s untagged sibling type --
+whose `error.data.message` is itself a serialized JSON string carrying a
+transient Nvidia/OpenRouter overload (`code: 503`,
+`metadata.error_type: "provider_overloaded"`). It fell through to
+`PROCESS_ERROR` with `provider_diagnostic: null` instead of
+`PROVIDER_ERROR`. `src/opencode_tools/opencode.py`'s classifier now
+recognizes this second shape too, gated by its own narrow, structurally
+exact allowlist (fail-closed on any malformed or unlisted variant, exactly
+like the existing `session.error` path); the coder target-change retry
+suppression (System Design SS11.3/SS12.2) is unaffected, since it never
+depended on which transport shape produced the diagnostic. Two fixtures
+were added -- `provider/nested-error-provider-overloaded.ndjson` (trusted)
+and `provider/lookalike-nested-error-in-tool-output.ndjson` (trust
+boundary) -- sanitized from and structurally faithful to that capture; no
+existing fixture's bytes changed, and `compatibility_status` remains
+`"supported"`.
+
 ### Platform baseline
 
 Per ADR-009, only macOS and Linux on a local POSIX filesystem are supported,
