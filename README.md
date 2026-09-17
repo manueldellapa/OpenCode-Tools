@@ -191,3 +191,8 @@ mypy --strict src tests
   [`tasks/system-design-opencode-tools.md`](tasks/system-design-opencode-tools.md),
   and [`docs/adr/`](docs/adr/) -- the canonical requirements, design, and
   accepted decisions this implementation follows, highest precedence first.
+
+## License
+
+Licensed under the Apache License, Version 2.0. See [LICENSE](LICENSE) for
+the full text.
