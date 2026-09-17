@@ -7,11 +7,12 @@ Python owns the whole lifecycle (state machine, retry, timeouts, Git safety,
 locking, logging); the agents only reason about the issue and write code.
 There is no fourth "orchestrator" agent.
 
-**Status: v0.1, pre-release.** The command, composition root, and terminal
+**Status: v0.1, qualified.** The command, composition root, and terminal
 rendering described below (milestones M01-M14) are implemented and covered
-by the test suite. OpenCode `1.17.18` is still a *candidate*, not a
-*supported*, version -- see [docs/compatibility.md](docs/compatibility.md)
-for exactly what remains open before the M15 qualification gates pass.
+by the test suite. OpenCode `1.17.18` is qualified as the supported
+version, and macOS and Linux on a local POSIX filesystem are the qualified
+platform baseline -- see [docs/compatibility.md](docs/compatibility.md)
+for the full qualification evidence.
 
 ## Requirements
 
@@ -183,8 +184,9 @@ mypy --strict src tests
   model, logged/not-logged data, filesystem privacy, redaction limits.
 - [docs/recovery.md](docs/recovery.md) -- inspecting a finished or failed
   run, the target lock, and quarantine.
-- [docs/compatibility.md](docs/compatibility.md) -- exact OpenCode version
-  and platform baseline, and what is still open before v0.1 release.
+- [docs/compatibility.md](docs/compatibility.md) -- the qualified OpenCode
+  version and platform baseline, and the qualification evidence behind
+  each.
 - [`tasks/prd-opencode-tools.md`](tasks/prd-opencode-tools.md),
   [`tasks/system-design-opencode-tools.md`](tasks/system-design-opencode-tools.md),
   and [`docs/adr/`](docs/adr/) -- the canonical requirements, design, and
