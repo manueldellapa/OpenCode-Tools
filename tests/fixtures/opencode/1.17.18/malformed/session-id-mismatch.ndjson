@@ -1,2 +1,2 @@
-{"type": "message.part.updated", "sessionID": "ses_session_mismatch_a", "part": {"id": "prt_1", "messageID": "msg_1", "type": "text", "text": "Starting work under one session.", "time": {"start": 1}}}
-{"type": "message.part.updated", "sessionID": "ses_session_mismatch_b", "part": {"id": "prt_2", "messageID": "msg_2", "type": "text", "text": "AGENT_STATUS: COMPLETED", "time": {"start": 2, "end": 3}}}
+{"type": "text", "sessionID": "ses_session_mismatch_a", "part": {"id": "prt_1", "messageID": "msg_1", "type": "text", "text": "Starting work under one session.", "time": {"start": 1}}}
+{"type": "text", "sessionID": "ses_session_mismatch_b", "part": {"id": "prt_2", "messageID": "msg_2", "type": "text", "text": "AGENT_STATUS: COMPLETED", "time": {"start": 2, "end": 3}}}

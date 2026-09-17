@@ -1,1 +1,1 @@
-{"type": "message.part.updated", "sessionID": "ses_partial_output", "part": {"id": "prt_1", "messageID": "msg_1", "type": "reasoning", "text": "Beginning the requested change.", "time": {"start": 1}}}
+{"type": "reasoning", "sessionID": "ses_partial_output", "part": {"id": "prt_1", "messageID": "msg_1", "type": "reasoning", "text": "Beginning the requested change.", "time": {"start": 1}}}

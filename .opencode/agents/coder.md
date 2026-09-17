@@ -2,7 +2,7 @@
 {
   "description": "Implements the architect's plan inside the target working tree, strictly uncommitted.",
   "mode": "primary",
-  "model": "anthropic/claude-sonnet-4-5",
+  "model": "openrouter/nvidia/nemotron-3-ultra-550b-a55b:free",
   "tools": { "ask": false, "task": false },
   "permission": { "edit": "allow", "bash": "allow", "webfetch": "deny" }
 }

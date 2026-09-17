@@ -1,6 +1,16 @@
 {
   "name": "architect",
   "mode": "primary",
-  "tools": { "ask": true, "task": false },
-  "permission": { "edit": "deny", "bash": "deny", "webfetch": "deny" }
+  "tools": { "question": true, "task": false },
+  "permission": [
+    { "permission": "*", "action": "allow", "pattern": "*" },
+    { "permission": "question", "action": "deny", "pattern": "*" },
+    { "permission": "read", "action": "allow", "pattern": "*" },
+    { "permission": "ask", "action": "deny", "pattern": "*" },
+    { "permission": "task", "action": "deny", "pattern": "*" },
+    { "permission": "edit", "action": "deny", "pattern": "*" },
+    { "permission": "bash", "action": "deny", "pattern": "*" },
+    { "permission": "bash", "action": "allow", "pattern": "gh issue view *" },
+    { "permission": "webfetch", "action": "deny", "pattern": "*" }
+  ]
 }

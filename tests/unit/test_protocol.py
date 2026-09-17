@@ -15,6 +15,7 @@ from opencode_tools.domain import (
     ParsedAgentResponse,
     RepositoryIdentity,
     ReviewStatus,
+    RunOutcome,
 )
 from opencode_tools.errors import ProtocolError
 from opencode_tools.protocol import parse_agent_response
@@ -363,6 +364,62 @@ def test_single_trailing_newline_after_the_marker_is_still_terminal() -> None:
 
     assert result.agent_status is AgentStatus.COMPLETED
     assert result.body == ""
+
+
+# --- AC-016: terminal-only protocol safety -----------------------------------
+
+
+def test_ac_016_terminal_only_protocol_safety() -> None:
+    # AC-016 (PRD "Protocol safety"): "marker presenti in issue, prompt, tool
+    # event o stderr non sono accettati; marker mancante, duplicato o
+    # incompatibile produce PROTOCOL_ERROR." The second clause is entirely
+    # this module's responsibility and is proven below for each of missing,
+    # duplicate, and incompatible/conflicting markers, with the resulting
+    # exception's `.outcome` checked explicitly against RunOutcome.PROTOCOL_ERROR
+    # to make that half of the AC textually explicit rather than implicit in
+    # ProtocolError's class-level outcome (errors.py).
+    #
+    # The first clause's "not accepted from a tool event or stderr" half is
+    # out of this module's structural scope by design: `parse_agent_response`
+    # never reads NDJSON, tool events, reasoning, or stderr (protocol.py's
+    # module docstring) -- it only ever receives the already-decoded terminal
+    # assistant text an adapter handed it, so that half is proven instead by
+    # the M07 transport-boundary tests in tests/unit/test_opencode_adapter.py
+    # (Implementation Plan SS6: "AC-016 | M06/M07 |
+    # tests/unit/test_protocol.py::test_ac_016_terminal_only_protocol_safety e
+    # transport fixture M07"). Within this module, the closest proxy for "a
+    # marker embedded in issue/prompt-like free text is not accepted" is a
+    # marker-shaped line that never reaches column zero: it is invisible to
+    # the scanner and therefore indistinguishable from a response carrying no
+    # marker at all, exercised as case (4) below.
+
+    # (1) missing marker -> PROTOCOL_ERROR / protocol.marker_missing.
+    with pytest.raises(ProtocolError) as exc_info:
+        _parse(AgentRole.CODER, "Just prose with no marker at all.")
+    assert exc_info.value.code == "protocol.marker_missing"
+    assert exc_info.value.outcome is RunOutcome.PROTOCOL_ERROR
+
+    # (2) duplicate marker -> PROTOCOL_ERROR / protocol.duplicate_marker.
+    with pytest.raises(ProtocolError) as exc_info:
+        _parse(AgentRole.CODER, "AGENT_STATUS: COMPLETED\nAGENT_STATUS: COMPLETED")
+    assert exc_info.value.code == "protocol.duplicate_marker"
+    assert exc_info.value.outcome is RunOutcome.PROTOCOL_ERROR
+
+    # (3) incompatible/conflicting marker -> PROTOCOL_ERROR /
+    #     protocol.conflicting_marker.
+    with pytest.raises(ProtocolError) as exc_info:
+        _parse(AgentRole.REVIEWER, "AGENT_STATUS: FAILED\nREVIEW_STATUS: APPROVED")
+    assert exc_info.value.code == "protocol.conflicting_marker"
+    assert exc_info.value.outcome is RunOutcome.PROTOCOL_ERROR
+
+    # (4) a marker-shaped line off column zero is invisible to the scanner --
+    #     the closest in-module proxy for a marker arriving embedded in
+    #     issue/prompt-like free text rather than as a true terminal line ->
+    #     PROTOCOL_ERROR / protocol.marker_missing.
+    with pytest.raises(ProtocolError) as exc_info:
+        _parse(AgentRole.CODER, " AGENT_STATUS: COMPLETED")
+    assert exc_info.value.code == "protocol.marker_missing"
+    assert exc_info.value.outcome is RunOutcome.PROTOCOL_ERROR
 
 
 # --- the role/status matrix rejects every foreign combination ---------------

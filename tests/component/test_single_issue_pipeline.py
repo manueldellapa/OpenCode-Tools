@@ -3117,7 +3117,10 @@ def test_finalize_run_approves_after_a_clean_reviewer_approval_in_the_correct_or
     assert lease.released is True
 
 
-def test_finalize_run_denies_approval_when_postflight_drifts_after_a_historical_approval(
+# --- AC-019: git drift overrides reviewer approval -------------------------
+
+
+def test_ac_019_git_drift_overrides_reviewer_approval(
     tmp_path: Path,
 ) -> None:
     """System Design SS8.4: the reviewer's own `APPROVED` "resta un dato
@@ -3857,3 +3860,617 @@ def test_finalize_run_postflight_stays_safe_with_no_new_delta_after_approval(
     assert issue_result.final_status is FinalStatus.APPROVED
     assert issue_result.expected_exit_code == 0
     assert lease.released is True
+
+
+# --- AC-008: happy path (order, postflight safe, exit code 0, APPROVED) ----
+
+
+def test_ac_008_happy_path(tmp_path: Path) -> None:
+    """AC-008: fake OpenCode produces `READY`, `COMPLETED`, `APPROVED`; the
+    order is correct, postflight is safe, the exit code is 0, and the final
+    status is `APPROVED` -- proven together in one continuous run, from the
+    first architect invocation through `finalize_run`."""
+
+    workspace, target = _workspace_and_target(tmp_path)
+    git_baseline = _git_state(target_root=target.root, fingerprint="fp-0")
+    issue_ref = _issue_ref()
+    architect_response, coder_response, reviewer_response = _happy_path_responses(
+        issue_ref
+    )
+
+    agent_runner = SequencedAgentRunner(
+        [
+            _agent_result(
+                role=AgentRole.ARCHITECT,
+                review_cycle=None,
+                workspace_root=workspace.root,
+                terminal_response=architect_response,
+            ),
+            _agent_result(
+                role=AgentRole.CODER,
+                review_cycle=1,
+                workspace_root=workspace.root,
+                terminal_response=coder_response,
+            ),
+            _agent_result(
+                role=AgentRole.REVIEWER,
+                review_cycle=1,
+                workspace_root=workspace.root,
+                terminal_response=reviewer_response,
+            ),
+        ]
+    )
+    checks = _happy_path_git_checks(target.root)
+    checks.append(
+        _git_check(
+            target_root=target.root,
+            sequence=6,
+            purpose="postflight",
+            state=_git_state(target_root=target.root, fingerprint="fp-9"),
+        )
+    )
+    git_safety = SequencedGitSafetyPort(checks)
+    run_store = SequencedRunStorePort()
+    lease = RecordingTargetLease()
+
+    orchestrator = _orchestrator(
+        workspace=workspace,
+        target=target,
+        agent_runner=agent_runner,
+        git_safety=git_safety,
+        run_store=run_store,
+        git_baseline=git_baseline,
+    )
+
+    result = run_issue_pipeline(
+        orchestrator=orchestrator,
+        issue_locator=_issue_locator(),
+        workspace=workspace,
+        target=target,
+        max_review_cycles=MAX_REVIEW_CYCLES,
+    )
+
+    # The canonical invocation order: never a fourth agent.
+    assert [call[0] for call in agent_runner.calls] == [
+        AgentRole.ARCHITECT,
+        AgentRole.CODER,
+        AgentRole.REVIEWER,
+    ]
+    assert result.state == PipelineState(phase=PipelinePhase.POSTFLIGHT)
+    assert result.outcome is None
+
+    issue_result = finalize_run(
+        record=orchestrator.record,
+        target=target,
+        trigger_outcome=_trigger_outcome(result),
+        review_status=_last_review_status(result),
+        interrupted=False,
+        termination_confirmed=_termination_confirmed(result),
+        git_safety=git_safety,
+        run_store=run_store,
+        lease=lease,
+        clock=SteppingClock(),
+        max_review_cycles=MAX_REVIEW_CYCLES,
+    )
+
+    # A SAFE postflight continuity check, exit code 0, and final status
+    # APPROVED -- the AC's own closing clause, proven on this same run.
+    assert issue_result.git_safety_status is GitSafetyStatus.SAFE
+    assert issue_result.final_status is FinalStatus.APPROVED
+    assert issue_result.expected_exit_code == 0
+    assert lease.released is True
+
+
+# --- AC-009: rework cycle then approved -------------------------------------
+
+
+def test_ac_009_rework_then_approved(tmp_path: Path) -> None:
+    """AC-009: reviewer cycle 1 requires changes, the feedback reaches the
+    cycle-2 coder, and reviewer cycle 2 approves; the final status is
+    `APPROVED` -- proven on the same 2-cycle rework result that
+    `test_a_rework_cycle_carries_full_feedback_to_the_next_coder_then_approves`
+    proves the feedback-forwarding mechanics on, carried through to
+    `finalize_run`."""
+
+    workspace, target = _workspace_and_target(tmp_path)
+    git_baseline = _git_state(target_root=target.root, fingerprint="fp-0")
+    issue_ref = _issue_ref()
+
+    architect_response = ParsedAgentResponse(
+        role=AgentRole.ARCHITECT,
+        body="Understood the issue; add X.",
+        agent_status=AgentStatus.READY,
+        issue_ref=issue_ref,
+    )
+    coder1_response = ParsedAgentResponse(
+        role=AgentRole.CODER, body="Added X.", agent_status=AgentStatus.COMPLETED
+    )
+    reviewer1_response = ParsedAgentResponse(
+        role=AgentRole.REVIEWER,
+        body="X is missing an edge-case handler for empty input.",
+        review_status=ReviewStatus.CHANGES_REQUIRED,
+    )
+    coder2_response = ParsedAgentResponse(
+        role=AgentRole.CODER,
+        body="Handled the empty-input edge case.",
+        agent_status=AgentStatus.COMPLETED,
+    )
+    reviewer2_response = ParsedAgentResponse(
+        role=AgentRole.REVIEWER, body="", review_status=ReviewStatus.APPROVED
+    )
+
+    agent_runner = SequencedAgentRunner(
+        [
+            _agent_result(
+                role=AgentRole.ARCHITECT,
+                review_cycle=None,
+                workspace_root=workspace.root,
+                terminal_response=architect_response,
+            ),
+            _agent_result(
+                role=AgentRole.CODER,
+                review_cycle=1,
+                workspace_root=workspace.root,
+                terminal_response=coder1_response,
+            ),
+            _agent_result(
+                role=AgentRole.REVIEWER,
+                review_cycle=1,
+                workspace_root=workspace.root,
+                terminal_response=reviewer1_response,
+            ),
+            _agent_result(
+                role=AgentRole.CODER,
+                review_cycle=2,
+                workspace_root=workspace.root,
+                terminal_response=coder2_response,
+            ),
+            _agent_result(
+                role=AgentRole.REVIEWER,
+                review_cycle=2,
+                workspace_root=workspace.root,
+                terminal_response=reviewer2_response,
+            ),
+        ]
+    )
+    coder1_after = _git_state(target_root=target.root, fingerprint="fp-2")
+    coder2_after = _git_state(target_root=target.root, fingerprint="fp-4")
+    git_safety = SequencedGitSafetyPort(
+        [
+            _git_check(
+                target_root=target.root,
+                sequence=0,
+                purpose="ARCHITECT:0:1:before",
+                state=_git_state(target_root=target.root, fingerprint="fp-0"),
+            ),
+            _git_check(
+                target_root=target.root,
+                sequence=1,
+                purpose="ARCHITECT:0:1:after",
+                state=_git_state(target_root=target.root, fingerprint="fp-0"),
+            ),
+            _git_check(
+                target_root=target.root,
+                sequence=2,
+                purpose="CODER:1:1:before",
+                state=_git_state(target_root=target.root, fingerprint="fp-0"),
+            ),
+            _git_check(
+                target_root=target.root,
+                sequence=3,
+                purpose="CODER:1:1:after",
+                state=coder1_after,
+            ),
+            _git_check(
+                target_root=target.root,
+                sequence=4,
+                purpose="REVIEWER:1:1:before",
+                state=coder1_after,
+            ),
+            _git_check(
+                target_root=target.root,
+                sequence=5,
+                purpose="REVIEWER:1:1:after",
+                state=coder1_after,
+            ),
+            _git_check(
+                target_root=target.root,
+                sequence=6,
+                purpose="CODER:2:1:before",
+                state=coder1_after,
+            ),
+            _git_check(
+                target_root=target.root,
+                sequence=7,
+                purpose="CODER:2:1:after",
+                state=coder2_after,
+            ),
+            _git_check(
+                target_root=target.root,
+                sequence=8,
+                purpose="REVIEWER:2:1:before",
+                state=coder2_after,
+            ),
+            _git_check(
+                target_root=target.root,
+                sequence=9,
+                purpose="REVIEWER:2:1:after",
+                state=coder2_after,
+            ),
+            _git_check(
+                target_root=target.root,
+                sequence=10,
+                purpose="postflight",
+                state=coder2_after,
+            ),
+        ]
+    )
+    run_store = SequencedRunStorePort()
+    lease = RecordingTargetLease()
+    orchestrator = _orchestrator(
+        workspace=workspace,
+        target=target,
+        agent_runner=agent_runner,
+        git_safety=git_safety,
+        run_store=run_store,
+        git_baseline=git_baseline,
+    )
+
+    result = run_issue_pipeline(
+        orchestrator=orchestrator,
+        issue_locator=_issue_locator(),
+        workspace=workspace,
+        target=target,
+        max_review_cycles=MAX_REVIEW_CYCLES,
+    )
+
+    assert [call[0] for call in agent_runner.calls] == [
+        AgentRole.ARCHITECT,
+        AgentRole.CODER,
+        AgentRole.REVIEWER,
+        AgentRole.CODER,
+        AgentRole.REVIEWER,
+    ]
+    coder2_prompt = agent_runner.calls[3][1]
+    assert coder2_prompt == build_coder_prompt(
+        issue_ref=issue_ref,
+        architect_handoff=architect_response.body,
+        target_root=target.root,
+        review_cycle=2,
+        max_review_cycles=MAX_REVIEW_CYCLES,
+        previous_review_feedback=reviewer1_response.body,
+    )
+    assert result.state == PipelineState(phase=PipelinePhase.POSTFLIGHT)
+    assert result.outcome is None
+
+    issue_result = finalize_run(
+        record=orchestrator.record,
+        target=target,
+        trigger_outcome=_trigger_outcome(result),
+        review_status=_last_review_status(result),
+        interrupted=False,
+        termination_confirmed=_termination_confirmed(result),
+        git_safety=git_safety,
+        run_store=run_store,
+        lease=lease,
+        clock=SteppingClock(),
+        max_review_cycles=MAX_REVIEW_CYCLES,
+    )
+
+    # AC-009's own closing clause: the final status is APPROVED.
+    assert _last_review_status(result) is ReviewStatus.APPROVED
+    assert issue_result.final_status is FinalStatus.APPROVED
+    assert issue_result.expected_exit_code == 0
+    assert lease.released is True
+
+
+# --- AC-010: review limit, no extra coder -----------------------------------
+
+
+def test_ac_010_review_limit_no_extra_coder(tmp_path: Path) -> None:
+    """AC-010: `CHANGES_REQUIRED` at the last allowed cycle does not invoke a
+    new coder and finalizes `FAILED`/`REVIEW_CYCLES_EXHAUSTED` -- the
+    explicit no-extra-coder order assertion and the `finalize_run` FAILED
+    determination proven together on the same result."""
+
+    workspace, target = _workspace_and_target(tmp_path)
+    git_baseline = _git_state(target_root=target.root, fingerprint="fp-0")
+    issue_ref = _issue_ref()
+
+    architect_response = ParsedAgentResponse(
+        role=AgentRole.ARCHITECT,
+        body="plan",
+        agent_status=AgentStatus.READY,
+        issue_ref=issue_ref,
+    )
+    coder_response = ParsedAgentResponse(
+        role=AgentRole.CODER, body="done", agent_status=AgentStatus.COMPLETED
+    )
+    reviewer_response = ParsedAgentResponse(
+        role=AgentRole.REVIEWER,
+        body="Not quite right yet.",
+        review_status=ReviewStatus.CHANGES_REQUIRED,
+    )
+    agent_runner = SequencedAgentRunner(
+        [
+            _agent_result(
+                role=AgentRole.ARCHITECT,
+                review_cycle=None,
+                workspace_root=workspace.root,
+                terminal_response=architect_response,
+            ),
+            _agent_result(
+                role=AgentRole.CODER,
+                review_cycle=1,
+                workspace_root=workspace.root,
+                terminal_response=coder_response,
+            ),
+            _agent_result(
+                role=AgentRole.REVIEWER,
+                review_cycle=1,
+                workspace_root=workspace.root,
+                terminal_response=reviewer_response,
+            ),
+        ]
+    )
+    checks = _happy_path_git_checks(target.root)
+    checks.append(
+        _git_check(
+            target_root=target.root,
+            sequence=6,
+            purpose="postflight",
+            state=_git_state(target_root=target.root, fingerprint="fp-9"),
+        )
+    )
+    git_safety = SequencedGitSafetyPort(checks)
+    run_store = SequencedRunStorePort()
+    lease = RecordingTargetLease()
+    orchestrator = _orchestrator(
+        workspace=workspace,
+        target=target,
+        agent_runner=agent_runner,
+        git_safety=git_safety,
+        run_store=run_store,
+        git_baseline=git_baseline,
+    )
+
+    result = run_issue_pipeline(
+        orchestrator=orchestrator,
+        issue_locator=_issue_locator(),
+        workspace=workspace,
+        target=target,
+        max_review_cycles=1,
+    )
+
+    # No fourth agent -- explicitly, a stray call would fail this assertion
+    # rather than merely raise IndexError from an exhausted script.
+    assert [call[0] for call in agent_runner.calls] == [
+        AgentRole.ARCHITECT,
+        AgentRole.CODER,
+        AgentRole.REVIEWER,
+    ]
+    assert result.outcome is RunOutcome.REVIEW_CYCLES_EXHAUSTED
+
+    issue_result = finalize_run(
+        record=orchestrator.record,
+        target=target,
+        trigger_outcome=_trigger_outcome(result),
+        review_status=_last_review_status(result),
+        interrupted=False,
+        termination_confirmed=_termination_confirmed(result),
+        git_safety=git_safety,
+        run_store=run_store,
+        lease=lease,
+        clock=SteppingClock(),
+        max_review_cycles=1,
+    )
+
+    assert _last_review_status(result) is ReviewStatus.CHANGES_REQUIRED
+    assert issue_result.final_status is FinalStatus.FAILED
+    assert issue_result.trigger_outcome is RunOutcome.REVIEW_CYCLES_EXHAUSTED
+    assert issue_result.expected_exit_code == 20
+    assert lease.released is True
+
+
+# --- AC-030: reviewer input and integral feedback ---------------------------
+
+
+def test_ac_030_reviewer_input_and_integral_feedback(tmp_path: Path) -> None:
+    """AC-030: the reviewer receives the issue and handoff, inspects the
+    tracked/staged and new non-ignored files in the target, and, on
+    `CHANGES_REQUIRED`, the concrete feedback is passed integrally to the
+    next coder -- both halves proven together on the same 2-cycle rework
+    result, with a non-trivial staged/unstaged/untracked inventory."""
+
+    workspace, target = _workspace_and_target(tmp_path)
+    git_baseline = _git_state(target_root=target.root, fingerprint="fp-0")
+    issue_ref = _issue_ref()
+
+    architect_response = ParsedAgentResponse(
+        role=AgentRole.ARCHITECT,
+        body="Understood the issue; add X.",
+        agent_status=AgentStatus.READY,
+        issue_ref=issue_ref,
+    )
+    coder1_response = ParsedAgentResponse(
+        role=AgentRole.CODER, body="Added X.", agent_status=AgentStatus.COMPLETED
+    )
+    reviewer1_response = ParsedAgentResponse(
+        role=AgentRole.REVIEWER,
+        body="X is missing an edge-case handler for empty input.",
+        review_status=ReviewStatus.CHANGES_REQUIRED,
+    )
+    coder2_response = ParsedAgentResponse(
+        role=AgentRole.CODER,
+        body="Handled the empty-input edge case.",
+        agent_status=AgentStatus.COMPLETED,
+    )
+    reviewer2_response = ParsedAgentResponse(
+        role=AgentRole.REVIEWER, body="", review_status=ReviewStatus.APPROVED
+    )
+
+    agent_runner = SequencedAgentRunner(
+        [
+            _agent_result(
+                role=AgentRole.ARCHITECT,
+                review_cycle=None,
+                workspace_root=workspace.root,
+                terminal_response=architect_response,
+            ),
+            _agent_result(
+                role=AgentRole.CODER,
+                review_cycle=1,
+                workspace_root=workspace.root,
+                terminal_response=coder1_response,
+            ),
+            _agent_result(
+                role=AgentRole.REVIEWER,
+                review_cycle=1,
+                workspace_root=workspace.root,
+                terminal_response=reviewer1_response,
+            ),
+            _agent_result(
+                role=AgentRole.CODER,
+                review_cycle=2,
+                workspace_root=workspace.root,
+                terminal_response=coder2_response,
+            ),
+            _agent_result(
+                role=AgentRole.REVIEWER,
+                review_cycle=2,
+                workspace_root=workspace.root,
+                terminal_response=reviewer2_response,
+            ),
+        ]
+    )
+    # A non-trivial inventory -- staged, unstaged, and untracked paths alike
+    # -- so the reviewer's own prompt assertion proves the *full* inventory
+    # is forwarded, not just newly untracked files.
+    coder1_inventory_state = _git_state(
+        target_root=target.root,
+        fingerprint="fp-2",
+        staged=("src/feature.py",),
+        unstaged=("README.md",),
+        untracked=("src/new_module.py", "tests/test_new_module.py"),
+    )
+    coder2_after = _git_state(target_root=target.root, fingerprint="fp-4")
+    git_safety = SequencedGitSafetyPort(
+        [
+            _git_check(
+                target_root=target.root,
+                sequence=0,
+                purpose="ARCHITECT:0:1:before",
+                state=_git_state(target_root=target.root, fingerprint="fp-0"),
+            ),
+            _git_check(
+                target_root=target.root,
+                sequence=1,
+                purpose="ARCHITECT:0:1:after",
+                state=_git_state(target_root=target.root, fingerprint="fp-0"),
+            ),
+            _git_check(
+                target_root=target.root,
+                sequence=2,
+                purpose="CODER:1:1:before",
+                state=_git_state(target_root=target.root, fingerprint="fp-0"),
+            ),
+            _git_check(
+                target_root=target.root,
+                sequence=3,
+                purpose="CODER:1:1:after",
+                state=coder1_inventory_state,
+            ),
+            _git_check(
+                target_root=target.root,
+                sequence=4,
+                purpose="REVIEWER:1:1:before",
+                state=coder1_inventory_state,
+            ),
+            _git_check(
+                target_root=target.root,
+                sequence=5,
+                purpose="REVIEWER:1:1:after",
+                state=coder1_inventory_state,
+            ),
+            _git_check(
+                target_root=target.root,
+                sequence=6,
+                purpose="CODER:2:1:before",
+                state=coder1_inventory_state,
+            ),
+            _git_check(
+                target_root=target.root,
+                sequence=7,
+                purpose="CODER:2:1:after",
+                state=coder2_after,
+            ),
+            _git_check(
+                target_root=target.root,
+                sequence=8,
+                purpose="REVIEWER:2:1:before",
+                state=coder2_after,
+            ),
+            _git_check(
+                target_root=target.root,
+                sequence=9,
+                purpose="REVIEWER:2:1:after",
+                state=coder2_after,
+            ),
+        ]
+    )
+    run_store = SequencedRunStorePort()
+    orchestrator = _orchestrator(
+        workspace=workspace,
+        target=target,
+        agent_runner=agent_runner,
+        git_safety=git_safety,
+        run_store=run_store,
+        git_baseline=git_baseline,
+    )
+
+    result = run_issue_pipeline(
+        orchestrator=orchestrator,
+        issue_locator=_issue_locator(),
+        workspace=workspace,
+        target=target,
+        max_review_cycles=MAX_REVIEW_CYCLES,
+    )
+
+    assert [call[0] for call in agent_runner.calls] == [
+        AgentRole.ARCHITECT,
+        AgentRole.CODER,
+        AgentRole.REVIEWER,
+        AgentRole.CODER,
+        AgentRole.REVIEWER,
+    ]
+
+    # Half 1: the reviewer receives the issue ref, the architect's handoff,
+    # the coder's report, and the full tracked/staged/untracked inventory.
+    reviewer1_prompt = agent_runner.calls[2][1]
+    assert reviewer1_prompt == build_reviewer_prompt(
+        issue_ref=issue_ref,
+        architect_handoff=architect_response.body,
+        coder_report=coder1_response.body,
+        staged=coder1_inventory_state.staged,
+        unstaged=coder1_inventory_state.unstaged,
+        untracked=coder1_inventory_state.untracked,
+        test_scope="",
+        target_root=target.root,
+        review_cycle=1,
+        max_review_cycles=MAX_REVIEW_CYCLES,
+    )
+
+    # Half 2: on CHANGES_REQUIRED, the reviewer's concrete feedback reaches
+    # the next coder integrally, verbatim.
+    coder2_prompt = agent_runner.calls[3][1]
+    assert coder2_prompt == build_coder_prompt(
+        issue_ref=issue_ref,
+        architect_handoff=architect_response.body,
+        target_root=target.root,
+        review_cycle=2,
+        max_review_cycles=MAX_REVIEW_CYCLES,
+        previous_review_feedback=reviewer1_response.body,
+    )
+
+    assert result.state == PipelineState(phase=PipelinePhase.POSTFLIGHT)
+    assert result.outcome is None

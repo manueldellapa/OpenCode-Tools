@@ -22,7 +22,17 @@ from typing import Final, cast
 
 import pytest
 
-from opencode_tools.domain import AgentRole, ProcessSpec, Workspace
+from opencode_tools.domain import (
+    AgentRole,
+    GitSafetyStatus,
+    IssueLocator,
+    PersistenceStatus,
+    ProcessSpec,
+    ProviderRetryConfig,
+    RepositoryIdentity,
+    RunOutcome,
+    Workspace,
+)
 from opencode_tools.errors import PreflightError, ProtocolError
 from opencode_tools.opencode import (
     CANDIDATE_OPENCODE_VERSION,
@@ -46,6 +56,8 @@ from opencode_tools.opencode import (
     resolve_executable,
     verify_agent_identity,
 )
+from opencode_tools.protocol import parse_agent_response
+from opencode_tools.retry import decide_retry
 
 REPO_ROOT: Final = Path(__file__).resolve().parents[2]
 FIXTURES_ROOT: Final = REPO_ROOT / "tests" / "fixtures" / "opencode" / "1.17.18"
@@ -131,10 +143,10 @@ def _all_fixture_files() -> tuple[Path, ...]:
 # --- version and status attribution -----------------------------------------
 
 
-def test_manifest_declares_the_exact_candidate_version() -> None:
+def test_manifest_declares_the_exact_supported_version() -> None:
     manifest = _load_manifest()
     assert manifest["opencode_version"] == OPENCODE_VERSION
-    assert manifest["compatibility_status"] == "candidate"
+    assert manifest["compatibility_status"] == "supported"
 
 
 def test_manifest_records_verifiable_pack_wide_provenance() -> None:
@@ -296,11 +308,10 @@ def test_no_fixture_contains_an_obvious_secret_pattern() -> None:
 # --- compatibility documentation ------------------------------------------------
 
 
-def test_compatibility_doc_declares_the_version_candidate_not_supported() -> None:
+def test_compatibility_doc_declares_the_version_supported() -> None:
     doc = COMPATIBILITY_DOC_PATH.read_text(encoding="utf-8")
     assert OPENCODE_VERSION in doc
-    assert "candidate" in doc.lower()
-    assert "not yet supported" in doc.lower() or "not supported" in doc.lower()
+    assert "status: supported" in doc.lower()
 
 
 # =============================================================================
@@ -361,8 +372,16 @@ def test_check_version_rejects_anything_but_an_exact_match(raw_output: str) -> N
 
 
 def test_check_run_help_capability_accepts_all_required_tokens() -> None:
+    # Modeled on the real `1.17.18` binary's actual `run --help` shape
+    # (confirmed live, M15-03): "--format" and "json" are several words
+    # apart, never adjacent as a literal "--format json" substring -- a
+    # contrived, adjacent-tokens fixture string would not have caught the
+    # real mismatch this test now guards against.
     check_run_help_capability(
-        "Usage: opencode run [--agent <name>] [--format json] [--dir <path>]"
+        "      --agent        agent to use                            [string]\n"
+        "      --format       format: default (formatted) or json (raw JSON events)\n"
+        '                     [string] [choices: "default", "json"]\n'
+        "      --dir          directory to run in                     [string]\n"
     )
 
 
@@ -371,6 +390,7 @@ def test_check_run_help_capability_accepts_all_required_tokens() -> None:
     [
         "Usage: opencode run [--format json] [--dir <path>]",
         "Usage: opencode run [--agent <name>] [--dir <path>]",
+        "Usage: opencode run [--agent <name>] [--format] [--dir <path>]",
         "Usage: opencode run [--agent <name>] [--format json]",
         "",
     ],
@@ -436,6 +456,11 @@ def test_check_debug_agent_accepts_each_role_baseline(
         ),
         (
             AgentRole.ARCHITECT,
+            "debug/agent-architect-permissive-bash.json",
+            "opencode.debug_agent_rejected",
+        ),
+        (
+            AgentRole.ARCHITECT,
             "debug/agent-missing.json",
             "opencode.debug_agent_identity_mismatch",
         ),
@@ -453,12 +478,192 @@ def test_check_debug_agent_rejects_a_fallback_to_a_different_named_agent() -> No
     fallback_agent: dict[str, object] = {
         "name": "general",
         "mode": "primary",
-        "tools": {"ask": False, "task": False},
-        "permission": {"edit": "deny", "bash": "deny", "webfetch": "deny"},
+        "tools": {"question": False, "task": False},
+        "permission": [
+            {"permission": "*", "action": "allow", "pattern": "*"},
+            {"permission": "edit", "action": "deny", "pattern": "*"},
+            {"permission": "bash", "action": "deny", "pattern": "*"},
+            {"permission": "webfetch", "action": "deny", "pattern": "*"},
+        ],
     }
     with pytest.raises(PreflightError) as exc_info:
         check_debug_agent(AgentRole.ARCHITECT, fallback_agent)
     assert exc_info.value.code == "opencode.debug_agent_identity_mismatch"
+
+
+def test_check_debug_agent_last_matching_rule_wins_over_an_earlier_broad_one() -> None:
+    # A real 1.17.18 response's permission list is ordered and resolved
+    # last-match-wins (https://opencode.ai/docs/permissions/), not a flat
+    # dict: an earlier, broader "allow" for edit must lose to a later,
+    # more specific "deny" -- the exact shape already exercised implicitly
+    # by debug/agent-architect-baseline.json, asserted explicitly here.
+    agent: dict[str, object] = {
+        "name": "architect",
+        "mode": "primary",
+        "tools": {"question": False, "task": False},
+        "permission": [
+            {"permission": "*", "action": "allow", "pattern": "*"},
+            {"permission": "edit", "action": "allow", "pattern": "*.md"},
+            {"permission": "edit", "action": "deny", "pattern": "*"},
+            {"permission": "bash", "action": "deny", "pattern": "*"},
+            {"permission": "bash", "action": "allow", "pattern": "gh issue view *"},
+            {"permission": "webfetch", "action": "deny", "pattern": "*"},
+        ],
+    }
+    check_debug_agent(AgentRole.ARCHITECT, agent)
+
+
+def test_check_debug_agent_ignores_unrelated_and_machine_specific_rules() -> None:
+    # Rules for permission kinds outside the reviewed baseline (read,
+    # doom_loop, plan_enter/exit, and external_directory entries a user's
+    # own global OpenCode config can add, tied to paths that exist only on
+    # that machine) must never affect whether edit/bash/webfetch match the
+    # baseline, in any position in the list.
+    agent: dict[str, object] = {
+        "name": "coder",
+        "mode": "primary",
+        "tools": {"question": False, "task": False},
+        "permission": [
+            {"permission": "*", "action": "allow", "pattern": "*"},
+            {"permission": "doom_loop", "action": "ask", "pattern": "*"},
+            {
+                "permission": "external_directory",
+                "action": "allow",
+                "pattern": "/Users/someone/.local/share/opencode/tool-output/*",
+            },
+            {"permission": "plan_enter", "action": "deny", "pattern": "*"},
+            {"permission": "read", "action": "allow", "pattern": "*"},
+            {"permission": "edit", "action": "allow", "pattern": "*"},
+            {"permission": "bash", "action": "allow", "pattern": "*"},
+            {"permission": "plan_exit", "action": "deny", "pattern": "*"},
+            {"permission": "webfetch", "action": "deny", "pattern": "*"},
+            {
+                "permission": "external_directory",
+                "action": "allow",
+                "pattern": "/Users/someone/.claude/skills/some-skill/*",
+            },
+        ],
+    }
+    check_debug_agent(AgentRole.CODER, agent)
+
+
+def test_check_debug_agent_rejects_when_a_baseline_permission_has_no_rule_at_all() -> (
+    None
+):
+    # No rule anywhere names "webfetch" or the wildcard "*" -- the
+    # effective action cannot be determined, so it must fail closed
+    # (None can never equal a real baseline action) rather than being
+    # treated as an implicit allow or skipped.
+    agent: dict[str, object] = {
+        "name": "architect",
+        "mode": "primary",
+        "tools": {"question": False, "task": False},
+        "permission": [
+            {"permission": "edit", "action": "deny", "pattern": "*"},
+            {"permission": "bash", "action": "deny", "pattern": "*"},
+        ],
+    }
+    with pytest.raises(PreflightError) as exc_info:
+        check_debug_agent(AgentRole.ARCHITECT, agent)
+    assert exc_info.value.code == "opencode.debug_agent_rejected"
+
+
+def test_check_debug_agent_rejects_a_malformed_permission_rule_entry() -> None:
+    agent: dict[str, object] = {
+        "name": "architect",
+        "mode": "primary",
+        "tools": {"question": False, "task": False},
+        "permission": [
+            {"permission": "*", "action": "allow", "pattern": "*"},
+            "not-an-object",
+            {"permission": "edit", "action": "deny", "pattern": "*"},
+        ],
+    }
+    with pytest.raises(PreflightError) as exc_info:
+        check_debug_agent(AgentRole.ARCHITECT, agent)
+    assert exc_info.value.code == "opencode.debug_agent_invalid"
+
+
+# --- check_debug_agent: the architect's least-privilege bash policy ----------
+#
+# Discovered live during the M15-03 re-qualification (2026-09-17):
+# `build_architect_prompt` instructs the architect to run `gh issue view`
+# itself to discover the issue title/body -- Python never embeds them -- so
+# a flat `bash: deny` made the architect structurally unable to ever
+# succeed. The fix is least privilege, not a broader flat allow: deny by
+# default, with exactly one narrow, reviewed exception.
+
+
+def _architect_agent_with_bash_rules(
+    *extra_bash_rules: dict[str, object],
+) -> dict[str, object]:
+    return {
+        "name": "architect",
+        "mode": "primary",
+        "tools": {"question": False, "task": False},
+        "permission": [
+            {"permission": "*", "action": "allow", "pattern": "*"},
+            {"permission": "edit", "action": "deny", "pattern": "*"},
+            *extra_bash_rules,
+            {"permission": "webfetch", "action": "deny", "pattern": "*"},
+        ],
+    }
+
+
+def test_check_debug_agent_accepts_the_exact_reviewed_architect_bash_policy() -> None:
+    agent = _architect_agent_with_bash_rules(
+        {"permission": "bash", "action": "deny", "pattern": "*"},
+        {"permission": "bash", "action": "allow", "pattern": "gh issue view *"},
+    )
+    check_debug_agent(AgentRole.ARCHITECT, agent)  # must not raise
+
+
+def test_check_debug_agent_rejects_an_architect_missing_the_gh_issue_view_allow() -> (
+    None
+):
+    agent = _architect_agent_with_bash_rules(
+        {"permission": "bash", "action": "deny", "pattern": "*"},
+    )
+    with pytest.raises(PreflightError) as exc_info:
+        check_debug_agent(AgentRole.ARCHITECT, agent)
+    assert exc_info.value.code == "opencode.debug_agent_rejected"
+
+
+def test_check_debug_agent_rejects_an_architect_with_a_broader_bash_allow() -> None:
+    agent = _architect_agent_with_bash_rules(
+        {"permission": "bash", "action": "deny", "pattern": "*"},
+        {"permission": "bash", "action": "allow", "pattern": "gh issue view *"},
+        {"permission": "bash", "action": "allow", "pattern": "*"},
+    )
+    with pytest.raises(PreflightError) as exc_info:
+        check_debug_agent(AgentRole.ARCHITECT, agent)
+    assert exc_info.value.code == "opencode.debug_agent_rejected"
+
+
+def test_check_debug_agent_rejects_an_architect_with_a_different_allowed_gh_pattern() -> (
+    None
+):
+    agent = _architect_agent_with_bash_rules(
+        {"permission": "bash", "action": "deny", "pattern": "*"},
+        {"permission": "bash", "action": "allow", "pattern": "gh issue edit *"},
+    )
+    with pytest.raises(PreflightError) as exc_info:
+        check_debug_agent(AgentRole.ARCHITECT, agent)
+    assert exc_info.value.code == "opencode.debug_agent_rejected"
+
+
+def test_check_debug_agent_rejects_an_architect_whose_deny_all_shadows_the_allow() -> (
+    None
+):
+    # Order matters under last-match-wins: a deny-all placed *after* the
+    # narrow allow would shadow it for the one command that must succeed.
+    agent = _architect_agent_with_bash_rules(
+        {"permission": "bash", "action": "allow", "pattern": "gh issue view *"},
+        {"permission": "bash", "action": "deny", "pattern": "*"},
+    )
+    with pytest.raises(PreflightError) as exc_info:
+        check_debug_agent(AgentRole.ARCHITECT, agent)
+    assert exc_info.value.code == "opencode.debug_agent_rejected"
 
 
 # --- compute_control_plane_digest ---------------------------------------------
@@ -489,6 +694,123 @@ def test_compute_control_plane_digest_changes_when_content_changes() -> None:
     )
     digest_after = compute_control_plane_digest(config={"share": "auto"}, agents=agents)
     assert digest_before != digest_after
+
+
+def _architect_agent_with_permission(
+    permission: list[object],
+) -> dict[AgentRole, dict[str, object]]:
+    architect: dict[str, object] = {
+        "name": "architect",
+        "mode": "primary",
+        "tools": {"question": False, "task": False},
+        "permission": permission,
+    }
+    agents = _baseline_agents()
+    agents[AgentRole.ARCHITECT] = architect
+    return agents
+
+
+def test_compute_control_plane_digest_is_stable_across_external_directory_reorder() -> (
+    None
+):
+    # Confirmed live during M15-03: successive real `debug agent` calls
+    # return the same set of external_directory rules (a user's own
+    # global OpenCode config, e.g. installed skill folders) in a
+    # different order each time. Two non-overlapping, distinct-prefix
+    # patterns reordered must hash identically.
+    base: list[object] = [
+        {"permission": "*", "action": "allow", "pattern": "*"},
+        {"permission": "edit", "action": "deny", "pattern": "*"},
+    ]
+    order_a: list[object] = [
+        *base,
+        {"permission": "external_directory", "action": "allow", "pattern": "/a/*"},
+        {"permission": "external_directory", "action": "allow", "pattern": "/b/*"},
+        {"permission": "external_directory", "action": "allow", "pattern": "/c/*"},
+    ]
+    order_b: list[object] = [
+        *base,
+        {"permission": "external_directory", "action": "allow", "pattern": "/c/*"},
+        {"permission": "external_directory", "action": "allow", "pattern": "/a/*"},
+        {"permission": "external_directory", "action": "allow", "pattern": "/b/*"},
+    ]
+    digest_a = compute_control_plane_digest(
+        config={}, agents=_architect_agent_with_permission(order_a)
+    )
+    digest_b = compute_control_plane_digest(
+        config={}, agents=_architect_agent_with_permission(order_b)
+    )
+    assert digest_a == digest_b
+
+
+def test_compute_control_plane_digest_changes_when_a_permission_rule_changes() -> None:
+    permission_before: list[object] = [
+        {"permission": "*", "action": "allow", "pattern": "*"},
+        {"permission": "edit", "action": "deny", "pattern": "*"},
+    ]
+    permission_after: list[object] = [
+        {"permission": "*", "action": "allow", "pattern": "*"},
+        {"permission": "edit", "action": "allow", "pattern": "*"},
+    ]
+    digest_before = compute_control_plane_digest(
+        config={}, agents=_architect_agent_with_permission(permission_before)
+    )
+    digest_after = compute_control_plane_digest(
+        config={}, agents=_architect_agent_with_permission(permission_after)
+    )
+    assert digest_before != digest_after
+
+
+def test_compute_control_plane_digest_changes_on_overlapping_external_directory_reorder() -> (
+    None
+):
+    # Two external_directory rules for the SAME pattern with different
+    # actions are ambiguous to reorder (which one would apply to a real
+    # path is exactly a function of their relative order) -- proven
+    # overlapping by `_external_directory_patterns_may_overlap`, so this
+    # run is never canonicalized and a reordering still registers as
+    # drift, per the fail-closed requirement.
+    order_a: list[object] = [
+        {"permission": "*", "action": "allow", "pattern": "*"},
+        {"permission": "external_directory", "action": "ask", "pattern": "/a/*"},
+        {"permission": "external_directory", "action": "allow", "pattern": "/a/*"},
+    ]
+    order_b: list[object] = [
+        {"permission": "*", "action": "allow", "pattern": "*"},
+        {"permission": "external_directory", "action": "allow", "pattern": "/a/*"},
+        {"permission": "external_directory", "action": "ask", "pattern": "/a/*"},
+    ]
+    digest_a = compute_control_plane_digest(
+        config={}, agents=_architect_agent_with_permission(order_a)
+    )
+    digest_b = compute_control_plane_digest(
+        config={}, agents=_architect_agent_with_permission(order_b)
+    )
+    assert digest_a != digest_b
+
+
+def test_compute_control_plane_digest_stays_order_sensitive_for_non_external_directory_rules() -> (
+    None
+):
+    # Only external_directory runs are ever canonicalized -- reordering
+    # any other permission kind (here, two differently-scoped `read`
+    # rules) must still register as drift; their order is meaningfully
+    # part of the effective policy and is never touched.
+    order_a: list[object] = [
+        {"permission": "read", "action": "allow", "pattern": "*"},
+        {"permission": "read", "action": "ask", "pattern": "*.env"},
+    ]
+    order_b: list[object] = [
+        {"permission": "read", "action": "ask", "pattern": "*.env"},
+        {"permission": "read", "action": "allow", "pattern": "*"},
+    ]
+    digest_a = compute_control_plane_digest(
+        config={}, agents=_architect_agent_with_permission(order_a)
+    )
+    digest_b = compute_control_plane_digest(
+        config={}, agents=_architect_agent_with_permission(order_b)
+    )
+    assert digest_a != digest_b
 
 
 # --- ControlPlaneEvidence ------------------------------------------------------
@@ -688,7 +1010,14 @@ def _text(path: Path) -> str:
             "ses_architect_ready",
             "AGENT_STATUS: READY",
         ),
-        ("architect-failed.ndjson", "ses_architect_failed", "AGENT_STATUS: FAILED"),
+        (
+            # Genuine NDJSON captured from a real `opencode run --format
+            # json` 1.17.18 invocation during M15-03 live qualification --
+            # not hand-authored, unlike the other rows in this table.
+            "architect-failed.ndjson",
+            "ses_f515f27d1ffeeSNk4UDje4MDiK",
+            "AGENT_STATUS: FAILED",
+        ),
         (
             "coder-completed-success.ndjson",
             "ses_coder_completed",
@@ -752,6 +1081,160 @@ def test_decode_run_transport_fails_closed_when_no_events_are_present() -> None:
     with pytest.raises(ProtocolError) as exc_info:
         decode_run_transport("")
     assert exc_info.value.code == "opencode.transport_no_terminal_text"
+
+
+# --- M15-03 live-qualification correction: the real 1.17.18 event shape ------
+#
+# A live `opencode run --format json` capture (M15-03 AC-027 re-qualification,
+# 2026-09-17) proved this adapter's original assumption wrong: real NDJSON
+# carries the message-lifecycle kind directly as the top-level `type`
+# (`step_start`, `text`, `step_finish`, ...), never wrapped in a
+# `message.part.updated` envelope. These tests fix that corrected contract so
+# it cannot silently regress.
+
+
+def test_decode_run_transport_rejects_the_old_unproven_message_part_updated_envelope() -> (
+    None
+):
+    text = json.dumps(
+        {
+            "type": "message.part.updated",
+            "sessionID": "ses_old_shape",
+            "part": {
+                "id": "prt_1",
+                "messageID": "msg_1",
+                "type": "text",
+                "text": "AGENT_STATUS: COMPLETED",
+                "time": {"start": 1, "end": 2},
+            },
+        }
+    )
+    with pytest.raises(ProtocolError) as exc_info:
+        decode_run_transport(text)
+    assert exc_info.value.code == "opencode.transport_unknown_event_type"
+
+
+@pytest.mark.parametrize(
+    "event_type", ["step_start", "step_finish", "tool_use", "error"]
+)
+def test_decode_run_transport_recognizes_but_excludes_message_lifecycle_events(
+    event_type: str,
+) -> None:
+    lines = [
+        json.dumps(
+            {"type": event_type, "sessionID": "ses_lifecycle", "part": {"id": "p"}}
+        ),
+        json.dumps(
+            {
+                "type": "text",
+                "sessionID": "ses_lifecycle",
+                "part": {
+                    "id": "prt_2",
+                    "messageID": "msg_1",
+                    "type": "text",
+                    "text": "AGENT_STATUS: COMPLETED",
+                    "time": {"start": 1, "end": 2},
+                },
+            }
+        ),
+    ]
+    result = decode_run_transport("\n".join(lines))
+    assert result.session_id == "ses_lifecycle"
+    assert result.terminal_text == "AGENT_STATUS: COMPLETED"
+
+
+def test_decode_run_transport_rejects_a_message_lifecycle_event_with_no_part_object() -> (
+    None
+):
+    text = json.dumps({"type": "step_start", "sessionID": "ses_no_part"})
+    with pytest.raises(ProtocolError) as exc_info:
+        decode_run_transport(text)
+    assert exc_info.value.code == "opencode.transport_invalid_event"
+
+
+def test_decode_run_transport_rejects_a_text_event_whose_part_type_is_not_text() -> (
+    None
+):
+    text = json.dumps(
+        {
+            "type": "text",
+            "sessionID": "ses_wrong_part_type",
+            "part": {"id": "prt_1", "messageID": "msg_1", "type": "reasoning"},
+        }
+    )
+    with pytest.raises(ProtocolError) as exc_info:
+        decode_run_transport(text)
+    assert exc_info.value.code == "opencode.transport_invalid_event"
+
+
+# --- AC-035: transport and status spoofing fail closed -----------------------
+
+
+def test_ac_035_transport_and_status_spoofing_fail_closed() -> None:
+    # A malformed (not line-delimited JSON) stream fails closed at decode.
+    with pytest.raises(ProtocolError) as invalid_json_error:
+        decode_run_transport(_text(MALFORMED_FIXTURES / "invalid-json-line.ndjson"))
+    assert invalid_json_error.value.code == "opencode.transport_invalid_json"
+
+    # A truncated stream with no terminal text fails closed, not silently.
+    with pytest.raises(ProtocolError) as truncated_error:
+        decode_run_transport(
+            _text(MALFORMED_FIXTURES / "truncated-no-terminal-text.ndjson")
+        )
+    assert truncated_error.value.code == "opencode.transport_no_terminal_text"
+
+    # More than one candidate terminal message is rejected, never guessed.
+    with pytest.raises(ProtocolError) as multi_terminal_error:
+        decode_run_transport(
+            _text(MALFORMED_FIXTURES / "multi-terminal-candidates.ndjson")
+        )
+    assert (
+        multi_terminal_error.value.code
+        == "opencode.transport_multiple_terminal_candidates"
+    )
+
+    # An agent that emits FINAL_STATUS is rejected too -- decode_run_transport
+    # has no marker semantics, so this spoofing check lives one boundary
+    # further in, at parse_agent_response, which this file also owns.
+    locator = IssueLocator(
+        RepositoryIdentity(
+            host="github.com",
+            owner="octocat",
+            repository="hello-world",
+            source="test",
+        ),
+        number=1,
+    )
+    with pytest.raises(ProtocolError) as final_status_error:
+        parse_agent_response(
+            AgentRole.CODER,
+            "FINAL_STATUS: APPROVED\nAGENT_STATUS: COMPLETED",
+            issue_locator=locator,
+        )
+    assert final_status_error.value.code == "protocol.final_status_reserved"
+
+    # None of these PROTOCOL_ERROR-classified failures authorize a provider
+    # retry. Every other guard is held favorable so the outcome-type guard
+    # is unambiguously what denies it, not some other guard failing too.
+    retry_config = ProviderRetryConfig(
+        max_attempts=3,
+        initial_delay_seconds=1.0,
+        multiplier=2.0,
+        max_delay_seconds=60.0,
+    )
+    decision = decide_retry(
+        outcome=RunOutcome.PROTOCOL_ERROR,
+        provider_diagnostic=None,
+        provider_attempt=1,
+        role=AgentRole.CODER,
+        target_changed=False,
+        termination_confirmed=True,
+        git_safety_status=GitSafetyStatus.SAFE,
+        persistence_status=PersistenceStatus.OK,
+        cancellation_requested=False,
+        config=retry_config,
+    )
+    assert decision.should_retry is False
 
 
 # --- tool/reasoning exclusion and marker-spoofing resistance -----------------

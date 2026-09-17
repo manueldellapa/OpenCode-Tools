@@ -22,6 +22,7 @@ from __future__ import annotations
 import os
 import subprocess
 import time
+from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -67,6 +68,10 @@ class RealClock:
 
 
 GIT_EXECUTABLE = resolve_git_executable()
+
+# A controllable fake `git`, used only for AC-036's checkpoint-layer probe
+# failures below -- see `tests/component/helpers/fake_git.py`.
+FAKE_GIT = Path(__file__).resolve().parent / "helpers" / "fake_git.py"
 
 
 def _git(args: list[str], *, cwd: Path) -> subprocess.CompletedProcess[bytes]:
@@ -115,17 +120,19 @@ def _check(
     purpose: str,
     role: AgentRole | None = None,
     baseline: GitState | None = None,
+    git_executable: Path = GIT_EXECUTABLE,
+    utility_timeout_seconds: float = UTILITY_TIMEOUT_SECONDS,
 ) -> GitCheckRecord:
     return check_git_state(
         SubprocessRunner(RealClock()),
-        git_executable=GIT_EXECUTABLE,
+        git_executable=git_executable,
         target=target,
         clock=RealClock(),
         sequence=sequence,
         purpose=purpose,
         role=role,
         baseline=baseline,
-        utility_timeout_seconds=UTILITY_TIMEOUT_SECONDS,
+        utility_timeout_seconds=utility_timeout_seconds,
         termination_grace_seconds=TERMINATION_GRACE_SECONDS,
     )
 
@@ -226,6 +233,70 @@ def test_check_git_state_detects_a_mutation_between_two_phases(tmp_path: Path) -
     assert coder_before.safety_status is GitSafetyStatus.UNSAFE
 
 
+# --- AC-018: branch/HEAD drift blocks new invocations, after each role -----
+
+
+@pytest.mark.parametrize(
+    "role", [AgentRole.ARCHITECT, AgentRole.CODER, AgentRole.REVIEWER]
+)
+def test_ac_018_branch_or_head_drift_after_each_role(
+    tmp_path: Path, role: AgentRole
+) -> None:
+    """`check_git_state`'s own docstring claims branch/HEAD drift is
+    `UNSAFE` "regardless of `role`" -- the continuity tests above already
+    exercise that code path, but always with `role=None` (a `before`
+    check). This proves the claim explicitly on a specific role's own
+    `after` checkpoint, for both drift kinds, mirroring
+    `test_check_git_state_detects_branch_drift_before_the_next_spawn` and
+    `test_check_git_state_detects_head_drift_before_the_next_spawn`.
+
+    Only the `GitSafetyStatus.UNSAFE` half of AC-018 belongs here: the
+    "terminano FAILED/GIT_SAFETY_ERROR senza reset" clause is a
+    state-machine/orchestrator-level final-outcome decision (this module
+    only ever returns a `GitSafetyStatus`), out of `check_git_state`'s own
+    contract.
+    """
+
+    # Branch drift.
+    branch_workspace = _workspace(tmp_path / "branch-workspace")
+    branch_repo = _clean_repo(branch_workspace.root / "repo")
+    branch_target = _resolve(branch_workspace, branch_repo)
+    branch_before = _check(
+        branch_target, sequence=0, purpose=f"{role.value}-attempt-1-before"
+    )
+
+    _git(["checkout", "--quiet", "-b", "other"], cwd=branch_repo)
+
+    branch_after = _check(
+        branch_target,
+        sequence=1,
+        purpose=f"{role.value}-attempt-1-after",
+        role=role,
+        baseline=branch_before.state,
+    )
+    assert branch_after.safety_status is GitSafetyStatus.UNSAFE
+
+    # HEAD drift.
+    head_workspace = _workspace(tmp_path / "head-workspace")
+    head_repo = _clean_repo(head_workspace.root / "repo")
+    head_target = _resolve(head_workspace, head_repo)
+    head_before = _check(
+        head_target, sequence=0, purpose=f"{role.value}-attempt-1-before"
+    )
+
+    (head_repo / "extra.txt").write_text("extra\n", encoding="utf-8")
+    _commit_all(head_repo, "extra commit")
+
+    head_after = _check(
+        head_target,
+        sequence=1,
+        purpose=f"{role.value}-attempt-1-after",
+        role=role,
+        baseline=head_before.state,
+    )
+    assert head_after.safety_status is GitSafetyStatus.UNSAFE
+
+
 # --- role mutation policy: read-only roles ----------------------------------
 
 
@@ -251,6 +322,84 @@ def test_check_git_state_read_only_role_delta_is_unsafe(
     )
 
     assert after.safety_status is GitSafetyStatus.UNSAFE
+
+
+def _prepare_already_unstaged(repo: Path) -> None:
+    (repo / "file.txt").write_text("first edit\n", encoding="utf-8")
+
+
+def _mutate_unstaged(repo: Path) -> None:
+    (repo / "file.txt").write_text("second edit\n", encoding="utf-8")
+
+
+def _prepare_already_staged(repo: Path) -> None:
+    (repo / "file.txt").write_text("first edit\n", encoding="utf-8")
+    _git(["add", "file.txt"], cwd=repo)
+
+
+def _mutate_staged(repo: Path) -> None:
+    (repo / "file.txt").write_text("second edit\n", encoding="utf-8")
+    _git(["add", "file.txt"], cwd=repo)
+
+
+def _prepare_already_untracked(repo: Path) -> None:
+    (repo / "extra.txt").write_text("first edit\n", encoding="utf-8")
+
+
+def _mutate_untracked(repo: Path) -> None:
+    (repo / "extra.txt").write_text("second edit\n", encoding="utf-8")
+
+
+@pytest.mark.parametrize("role", [AgentRole.ARCHITECT, AgentRole.REVIEWER])
+@pytest.mark.parametrize(
+    ("prepare", "mutate"),
+    [
+        pytest.param(_prepare_already_unstaged, _mutate_unstaged, id="unstaged"),
+        pytest.param(_prepare_already_staged, _mutate_staged, id="staged"),
+        pytest.param(_prepare_already_untracked, _mutate_untracked, id="untracked"),
+    ],
+)
+def test_ac_028_read_only_role_mutation_and_second_m_edit(
+    tmp_path: Path,
+    role: AgentRole,
+    prepare: Callable[[Path], None],
+    mutate: Callable[[Path], None],
+) -> None:
+    """Complements `test_check_git_state_read_only_role_delta_is_unsafe`
+    above, which only proves the straightforward clean-to-`M` transition.
+    AC-028's harder clause: a path already dirty (staged `M`, unstaged `M`,
+    or untracked) at the `before` checkpoint, edited *again* to different
+    content by a read-only role, with the porcelain classification staying
+    byte-for-byte identical between `before` and `after` -- no new path
+    enters `staged`/`unstaged`/`untracked`. Only `git-state-v1`'s
+    content-sensitive fingerprint -- not porcelain-code parsing -- can
+    catch a delta like this (see `git_safety.py`'s module docstring: "a
+    second edit to an already-`M` file changes it").
+    """
+
+    workspace = _workspace(tmp_path / "workspace")
+    repo = _clean_repo(workspace.root / "repo")
+    target = _resolve(workspace, repo)
+
+    prepare(repo)
+    before = _check(target, sequence=0, purpose=f"{role.value}-attempt-1-before")
+
+    mutate(repo)
+    after = _check(
+        target,
+        sequence=1,
+        purpose=f"{role.value}-attempt-1-after",
+        role=role,
+        baseline=before.state,
+    )
+
+    assert after.safety_status is GitSafetyStatus.UNSAFE
+    # The porcelain-derived inventory is unchanged -- the delta is visible
+    # only through the content fingerprint, never a new/changed path entry.
+    assert after.state.staged == before.state.staged
+    assert after.state.unstaged == before.state.unstaged
+    assert after.state.untracked == before.state.untracked
+    assert after.state.fingerprint != before.state.fingerprint
 
 
 # --- role mutation policy: coder --------------------------------------------
@@ -408,6 +557,66 @@ def test_check_git_state_first_checkpoint_is_indeterminate_when_incomplete(
     record = _check(target, sequence=0, purpose="baseline")
 
     assert record.safety_status is GitSafetyStatus.INDETERMINATE
+
+
+def test_check_git_state_probe_timeout_and_process_error_are_indeterminate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Complements `test_ac_036_git_probe_failure_is_indeterminate` in
+    `tests/component/test_git_repository.py`, which proves AC-036's text at
+    the `resolve_target`/preflight layer (a timeout, a non-zero exit, or
+    ambiguous stdout on the initial `git rev-parse --show-toplevel` probe
+    -> `PreflightError` `git_safety.top_level_probe_failed`). This proves
+    the complementary checkpoint layer: a genuine git subprocess `TIMEOUT`
+    or non-zero-exit `PROCESS_ERROR` on one of `capture_git_state`'s own
+    six `_STATE_PROBES` (`git_safety.py`) is classified
+    `GitSafetyStatus.INDETERMINATE` by `check_git_state`, never guessed
+    `SAFE` -- the half of AC-036's text ("timeout o exit non-zero di un
+    comando Git di safety") that only `capture_git_state`/`check_git_state`
+    can exercise, and that every other `INDETERMINATE` test in this file
+    triggers through an unrelated cause (a filesystem permission fault, or
+    a monkeypatched return value) rather than a real probe failure.
+
+    The target is resolved with the real `git` executable first (a real
+    `TargetRepository` is required), and only the `check_git_state` call
+    itself is redirected to `FAKE_GIT`
+    (`tests/component/helpers/fake_git.py`), which ignores argv and
+    responds identically to every subcommand -- forcing a failure on the
+    first of the six probes (`branch`) is therefore sufficient to prove
+    the classification for the checkpoint layer as a whole. Like the
+    sibling AC-036 test, this asserts only the black-box
+    `GitSafetyStatus` verdict: `capture_git_state`'s `except PreflightError`
+    branch (`git_safety.py`) discards the failing probe's own
+    `ProcessResult` entirely, so there is no `TIMEOUT`/`PROCESS_ERROR`
+    outcome left on the returned record to assert on directly.
+    """
+
+    workspace = _workspace(tmp_path / "workspace")
+    repo = _clean_repo(workspace.root / "repo")
+    target = _resolve(workspace, repo)
+
+    # A probe that exceeds the utility deadline fails closed.
+    monkeypatch.setenv("FAKE_GIT_SLEEP_SECONDS", "5")
+    timeout_record = _check(
+        target,
+        sequence=0,
+        purpose="baseline",
+        git_executable=FAKE_GIT,
+        utility_timeout_seconds=0.2,
+    )
+    assert timeout_record.safety_status is GitSafetyStatus.INDETERMINATE
+    monkeypatch.delenv("FAKE_GIT_SLEEP_SECONDS", raising=False)
+
+    # A non-zero exit from a probe fails closed.
+    monkeypatch.setenv("FAKE_GIT_EXIT_CODE", "128")
+    nonzero_record = _check(
+        target,
+        sequence=1,
+        purpose="baseline",
+        git_executable=FAKE_GIT,
+    )
+    assert nonzero_record.safety_status is GitSafetyStatus.INDETERMINATE
+    monkeypatch.delenv("FAKE_GIT_EXIT_CODE", raising=False)
 
 
 # =============================================================================

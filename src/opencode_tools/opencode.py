@@ -16,6 +16,7 @@ its fixtures, and the live smoke all pass.
 
 from __future__ import annotations
 
+import fnmatch
 import hashlib
 import json
 import shutil
@@ -53,7 +54,14 @@ _ROLE_TOKENS: dict[AgentRole, str] = {
     AgentRole.CODER: "coder",
     AgentRole.REVIEWER: "reviewer",
 }
-_REQUIRED_RUN_HELP_TOKENS: tuple[str, ...] = ("--agent", "--format json", "--dir")
+# "--format" and "json" are two independent tokens, not one contiguous
+# "--format json" substring: the real `1.17.18` binary's help text puts
+# them multiple words apart ("--format       format: default (formatted)
+# or json (raw JSON events)"), confirmed against a real, locally installed
+# `1.17.18` binary during the M15-03 live qualification. Requiring them
+# adjacent was an unverified assumption from the offline fixture pack that
+# a real run --help call never actually matched.
+_REQUIRED_RUN_HELP_TOKENS: tuple[str, ...] = ("--agent", "--format", "json", "--dir")
 
 # Flags this adapter must never pass to `opencode run` (System Design
 # SS10.3): auto/share/model overrides and every form of session
@@ -69,15 +77,59 @@ FORBIDDEN_RUN_FLAGS: tuple[str, ...] = (
 )
 
 # The reviewed, exact-match permission baseline for each primary role: only
-# the coder may edit or run bash against the target; architect and reviewer
-# stay read-only. Anything else -- including a more permissive "ask" level a
-# non-interactive run could never answer -- fails closed rather than being
-# ranked on a permissiveness scale (ADR-005, ADR-010).
+# the coder may edit or run bash against the target; the architect and
+# reviewer never edit and never fetch a URL themselves. Anything else --
+# including a more permissive "ask" level a non-interactive run could never
+# answer -- fails closed rather than being ranked on a permissiveness scale
+# (ADR-005, ADR-010). The architect's `bash` is deliberately absent here --
+# it is not a flat allow/deny, see `_ARCHITECT_BASH_PERMISSION_CONFIG` below.
 _PERMISSION_BASELINE: dict[AgentRole, dict[str, str]] = {
-    AgentRole.ARCHITECT: {"edit": "deny", "bash": "deny", "webfetch": "deny"},
+    AgentRole.ARCHITECT: {"edit": "deny", "webfetch": "deny"},
     AgentRole.CODER: {"edit": "allow", "bash": "allow", "webfetch": "deny"},
     AgentRole.REVIEWER: {"edit": "deny", "bash": "deny", "webfetch": "deny"},
 }
+
+# The architect's bash access is least-privilege, not merely denied (System
+# Design SS9.3; ADR-007/FR-017: Python never reads or embeds the issue
+# title/body itself -- `build_architect_prompt` instructs the architect to
+# discover both on its own via this single, read-only `gh` command). This
+# is `.opencode/agents/architect.md`'s frontmatter "bash" value verbatim --
+# the ground truth for both that file and `check_debug_agent`'s effective-
+# policy check below, exactly like `_PERMISSION_BASELINE` is for the other,
+# flat permission kinds -- change both together, never hand-copy.
+_ARCHITECT_BASH_PERMISSION_CONFIG: dict[str, str] = {
+    "*": "deny",
+    "gh issue view *": "allow",
+}
+_ARCHITECT_BASH_ALLOWED_PATTERN: str = next(
+    pattern
+    for pattern, action in _ARCHITECT_BASH_PERMISSION_CONFIG.items()
+    if action == "allow"
+)
+
+# Representative bash invocations used to prove the architect's *effective*
+# resolved bash policy, not just inspect its literal rule list: a live
+# capture during the M15-03 qualification showed a machine's own global
+# OpenCode config can prepend an unrelated catch-all rule (observed:
+# `{"permission": "*", "action": "allow", "pattern": "*"}`), so a literal
+# rule-shape comparison could reject a policy that actually resolves
+# correctly, or accept one that does not. Simulating OpenCode's own
+# documented last-match-wins glob resolution
+# (https://opencode.ai/docs/permissions/) for these probes is what actually
+# proves "only `gh issue view` is allowed, every other command is denied".
+_ARCHITECT_BASH_MUST_ALLOW: tuple[str, ...] = (
+    "gh issue view 1 --repo octocat/hello-world",
+)
+_ARCHITECT_BASH_MUST_DENY: tuple[str, ...] = (
+    "gh issue edit 1 --repo octocat/hello-world",
+    "gh issue close 1 --repo octocat/hello-world",
+    "gh issue comment 1 --repo octocat/hello-world",
+    "gh pr create",
+    "git commit -m x",
+    "git push",
+    "rm -rf /",
+    "echo hello",
+)
 
 # Versioned defensive buffer for preflight utility output (System Design
 # SS10.1's "buffer massimo versionato"); a call that exceeds this never
@@ -96,12 +148,24 @@ RUN_OUTPUT_LIMIT_BYTES = 8 * 1_048_576
 # byte budget (System Design SS10.5's "limiti dimensionali").
 MAX_NDJSON_LINES = 100_000
 
-# The transport-level event/part shapes this exact-version adapter
-# recognizes (System Design SS10.5). Anything else -- including a real
+# The transport-level event shapes this exact-version adapter recognizes
+# (System Design SS10.5), corrected against a genuine `opencode run
+# --format json` 1.17.18 NDJSON capture (M15-03 live qualification):
+# real output carries the message-lifecycle kind directly as the top-level
+# `type` -- `step_start`, `text`, `step_finish`, `tool_use`, `reasoning`,
+# `error` -- never wrapped in a `message.part.updated` envelope, which was
+# an unproven, hand-authored assumption this adapter never actually
+# exercised against a real transcript until now. `session.error` is a
+# separate, session-lifecycle event kind (no `part` object at all) already
+# proven by a genuine provider failure. Anything else -- including a real
 # OpenCode event type this adapter simply does not know about yet -- fails
 # closed rather than being ignored, per ADR-005's no-best-effort policy.
-_ALLOWED_TRANSPORT_EVENT_TYPES = frozenset({"message.part.updated", "session.error"})
-_ALLOWED_TRANSPORT_PART_TYPES = frozenset({"text", "reasoning", "tool"})
+_MESSAGE_LIFECYCLE_EVENT_TYPES = frozenset(
+    {"step_start", "text", "step_finish", "tool_use", "reasoning", "error"}
+)
+_ALLOWED_TRANSPORT_EVENT_TYPES = _MESSAGE_LIFECYCLE_EVENT_TYPES | frozenset(
+    {"session.error"}
+)
 
 # The only trusted transient-provider signatures for 1.17.18 (FR-028, System
 # Design SS10.6): keyed by the allowlisted `session.error.data.code` value,
@@ -357,13 +421,14 @@ def decode_run_transport(text: str) -> TransportResult:
 
     Applies, in order (System Design SS9.2/SS10.5, ADR-002/ADR-005): CRLF/CR
     normalization only; bounded NDJSON line splitting; per-line JSON
-    validity and an allowed event-type/part-type/session-ID check; grouping
-    completed `text` parts by `messageID` (last write for a given ID wins),
-    with `tool` and `reasoning` parts excluded entirely from the result; and
-    a requirement that exactly one completed group exists once the stream
-    ends. Every violation is `ProtocolError`; this never searches for a
-    marker itself -- that is `protocol.py`'s job on the single string this
-    function returns.
+    validity and an allowed event-type/session-ID check; grouping completed
+    `text` events' `part.text` by `messageID` (last write for a given ID
+    wins), with `step_start`, `step_finish`, `tool_use`, `reasoning`,
+    `error`, and `session.error` events excluded entirely from the result;
+    and a requirement that exactly one completed group exists once the
+    stream ends. Every violation is `ProtocolError`; this never searches
+    for a marker itself -- that is `protocol.py`'s job on the single
+    string this function returns.
     """
 
     lines = _split_ndjson_lines(text)
@@ -412,23 +477,31 @@ def decode_run_transport(text: str) -> TransportResult:
                 "opencode run produced more than one distinct sessionID.",
             )
 
-        if event_type != "message.part.updated":
+        if event_type == "session.error":
+            # Session-lifecycle diagnostic, not a message part; classifying
+            # it is `classify_provider_signal`'s job on the same stdout, not
+            # this function's (see that function's own docstring).
             continue
 
         part = event.get("part")
         if not isinstance(part, dict):
             raise ProtocolError(
                 "opencode.transport_invalid_event",
-                "A message.part.updated event has no part object.",
+                f"A {event_type!r} event has no part object.",
             )
-        part_type = part.get("type")
-        if part_type not in _ALLOWED_TRANSPORT_PART_TYPES:
-            raise ProtocolError(
-                "opencode.transport_unknown_event_type",
-                f"opencode run produced an unrecognized part type: {part_type!r}.",
-            )
-        if part_type != "text":
+
+        if event_type != "text":
+            # step_start / step_finish / tool_use / reasoning / error are
+            # recognized message-lifecycle events but never contribute to
+            # the terminal assistant text.
             continue
+
+        part_type = part.get("type")
+        if part_type != "text":
+            raise ProtocolError(
+                "opencode.transport_invalid_event",
+                f"A text event's part has an unexpected type: {part_type!r}.",
+            )
 
         message_id = part.get("messageID")
         if not isinstance(message_id, str) or not message_id:
@@ -567,16 +640,38 @@ def _require_process_succeeded(
 
 
 def _decode_or_raise(
-    sink: _BoundedCapturingSink, *, error_cls: type[OpenCodeToolsError], code: str
+    sink: _BoundedCapturingSink,
+    *,
+    error_cls: type[OpenCodeToolsError],
+    code: str,
+    include_stderr: bool = False,
 ) -> str:
-    if sink.overflowed("stdout"):
+    """Decode a utility call's captured `stdout`, or `stdout` + `stderr`.
+
+    Every other utility call (`--version`, `debug config`, `debug agent`,
+    `export`) puts its payload on `stdout`, confirmed live against the real
+    `1.17.18` binary. `opencode run --help` is the one exception: it writes
+    its entire help text to `stderr` with `stdout` empty, also confirmed
+    live -- a real CLI behavior the offline fixture pack's hand-authored
+    text never modeled. `include_stderr=True` decodes and concatenates both
+    channels so a capability check reads whichever one the real binary
+    actually used, rather than assuming a single fixed channel.
+    """
+
+    channels: tuple[LogChannel, ...] = (
+        ("stdout", "stderr") if include_stderr else ("stdout",)
+    )
+    if any(sink.overflowed(channel) for channel in channels):
         raise error_cls(
             code, "OpenCode utility output exceeded the defensive size limit."
         )
-    text = _strict_utf8(sink.bytes_for("stdout"))
-    if text is None:
-        raise error_cls(code, "OpenCode utility output was not valid UTF-8.")
-    return text
+    parts: list[str] = []
+    for channel in channels:
+        text = _strict_utf8(sink.bytes_for(channel))
+        if text is None:
+            raise error_cls(code, "OpenCode utility output was not valid UTF-8.")
+        parts.append(text)
+    return "".join(parts)
 
 
 def _parse_json_object(
@@ -659,7 +754,7 @@ def check_debug_config(config: dict[str, object]) -> None:
 
 
 def check_debug_agent(role: AgentRole, agent: dict[str, object]) -> None:
-    """Reject a missing/fallback, non-primary, ask/task-enabled, or
+    """Reject a missing/fallback, non-primary, question/task-enabled, or
     over-permissive agent.
 
     The identity check comes first and on its own: OpenCode `1.17.18` can
@@ -668,6 +763,14 @@ def check_debug_agent(role: AgentRole, agent: dict[str, object]) -> None:
     does not itself claim to be `role` -- whether because the role is not
     defined at all or because the CLI substituted a different one -- must
     fail closed before any policy field is even inspected.
+
+    `.opencode/agents/*.md` frontmatter configures this capability under
+    the key `tools.ask` (OpenCode's documented config-time name), but the
+    real `1.17.18` binary's `debug agent` response reports the resolved,
+    effective tool under `tools.question` instead -- confirmed live
+    against a real, locally installed binary during the M15-03
+    qualification; `ask` never appears in a real response at all. This
+    checks the response-side name, not the config-time one.
     """
 
     if agent.get("name") != _ROLE_TOKENS[role]:
@@ -688,25 +791,252 @@ def check_debug_agent(role: AgentRole, agent: dict[str, object]) -> None:
             "opencode.debug_agent_invalid",
             f"opencode debug agent {_ROLE_TOKENS[role]} has no tools object.",
         )
-    if tools.get("ask") is not False or tools.get("task") is not False:
+    if tools.get("question") is not False or tools.get("task") is not False:
         raise PreflightError(
             "opencode.debug_agent_rejected",
-            f"opencode debug agent {_ROLE_TOKENS[role]} enables ask or task.",
+            f"opencode debug agent {_ROLE_TOKENS[role]} enables question or task.",
         )
     permission = agent.get("permission")
-    if not isinstance(permission, dict):
+    if not isinstance(permission, list):
         raise PreflightError(
             "opencode.debug_agent_invalid",
-            f"opencode debug agent {_ROLE_TOKENS[role]} has no permission object.",
+            f"opencode debug agent {_ROLE_TOKENS[role]} has no permission rule list.",
         )
     expected = _PERMISSION_BASELINE[role]
-    observed = {key: permission.get(key) for key in expected}
+    observed = {
+        key: _effective_permission_action(role, permission, key) for key in expected
+    }
     if observed != expected:
         raise PreflightError(
             "opencode.debug_agent_rejected",
             f"opencode debug agent {_ROLE_TOKENS[role]} permission matrix "
             "does not match the reviewed baseline.",
         )
+    if role is AgentRole.ARCHITECT:
+        _check_architect_bash_policy(permission)
+
+
+def _resolve_bash_action(bash_rules: list[tuple[str, str]], command: str) -> str | None:
+    """Last-match-wins glob resolution (OpenCode's own documented
+    semantics) of `command` against an ordered `(action, pattern)` list
+    already filtered to the `bash`/`*` permission kinds."""
+
+    effective: str | None = None
+    for action, pattern in bash_rules:
+        if fnmatch.fnmatchcase(command, pattern):
+            effective = action
+    return effective
+
+
+def _check_architect_bash_policy(rules: list[object]) -> None:
+    """Prove the architect's *effective* bash policy is exactly least-
+    privilege: the single `gh issue view` command `build_architect_prompt`
+    instructs it to run is allowed, and every other representative command
+    -- another `gh issue`/`gh pr` mutation, a Git mutation, an arbitrary
+    shell command -- resolves to denied. Simulated by pattern rather than
+    read off a fixed rule shape, because a machine's own global OpenCode
+    config can legitimately prepend unrelated rules that a literal
+    rule-list comparison would trip over (System Design SS9.3;
+    ADR-007/FR-017).
+    """
+
+    bash_rules: list[tuple[str, str]] = []
+    for rule in rules:
+        if not isinstance(rule, dict):
+            raise PreflightError(
+                "opencode.debug_agent_invalid",
+                "opencode debug agent architect has a permission rule that "
+                "is not an object.",
+            )
+        name = rule.get("permission")
+        action = rule.get("action")
+        pattern = rule.get("pattern")
+        if (
+            not isinstance(name, str)
+            or not isinstance(action, str)
+            or not isinstance(pattern, str)
+        ):
+            raise PreflightError(
+                "opencode.debug_agent_invalid",
+                "opencode debug agent architect has a permission rule with "
+                "a non-string permission, action, or pattern.",
+            )
+        if name in ("bash", "*"):
+            bash_rules.append((action, pattern))
+
+    for command in _ARCHITECT_BASH_MUST_ALLOW:
+        if _resolve_bash_action(bash_rules, command) != "allow":
+            raise PreflightError(
+                "opencode.debug_agent_rejected",
+                "opencode debug agent architect does not allow the "
+                f"required bash pattern {_ARCHITECT_BASH_ALLOWED_PATTERN!r}.",
+            )
+    for command in _ARCHITECT_BASH_MUST_DENY:
+        if _resolve_bash_action(bash_rules, command) != "deny":
+            raise PreflightError(
+                "opencode.debug_agent_rejected",
+                "opencode debug agent architect's effective bash policy "
+                f"allows more than {_ARCHITECT_BASH_ALLOWED_PATTERN!r}.",
+            )
+
+
+def _effective_permission_action(
+    role: AgentRole, rules: list[object], permission_name: str
+) -> str | None:
+    """Resolve `permission_name`'s effective action from `1.17.18`'s ordered
+    permission rule list (a real response shape -- {permission, action,
+    pattern} objects, confirmed live during the M15-03 qualification --
+    not the flat dict the offline fixture pack originally assumed).
+
+    Per OpenCode's own documented resolution order
+    (https://opencode.ai/docs/permissions/): "Rules are evaluated by
+    pattern match, with the last matching rule winning." A rule matches
+    `permission_name` when its own `permission` field equals it exactly,
+    or is the wildcard `"*"` (matching every permission kind -- the
+    canonical catch-all OpenCode's own docs recommend placing first).
+    Every other permission kind (`read`, `doom_loop`, `external_directory`,
+    and machine-local entries a user's own global OpenCode config may add)
+    is irrelevant here and is skipped without affecting the result.
+
+    Every rule entry must be a well-formed object with string `permission`
+    and `action` fields; a malformed one fails closed rather than being
+    silently skipped. No match at all (an empty or entirely irrelevant
+    list) resolves to `None`, which can never equal a real baseline
+    action string, so the caller's equality check already fails closed on
+    that case without needing a separate error here.
+    """
+
+    effective: str | None = None
+    for rule in rules:
+        if not isinstance(rule, dict):
+            raise PreflightError(
+                "opencode.debug_agent_invalid",
+                f"opencode debug agent {_ROLE_TOKENS[role]} has a permission "
+                "rule that is not an object.",
+            )
+        name = rule.get("permission")
+        action = rule.get("action")
+        if not isinstance(name, str) or not isinstance(action, str):
+            raise PreflightError(
+                "opencode.debug_agent_invalid",
+                f"opencode debug agent {_ROLE_TOKENS[role]} has a permission "
+                "rule with a non-string permission or action.",
+            )
+        if name == permission_name or name == "*":
+            effective = action
+    return effective
+
+
+def _permission_rule_sort_key(rule: dict[str, object]) -> tuple[str, str, str]:
+    return (
+        str(rule.get("permission", "")),
+        str(rule.get("pattern", "")),
+        str(rule.get("action", "")),
+    )
+
+
+def _external_directory_patterns_may_overlap(pattern_a: str, pattern_b: str) -> bool:
+    """Conservative overlap test for two `external_directory` rule patterns.
+
+    Only a pair of distinct, `"<literal-directory-prefix>*"`-shaped
+    patterns -- a single trailing wildcard, no wildcard elsewhere, neither
+    prefix nested inside the other -- is provably non-overlapping (moving
+    one relative to the other can never change which directory either one
+    matches). Anything else -- an identical pattern, a bare `"*"`, a
+    wildcard anywhere but the very end, or one prefix nested inside the
+    other -- is treated as potentially overlapping, so reordering it is
+    never assumed safe.
+    """
+
+    if pattern_a == pattern_b:
+        return True
+    for pattern in (pattern_a, pattern_b):
+        if pattern == "*" or not pattern.endswith("*") or "*" in pattern[:-1]:
+            return True
+    prefix_a, prefix_b = pattern_a[:-1], pattern_b[:-1]
+    return prefix_a.startswith(prefix_b) or prefix_b.startswith(prefix_a)
+
+
+def _canonicalize_permission_rules(rules: object) -> object:
+    """Stabilize digest-irrelevant reordering in a real `1.17.18`
+    `debug agent` permission rule list, without ever reordering anything
+    whose position could affect OpenCode's documented last-match-wins
+    resolution (https://opencode.ai/docs/permissions/) for any permission
+    kind.
+
+    Confirmed live during the M15-03 qualification: successive `debug
+    agent` calls return the same *set* of `external_directory` rules --
+    entries a user's own global OpenCode config adds, granting access to
+    specific, mutually unrelated local directories such as installed
+    skill folders -- in a *different order* each time, while every other
+    rule's position stays stable. That noisy run is not internally
+    uniform, though: it typically opens with a genuinely ambiguous
+    `external_directory` rule (e.g. `pattern: "*"`, overlapping with every
+    other one) before the mutually-distinct directory grants. Treating the
+    whole contiguous run as one atomic sort-or-don't unit -- as an earlier
+    version of this function did -- lets that one ambiguous rule poison
+    the entire run, leaving the genuinely noisy part unsorted and the
+    digest unstable. Instead, entries are grouped *incrementally*: a new
+    `external_directory` entry joins the current subgroup only if it is
+    provably non-overlapping (`_external_directory_patterns_may_overlap`)
+    with every entry already in it; otherwise the current subgroup is
+    closed (and sorted, if it has more than one entry) and a new one
+    starts with just this entry. Each closed subgroup is emitted in its
+    original position -- only entries *within* one provably-safe subgroup
+    are ever reordered relative to each other. Anything that is not a
+    well-formed `{permission, pattern, action}` `external_directory`
+    object closes the current subgroup and passes through unchanged in
+    its original position, so a reordering there, or a set that genuinely
+    changed, still registers as drift rather than being silently
+    normalized. This is never asked to interpret a rule list
+    `check_debug_agent` has not already validated -- a malformed list
+    simply fails to canonicalize and its raw form still hashes, correctly
+    registering as drift.
+    """
+
+    if not isinstance(rules, list):
+        return rules
+
+    def _run_entry(entry: object) -> dict[str, object] | None:
+        if (
+            isinstance(entry, dict)
+            and entry.get("permission") == "external_directory"
+            and isinstance(entry.get("pattern"), str)
+            and isinstance(entry.get("action"), str)
+        ):
+            return entry
+        return None
+
+    canonical: list[object] = []
+    subgroup: list[dict[str, object]] = []
+
+    def flush_subgroup() -> None:
+        if not subgroup:
+            return
+        ordered: list[dict[str, object]] = sorted(
+            subgroup, key=_permission_rule_sort_key
+        )
+        canonical.extend(ordered)
+        subgroup.clear()
+
+    for entry in rules:
+        run_entry = _run_entry(entry)
+        if run_entry is None:
+            flush_subgroup()
+            canonical.append(entry)
+            continue
+        pattern = cast(str, run_entry["pattern"])
+        conflicts = any(
+            _external_directory_patterns_may_overlap(
+                pattern, cast(str, existing["pattern"])
+            )
+            for existing in subgroup
+        )
+        if conflicts:
+            flush_subgroup()
+        subgroup.append(run_entry)
+    flush_subgroup()
+    return canonical
 
 
 def compute_control_plane_digest(
@@ -720,12 +1050,26 @@ def compute_control_plane_digest(
     rather than raw bytes, means a harmless re-serialization difference
     between two `debug` calls -- key order, whitespace -- never registers as
     drift; only a genuine change to the effective policy does (ADR-005,
-    System Design SS18.2).
+    System Design SS18.2). `sort_keys` alone only orders JSON *object* keys,
+    never list elements: each role's `permission` rule list is separately
+    canonicalized first (`_canonicalize_permission_rules`) so the real
+    binary's own non-deterministic `external_directory` rule ordering,
+    confirmed live during the M15-03 qualification, cannot register as
+    drift either, without ever reordering anything last-match-wins
+    resolution could actually depend on.
     """
 
     canonical = {
         "config": config,
-        "agents": {role.value: agents[role] for role in _PRIMARY_ROLES},
+        "agents": {
+            role.value: {
+                **agents[role],
+                "permission": _canonicalize_permission_rules(
+                    agents[role].get("permission")
+                ),
+            }
+            for role in _PRIMARY_ROLES
+        },
     }
     encoded = json.dumps(canonical, sort_keys=True, separators=(",", ":")).encode(
         "utf-8"
@@ -862,7 +1206,10 @@ def run_preflight(
         message="opencode run --help did not complete successfully.",
     )
     help_text = _decode_or_raise(
-        help_sink, error_cls=PreflightError, code="opencode.capability_call_failed"
+        help_sink,
+        error_cls=PreflightError,
+        code="opencode.capability_call_failed",
+        include_stderr=True,
     )
     check_run_help_capability(help_text)
 

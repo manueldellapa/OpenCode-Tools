@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "opencode_version": "1.17.18",
-  "compatibility_status": "candidate",
+  "compatibility_status": "supported",
   "provenance": {
     "method": "Hand-authored offline evidence pack modeling the documented OpenCode 1.17.18 CLI, NDJSON transport, and debug/export JSON contract. No live OpenCode process, network access, or real provider/model was used; every fixture is a static, version-pinned test double checked into the repository.",
     "authored_for": "OpenCode-Tools GitHub issue #21 (work package M07-01)",
@@ -10,6 +10,66 @@
       "https://raw.githubusercontent.com/anomalyco/opencode/v1.17.18/packages/opencode/src/cli/cmd/run.ts",
       "https://raw.githubusercontent.com/anomalyco/opencode/v1.17.18/packages/opencode/src/cli/cmd/export.ts",
       "https://raw.githubusercontent.com/anomalyco/opencode/v1.17.18/packages/opencode/src/cli/cmd/debug/agent.ts"
+    ],
+    "corrections": [
+      {
+        "date": "2026-09-17",
+        "authored_for": "OpenCode-Tools GitHub issue #59 (work package M15-03)",
+        "reason": "The M07-01 pack's seven debug/agent-*.json fixtures modeled `debug agent <role>` with a flat `permission: {edit, bash, webfetch}` dict and a `tools.ask` boolean -- an assumption never checked against a real binary. Live qualification against a real, locally installed 1.17.18 binary showed the actual response uses `tools.question` (not `tools.ask`, which never appears at all) and an ordered `permission: [{permission, action, pattern}, ...]` rule list resolved last-match-wins (https://opencode.ai/docs/permissions/), not a flat dict. All seven fixtures were corrected to the real shape and re-hashed; `src/opencode_tools/opencode.py`'s check_debug_agent and run --help's stdout/stderr capture were corrected to match.",
+        "affected_fixtures": [
+          "debug/agent-architect-baseline.json",
+          "debug/agent-architect-ask-enabled.json",
+          "debug/agent-architect-permissive-edit.json",
+          "debug/agent-coder-baseline.json",
+          "debug/agent-coder-task-enabled.json",
+          "debug/agent-reviewer-baseline.json",
+          "debug/agent-reviewer-subagent-mode.json"
+        ]
+      },
+      {
+        "date": "2026-09-17",
+        "authored_for": "OpenCode-Tools GitHub issue #59 (work package M15-03)",
+        "reason": "decode_run_transport assumed `opencode run --format json` wraps every message part in a `message.part.updated` envelope -- an assumption never checked against a real binary. A live re-qualification run (after fixing the earlier model-resolution blocker) captured a genuine NDJSON transcript and proved this wrong: real 1.17.18 output carries the message-lifecycle kind directly as the top-level `type` (`step_start`, `text`, `step_finish`, `tool_use`, `reasoning`, `error`), never wrapped. Every attempt was failing PROTOCOL_ERROR even when the agent's final message carried a syntactically valid AGENT_STATUS marker, because the parser never recognized the real event type and so never read it. `_ALLOWED_TRANSPORT_EVENT_TYPES` and `decode_run_transport` were corrected to the real contract (no `message.part.updated` fallback), `run/architect-failed.ndjson` was replaced with the genuine captured transcript, and the remaining run/provider/malformed NDJSON fixtures were converted from the unproven envelope shape to the real one.",
+        "affected_fixtures": [
+          "run/architect-ready-success.ndjson",
+          "run/architect-failed.ndjson",
+          "run/coder-completed-success.ndjson",
+          "run/coder-failed.ndjson",
+          "run/reviewer-approved-success.ndjson",
+          "run/reviewer-changes-required.ndjson",
+          "run/reviewer-failed.ndjson",
+          "run/exit-nonzero-no-provider-signal.ndjson",
+          "run/partial-output-return-code-null.ndjson",
+          "provider/http-429-rate-limit.ndjson",
+          "provider/http-502-bad-gateway.ndjson",
+          "provider/lookalike-in-assistant-text.ndjson",
+          "provider/lookalike-in-tool-output.ndjson",
+          "malformed/invalid-json-line.ndjson",
+          "malformed/unknown-event-type.ndjson",
+          "malformed/session-id-mismatch.ndjson",
+          "malformed/truncated-no-terminal-text.ndjson",
+          "malformed/multi-terminal-candidates.ndjson",
+          "malformed/tool-output-marker-spoofing.ndjson",
+          "malformed/reasoning-marker-spoofing.ndjson"
+        ]
+      },
+      {
+        "date": "2026-09-17",
+        "authored_for": "OpenCode-Tools GitHub issue #59 (work package M15-03)",
+        "reason": "A live re-qualification run (after the transport-shape fix above) reached a genuine, correctly-parsed architect response for the first time and exposed a real, pre-existing design contradiction: `build_architect_prompt` instructs the architect to run `gh issue view` itself to discover the issue title/body (Python never reads or embeds them -- ADR-007/FR-017), but `.opencode/agents/architect.md` declared `bash: deny` outright, so the architect had no tool to ever run that command -- every honest run was destined to report AGENT_STATUS: FAILED. Fixed with least privilege, not a broader flat allow: the architect's bash permission is now a config-time nested object (`_ARCHITECT_BASH_PERMISSION_CONFIG`) denying everything by default except the single, exact `gh issue view *` pattern its own prompt names. `check_debug_agent` now verifies this via `_check_architect_bash_policy`, which simulates OpenCode's real last-match-wins glob resolution against representative probe commands rather than comparing a literal rule list, because a live capture showed a machine's own global OpenCode config can legitimately prepend an unrelated catch-all rule that a literal-shape comparison would trip over.",
+        "affected_fixtures": [
+          "debug/agent-architect-baseline.json",
+          "debug/agent-architect-ask-enabled.json",
+          "debug/agent-architect-permissive-edit.json",
+          "debug/agent-architect-permissive-bash.json"
+        ]
+      },
+      {
+        "date": "2026-09-17",
+        "authored_for": "OpenCode-Tools GitHub issue #59 (work package M15-03)",
+        "reason": "AC-027 live re-qualification PASSED twice, independently, against a disposable private GitHub repository and a controlled issue on this project's own macOS (darwin) development machine, using the real, project-local architect/coder/reviewer agent definitions and their own configured openrouter provider/model with zero fallback. Both runs: exact version 1.17.18, verified_agent matching the requested role for every attempt via sanitized export, three distinct session_id values, git_safety_status SAFE, no remote/local HEAD or commit-count change, final_status APPROVED. compatibility_status moves from 'candidate' to 'supported' per ADR-005's three-step gate; the corresponding prose lives in docs/compatibility.md.",
+        "affected_fixtures": []
+      }
     ]
   },
   "fixtures": [
@@ -18,88 +78,88 @@
       "category": "run-transcript",
       "kind": "positive",
       "role": "architect",
-      "sha256": "16db087291d0c649960f8a35c4819dbde9429288db088fae549e62cb9305fcf9",
-      "description": "Clean single-session architect run producing one terminal text with a handoff, ISSUE_REF_JSON, and AGENT_STATUS: READY."
+      "sha256": "a4489e66bf703ee1549dcd25fd90cb92a76d087d973aaa7566065f14e7990aa6",
+      "description": "Clean single-session architect run producing one terminal text with a handoff, ISSUE_REF_JSON, and AGENT_STATUS: READY. (M15-03-transport-corrected: real step_start/text/step_finish/tool_use/reasoning/error top-level event shape, not the unproven message.part.updated envelope.)"
     },
     {
       "path": "run/architect-failed.ndjson",
       "category": "run-transcript",
       "kind": "positive",
       "role": "architect",
-      "sha256": "5060e38c7505e10e569c0481e47ed8f7c28d397e26ae3c3fe2951b9713696ac3",
-      "description": "Clean architect run that reports AGENT_STATUS: FAILED with a non-empty explanation before any handoff is produced."
+      "sha256": "7ee656b3e6cf0bf63285310e9885f1a6ac222c31c8cd1465bf5ac8259baae15c",
+      "description": "Genuine NDJSON captured from a real `opencode run --format json` 1.17.18 invocation during M15-03 live re-qualification (2026-09-17): the architect reports AGENT_STATUS: FAILED after reasoning it lacks a shell tool to fetch the issue itself. Real step_start/text/step_finish event shape (M15-03-transport-corrected), not hand-authored."
     },
     {
       "path": "run/coder-completed-success.ndjson",
       "category": "run-transcript",
       "kind": "positive",
       "role": "coder",
-      "sha256": "a975c667438d9290bbd43c8d7cf2d6c63ae54bdff0399a1eb740f06e0d1ce449",
-      "description": "Clean coder run with one tool call followed by a single terminal text ending in AGENT_STATUS: COMPLETED."
+      "sha256": "600c8a60e949ac9a336770b74b7c0a384677feecb4b8f53e82e2b9f0559eba3f",
+      "description": "Clean coder run with one tool call followed by a single terminal text ending in AGENT_STATUS: COMPLETED. (M15-03-transport-corrected: real step_start/text/step_finish/tool_use/reasoning/error top-level event shape, not the unproven message.part.updated envelope.)"
     },
     {
       "path": "run/coder-failed.ndjson",
       "category": "run-transcript",
       "kind": "positive",
       "role": "coder",
-      "sha256": "e923016201aeb46ef7d3aa68d621d77e5efcea467fcba19cfa9035c294f23c4c",
-      "description": "Clean coder run that reports AGENT_STATUS: FAILED with a non-empty explanation after a failed tool call."
+      "sha256": "f8a3db3322a46ff8154a1870fd790664fb9c3e3b4da29481ad34f47511a88b49",
+      "description": "Clean coder run that reports AGENT_STATUS: FAILED with a non-empty explanation after a failed tool call. (M15-03-transport-corrected: real step_start/text/step_finish/tool_use/reasoning/error top-level event shape, not the unproven message.part.updated envelope.)"
     },
     {
       "path": "run/reviewer-approved-success.ndjson",
       "category": "run-transcript",
       "kind": "positive",
       "role": "reviewer",
-      "sha256": "1c53bd5a9ee5a46fb734d3bb7b1ece2a460c6fb1b48b7f50e532b174cd51e4c9",
-      "description": "Clean reviewer run whose sole terminal text line is REVIEW_STATUS: APPROVED with an empty body."
+      "sha256": "454fa059eadc53796f138d0cbe4c6348c06c034827c40f07113540e2bab50d03",
+      "description": "Clean reviewer run whose sole terminal text line is REVIEW_STATUS: APPROVED with an empty body. (M15-03-transport-corrected: real step_start/text/step_finish/tool_use/reasoning/error top-level event shape, not the unproven message.part.updated envelope.)"
     },
     {
       "path": "run/reviewer-changes-required.ndjson",
       "category": "run-transcript",
       "kind": "positive",
       "role": "reviewer",
-      "sha256": "35d6cd5a1dce9acee2aa0be00c8a196a4479f7210e433c6673f8a4b7a6398963",
-      "description": "Clean reviewer run reporting REVIEW_STATUS: CHANGES_REQUIRED with a non-empty body; a valid parse with outcome SUCCEEDED."
+      "sha256": "019d4af27bd388b8174e3d13ab8d70b288f805d569984a5e2ae2dc22d12127b2",
+      "description": "Clean reviewer run reporting REVIEW_STATUS: CHANGES_REQUIRED with a non-empty body; a valid parse with outcome SUCCEEDED. (M15-03-transport-corrected: real step_start/text/step_finish/tool_use/reasoning/error top-level event shape, not the unproven message.part.updated envelope.)"
     },
     {
       "path": "run/reviewer-failed.ndjson",
       "category": "run-transcript",
       "kind": "positive",
       "role": "reviewer",
-      "sha256": "c02acd64b8c9849927bb40bda4df0540c1b1f067a1b249ccf08794466b3200d4",
-      "description": "Clean reviewer run that reports AGENT_STATUS: FAILED with a non-empty explanation when review cannot proceed."
+      "sha256": "96f3dcde3c9436f94409a28baea3bd6623ff61e4f1701ee18851dc83195aea56",
+      "description": "Clean reviewer run that reports AGENT_STATUS: FAILED with a non-empty explanation when review cannot proceed. (M15-03-transport-corrected: real step_start/text/step_finish/tool_use/reasoning/error top-level event shape, not the unproven message.part.updated envelope.)"
     },
     {
       "path": "run/exit-nonzero-no-provider-signal.ndjson",
       "category": "run-process-exit",
       "kind": "negative",
       "role": null,
-      "sha256": "27b5d7ba86502ff352ed1f91af0398cca12b17d56824728ea69c71a27f33ba86",
-      "description": "Stream ends after an uncompleted tool call with no session.error event and no terminal text; paired with a non-zero exit code (1) and no trusted provider signal, so it must not authorize a provider retry."
+      "sha256": "a0601f103dcd15e449bb7f6de7c9613b4e274fc8d29eb4e66f690c2492cab7af",
+      "description": "Stream ends after an uncompleted tool call with no session.error event and no terminal text; paired with a non-zero exit code (1) and no trusted provider signal, so it must not authorize a provider retry. (M15-03-transport-corrected: real step_start/text/step_finish/tool_use/reasoning/error top-level event shape, not the unproven message.part.updated envelope.)"
     },
     {
       "path": "run/partial-output-return-code-null.ndjson",
       "category": "run-process-exit",
       "kind": "negative",
       "role": null,
-      "sha256": "0da15b73ffa58a2edce28c7bb5f81459dc84cb1e92709cde725191ab822f9c8a",
-      "description": "Stream stops mid-reasoning with no terminal text at all, modeling a killed child whose return code is nullable rather than observed."
+      "sha256": "00eb4bc9c3d47d57809bc72e2f1616b6edaebb4ff5a92252ed0800bf6d95d57b",
+      "description": "Stream stops mid-reasoning with no terminal text at all, modeling a killed child whose return code is nullable rather than observed. (M15-03-transport-corrected: real step_start/text/step_finish/tool_use/reasoning/error top-level event shape, not the unproven message.part.updated envelope.)"
     },
     {
       "path": "provider/http-429-rate-limit.ndjson",
       "category": "provider-trusted",
       "kind": "positive",
       "role": null,
-      "sha256": "cc32eb93f6a1e6facbc926b2877ecf310e72cd7870bfc5039682fb1aeffe4221",
-      "description": "Trusted session.error event carrying HTTP 429 / rate_limit_exceeded, the canonical transient provider signature."
+      "sha256": "899a27d222d7af605574617920e9df2fc4f195020741bac74b0aa4730b81aca2",
+      "description": "Trusted session.error event carrying HTTP 429 / rate_limit_exceeded, the canonical transient provider signature. (M15-03-transport-corrected: real step_start/text/step_finish/tool_use/reasoning/error top-level event shape, not the unproven message.part.updated envelope.)"
     },
     {
       "path": "provider/http-502-bad-gateway.ndjson",
       "category": "provider-trusted",
       "kind": "positive",
       "role": null,
-      "sha256": "fcf5db92d46b62e6494e3c11582aa142d6f739a15203fbceca60f325b355c751",
-      "description": "Trusted session.error event carrying HTTP 502 / bad_gateway, the canonical transient provider signature."
+      "sha256": "08cfb4ca6f38a5dc120459c79d444500b23cadef61a7b9c6de1185e0f6d35a91",
+      "description": "Trusted session.error event carrying HTTP 502 / bad_gateway, the canonical transient provider signature. (M15-03-transport-corrected: real step_start/text/step_finish/tool_use/reasoning/error top-level event shape, not the unproven message.part.updated envelope.)"
     },
     {
       "path": "provider/provider-unavailable.ndjson",
@@ -130,72 +190,72 @@
       "category": "provider-lookalike",
       "kind": "negative",
       "role": "coder",
-      "sha256": "2f0d6308ae18512d09c628467dccebdc5f56dcde735777b55d0154adb296c03e",
-      "description": "Trust-boundary case: the terminal assistant text mentions 429 and rate limit as ordinary prose with no session.error event; must not be classified as a trusted provider signal."
+      "sha256": "fa991ec45868f07b1c3934f3f36f5486d6e1ecea27260b243e3e0650665e96a6",
+      "description": "Trust-boundary case: the terminal assistant text mentions 429 and rate limit as ordinary prose with no session.error event; must not be classified as a trusted provider signal. (M15-03-transport-corrected: real step_start/text/step_finish/tool_use/reasoning/error top-level event shape, not the unproven message.part.updated envelope.)"
     },
     {
       "path": "provider/lookalike-in-tool-output.ndjson",
       "category": "provider-lookalike",
       "kind": "negative",
       "role": "coder",
-      "sha256": "aa7511a0e938db97331cdbbb1ebf79db5699a0dcb8eb58175d851b74d4559800",
-      "description": "Trust-boundary case: a tool call's captured output mentions 502 Bad Gateway with no session.error event; must not be classified as a trusted provider signal."
+      "sha256": "53ba7fef2d66ff44fcd6b0570cacc7e16a7d4362d7273d6d5d99ca1bfd2986a8",
+      "description": "Trust-boundary case: a tool call's captured output mentions 502 Bad Gateway with no session.error event; must not be classified as a trusted provider signal. (M15-03-transport-corrected: real step_start/text/step_finish/tool_use/reasoning/error top-level event shape, not the unproven message.part.updated envelope.)"
     },
     {
       "path": "malformed/invalid-json-line.ndjson",
       "category": "transport-malformed",
       "kind": "negative",
       "role": null,
-      "sha256": "2afdcf5742c33a94eeae739b5a0e06266eaf5954f8e53b61d53d4ca1d80b2326",
-      "description": "Second line is not valid JSON at all, modeling a truncated or corrupted NDJSON stream."
+      "sha256": "fd942389b8ec329cd6a42ae2ccc0285fbde3aa6ac7c11778c3ba459f723dee86",
+      "description": "Second line is not valid JSON at all, modeling a truncated or corrupted NDJSON stream. (M15-03-transport-corrected: real step_start/text/step_finish/tool_use/reasoning/error top-level event shape, not the unproven message.part.updated envelope.)"
     },
     {
       "path": "malformed/unknown-event-type.ndjson",
       "category": "transport-malformed",
       "kind": "negative",
       "role": null,
-      "sha256": "579f80bf49e8bcf81daec83c86f2cb2576eb3071b0ab708fd5246f5a8a2b3b05",
-      "description": "Well-formed JSON line whose event type is outside the 1.17.18 schema allowlist."
+      "sha256": "3a6af28ad765e7f273c482adf10d2b3ca713bfe1c311234243ffce8c52a3650c",
+      "description": "Well-formed JSON line whose event type is outside the 1.17.18 schema allowlist. (M15-03-transport-corrected: real step_start/text/step_finish/tool_use/reasoning/error top-level event shape, not the unproven message.part.updated envelope.)"
     },
     {
       "path": "malformed/session-id-mismatch.ndjson",
       "category": "transport-malformed",
       "kind": "negative",
       "role": null,
-      "sha256": "11734ace36c3630ae626a24248637f85d611abae0defe2a8945ac744dcbb3f9d",
-      "description": "Two lines carry different sessionID values, modeling an ambiguous or interleaved transport."
+      "sha256": "328612fe771a97581d1193ee0a636f87f431fc9dbd938e3608a1485af3472ccc",
+      "description": "Two lines carry different sessionID values, modeling an ambiguous or interleaved transport. (M15-03-transport-corrected: real step_start/text/step_finish/tool_use/reasoning/error top-level event shape, not the unproven message.part.updated envelope.)"
     },
     {
       "path": "malformed/truncated-no-terminal-text.ndjson",
       "category": "transport-malformed",
       "kind": "negative",
       "role": null,
-      "sha256": "4828964facca5de28dd0b5b0b7d11c5b0bb5c42999e0efc38a827df612177c30",
-      "description": "Stream ends with only a reasoning part and a still-running tool call; no completed terminal text part ever appears."
+      "sha256": "a64829f99219dc6028df0fdae8b74f89388d3972932aa4ffd2c0e01231ef3338",
+      "description": "Stream ends with only a reasoning part and a still-running tool call; no completed terminal text part ever appears. (M15-03-transport-corrected: real step_start/text/step_finish/tool_use/reasoning/error top-level event shape, not the unproven message.part.updated envelope.)"
     },
     {
       "path": "malformed/multi-terminal-candidates.ndjson",
       "category": "transport-malformed",
       "kind": "negative",
       "role": null,
-      "sha256": "7a77660073e05994259122880d6fa81642d8968078d2107e7db2534552580d07",
-      "description": "Two distinct messageID groups both present a completed terminal text candidate, making the terminal message ambiguous."
+      "sha256": "f2c8867ee0073c1c093969be2b9b11223d50536fcd86214deda9dffe7460e0ed",
+      "description": "Two distinct messageID groups both present a completed terminal text candidate, making the terminal message ambiguous. (M15-03-transport-corrected: real step_start/text/step_finish/tool_use/reasoning/error top-level event shape, not the unproven message.part.updated envelope.)"
     },
     {
       "path": "malformed/tool-output-marker-spoofing.ndjson",
       "category": "transport-malformed",
       "kind": "negative",
       "role": null,
-      "sha256": "867ce4cdd3f8c0c48cd09f3d57df5635fdcc6739d3fe928e1c5322f82eb9c867",
-      "description": "A tool call's captured output contains a literal AGENT_STATUS: READY line; only the true terminal text part may feed the protocol parser."
+      "sha256": "0c32a02ae659fa64832a2f0022eeb28a463b534b19272437ef384c931ef747af",
+      "description": "A tool call's captured output contains a literal AGENT_STATUS: READY line; only the true terminal text part may feed the protocol parser. (M15-03-transport-corrected: real step_start/text/step_finish/tool_use/reasoning/error top-level event shape, not the unproven message.part.updated envelope.)"
     },
     {
       "path": "malformed/reasoning-marker-spoofing.ndjson",
       "category": "transport-malformed",
       "kind": "negative",
       "role": null,
-      "sha256": "f07133c6eb8197aba100db35bd07a9970760762a3dd82e840631bce20206971a",
-      "description": "A reasoning part mentions AGENT_STATUS: COMPLETED as prose; reasoning parts must never feed the protocol parser."
+      "sha256": "fe68c9be181fa82ceae5b3a4456433c379592b43724211c77531bea90aef4d44",
+      "description": "A reasoning part mentions AGENT_STATUS: COMPLETED as prose; reasoning parts must never feed the protocol parser. (M15-03-transport-corrected: real step_start/text/step_finish/tool_use/reasoning/error top-level event shape, not the unproven message.part.updated envelope.)"
     },
     {
       "path": "malformed/non-utf8-bytes.bin",
@@ -234,56 +294,56 @@
       "category": "debug-agent",
       "kind": "positive",
       "role": "architect",
-      "sha256": "b24fdf4571da2bd6c217d143a3fee96f2953f07cb41c025849de9bd4b0388c76",
-      "description": "opencode debug agent architect output: primary mode, no ask/task tools, read-only permission matrix."
+      "sha256": "803afb00f438f8333feb03ebb860f747c996f86e13d5fa1f3fddf337c2e1fedc",
+      "description": "opencode debug agent architect output: primary mode, question/task tools both false, read-only permission matrix as an ordered rule list (M15-03-corrected: the real response uses tools.question and an ordered {permission,action,pattern} rule array, not tools.ask and a flat permission dict as originally hand-authored -- confirmed live). (M15-03-bash-least-privilege: architect bash rules now include the reviewed 'deny *' then 'allow gh issue view *' pair.)"
     },
     {
       "path": "debug/agent-coder-baseline.json",
       "category": "debug-agent",
       "kind": "positive",
       "role": "coder",
-      "sha256": "a4899a8544e65e61ef680a2e47527a0d9b305e2f6dab96c39ca378157ffb4c8d",
-      "description": "opencode debug agent coder output: primary mode, no ask/task tools, edit/bash permission allowed for the target."
+      "sha256": "27d13b8095ce3d9d226ad274887c4b72b6892e6a1f4b8b4524e37f2c471fb8a9",
+      "description": "opencode debug agent coder output: primary mode, question/task tools both false, edit/bash permission allowed for the target as an ordered rule list (M15-03-corrected, see agent-architect-baseline.json's note)."
     },
     {
       "path": "debug/agent-reviewer-baseline.json",
       "category": "debug-agent",
       "kind": "positive",
       "role": "reviewer",
-      "sha256": "c1dcc8ad975dd5c614aa5bd3b2ce38c72cbb6c35280ebd07e9076d78998e1b8f",
-      "description": "opencode debug agent reviewer output: primary mode, no ask/task tools, read-only permission matrix."
+      "sha256": "08dcfb100837993fc9a804cbd12c02d46eea2f5180ae3c3c4bbd634fd220af52",
+      "description": "opencode debug agent reviewer output: primary mode, question/task tools both false, read-only permission matrix as an ordered rule list (M15-03-corrected, see agent-architect-baseline.json's note)."
     },
     {
       "path": "debug/agent-architect-ask-enabled.json",
       "category": "debug-agent",
       "kind": "negative",
       "role": "architect",
-      "sha256": "0fa2bca4bed34f06fbd355ed2e41f1614197e15ebcba2454c6c371b96b8db802",
-      "description": "opencode debug agent architect output with the ask tool enabled; preflight must reject it."
+      "sha256": "5f666b52e018ccb3d0f05e63a86ae5e1ca4a9efb449240bb418d03e7e8ab3865",
+      "description": "opencode debug agent architect output with the question tool enabled; preflight must reject it (M15-03-corrected: tools.question, not tools.ask -- see agent-architect-baseline.json's note). (M15-03-bash-least-privilege: architect bash rules now include the reviewed 'deny *' then 'allow gh issue view *' pair.)"
     },
     {
       "path": "debug/agent-coder-task-enabled.json",
       "category": "debug-agent",
       "kind": "negative",
       "role": "coder",
-      "sha256": "9b875102c518b9ef2cbcb14a8660e55f45dec106f4ba8aebe5bd39736e40a53d",
-      "description": "opencode debug agent coder output with the task tool enabled; preflight must reject any subagent delegation capability."
+      "sha256": "32e4b1065aa79615ebaee33cc43cdf12dadc91c51bfb8b361817dfd8ff59c467",
+      "description": "opencode debug agent coder output with the task tool enabled; preflight must reject any subagent delegation capability (M15-03-corrected rule-list shape, see agent-architect-baseline.json's note)."
     },
     {
       "path": "debug/agent-reviewer-subagent-mode.json",
       "category": "debug-agent",
       "kind": "negative",
       "role": "reviewer",
-      "sha256": "0ad554e9a44a1a633c1ebd95bcc44e3f42f29745610c2ab02f71460d50d680f0",
-      "description": "opencode debug agent reviewer output reporting mode subagent instead of primary; preflight must reject non-primary agents."
+      "sha256": "9ff7c286bc60813b74c7b1fe5de63f0e1f0a448a53153de98266b71ed6080eef",
+      "description": "opencode debug agent reviewer output reporting mode subagent instead of primary; preflight must reject non-primary agents (M15-03-corrected rule-list shape, see agent-architect-baseline.json's note)."
     },
     {
       "path": "debug/agent-architect-permissive-edit.json",
       "category": "debug-agent",
       "kind": "negative",
       "role": "architect",
-      "sha256": "d7da782bdff3b5b8772aead657b78ba11e306375c310d19177ff169779f5f1a2",
-      "description": "opencode debug agent architect output granting edit permission; preflight must reject any effective policy more permissive than the reviewed read-only baseline."
+      "sha256": "90b4c7af4abd386a8d9cd97c72b332d5751c98690166e2cef4e9b4affe9f6743",
+      "description": "opencode debug agent architect output granting edit permission; preflight must reject any effective policy more permissive than the reviewed read-only baseline (M15-03-corrected rule-list shape, see agent-architect-baseline.json's note). (M15-03-bash-least-privilege: architect bash rules now include the reviewed 'deny *' then 'allow gh issue view *' pair.)"
     },
     {
       "path": "debug/agent-missing.json",
@@ -348,6 +408,14 @@
       "role": null,
       "sha256": "630517e1f7b6814acb4e7ef8960ab199349e3b70fb244445054eb0d2362735b7",
       "description": "Sanitized export with two top-level assistant messages reporting different info.agent values, one of them the default fallback agent."
+    },
+    {
+      "path": "debug/agent-architect-permissive-bash.json",
+      "category": "debug-agent",
+      "kind": "negative",
+      "role": "architect",
+      "sha256": "d0c84fcd21f0393ed89c47c1c29e98a3fa935c624511cfb7af7019cf49a94780",
+      "description": "opencode debug agent architect output whose bash rules allow both the reviewed 'gh issue view *' pattern and an extra 'gh issue edit *' pattern; preflight must reject any bash allow beyond the single reviewed least-privilege exception (M15-03-bash-least-privilege)."
     }
   ]
 }

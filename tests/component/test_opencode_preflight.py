@@ -111,6 +111,87 @@ def test_run_preflight_calls_each_endpoint_exactly_once_in_order(
     ]
 
 
+# --- AC-007: version/capability proof and effective-agent identity -----------
+
+
+def test_ac_007_version_capability_and_effective_agents(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # (1) Positive: version and capability are proven, and all three roles'
+    # effective agents are folded into one recorded control-plane digest.
+    call_log = tmp_path / "calls.log"
+    monkeypatch.setenv("FAKE_OPENCODE_CALL_LOG_FILE", str(call_log))
+    _set_baseline_debug_fixtures(monkeypatch)
+
+    evidence = _preflight(tmp_path)
+
+    assert evidence.version == "1.17.18"
+    assert evidence.control_plane_digest
+    assert call_log.read_text(encoding="utf-8").splitlines() == [
+        "--version",
+        "run --help",
+        "debug config",
+        "debug agent architect",
+        "debug agent coder",
+        "debug agent reviewer",
+    ]
+
+    # (2) Fail closed when a role's effective agent is missing outright.
+    _set_baseline_debug_fixtures(monkeypatch)
+    monkeypatch.setenv(
+        "FAKE_OPENCODE_DEBUG_AGENT_ARCHITECT_FILE",
+        str(DEBUG_FIXTURES / "agent-missing.json"),
+    )
+    with pytest.raises(PreflightError) as missing_agent_error:
+        _preflight(tmp_path)
+    assert missing_agent_error.value.code == "opencode.debug_agent_identity_mismatch"
+
+    # (3) Fail closed on a silent fallback to another agent.
+    fallback_file = tmp_path / "agent-fallback.json"
+    fallback_file.write_text(
+        '{"name": "general", "mode": "primary", '
+        '"tools": {"question": false, "task": false}, '
+        '"permission": [{"permission": "*", "action": "allow", "pattern": "*"}, '
+        '{"permission": "edit", "action": "deny", "pattern": "*"}, '
+        '{"permission": "bash", "action": "deny", "pattern": "*"}, '
+        '{"permission": "webfetch", "action": "deny", "pattern": "*"}]}',
+        encoding="utf-8",
+    )
+    _set_baseline_debug_fixtures(monkeypatch)
+    monkeypatch.setenv("FAKE_OPENCODE_DEBUG_AGENT_ARCHITECT_FILE", str(fallback_file))
+    with pytest.raises(PreflightError) as fallback_agent_error:
+        _preflight(tmp_path)
+    assert fallback_agent_error.value.code == "opencode.debug_agent_identity_mismatch"
+
+    # (4) Positive at the M07-05 sanitized-export identity layer: the
+    # verified agent recorded for the executed role is proven, not assumed.
+    monkeypatch.setenv(
+        "FAKE_OPENCODE_EXPORT_FILE", str(EXPORT_FIXTURES / "coder-correct-agent.json")
+    )
+    export_evidence = _export_identity(
+        tmp_path, AgentRole.CODER, session_id="ses_coder_completed"
+    )
+    assert export_evidence.verified_agent == "coder"
+
+    # (5) Fail closed at the export layer too: a mismatched or missing
+    # agent field must not be silently accepted.
+    monkeypatch.setenv(
+        "FAKE_OPENCODE_EXPORT_FILE", str(EXPORT_FIXTURES / "agent-mismatch.json")
+    )
+    with pytest.raises(ProtocolError) as export_mismatch_error:
+        _export_identity(
+            tmp_path, AgentRole.ARCHITECT, session_id="ses_architect_ready"
+        )
+    assert export_mismatch_error.value.code == "opencode.export_agent_mismatch"
+
+    monkeypatch.setenv(
+        "FAKE_OPENCODE_EXPORT_FILE", str(EXPORT_FIXTURES / "agent-field-missing.json")
+    )
+    with pytest.raises(ProtocolError) as export_missing_error:
+        _export_identity(tmp_path, AgentRole.CODER, session_id="ses_coder_completed")
+    assert export_missing_error.value.code == "opencode.export_agent_missing"
+
+
 # --- unknown version ----------------------------------------------------------
 
 
@@ -174,8 +255,11 @@ def test_run_preflight_fails_closed_on_a_silent_fallback_to_another_agent(
     fallback_file = tmp_path / "agent-fallback.json"
     fallback_file.write_text(
         '{"name": "general", "mode": "primary", '
-        '"tools": {"ask": false, "task": false}, '
-        '"permission": {"edit": "deny", "bash": "deny", "webfetch": "deny"}}',
+        '"tools": {"question": false, "task": false}, '
+        '"permission": [{"permission": "*", "action": "allow", "pattern": "*"}, '
+        '{"permission": "edit", "action": "deny", "pattern": "*"}, '
+        '{"permission": "bash", "action": "deny", "pattern": "*"}, '
+        '{"permission": "webfetch", "action": "deny", "pattern": "*"}]}',
         encoding="utf-8",
     )
     _set_baseline_debug_fixtures(monkeypatch)

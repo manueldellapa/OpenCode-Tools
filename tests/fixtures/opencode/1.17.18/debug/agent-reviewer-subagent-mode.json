@@ -1,6 +1,15 @@
 {
   "name": "reviewer",
   "mode": "subagent",
-  "tools": { "ask": false, "task": false },
-  "permission": { "edit": "deny", "bash": "deny", "webfetch": "deny" }
+  "tools": { "question": false, "task": false },
+  "permission": [
+    { "permission": "*", "action": "allow", "pattern": "*" },
+    { "permission": "question", "action": "deny", "pattern": "*" },
+    { "permission": "read", "action": "allow", "pattern": "*" },
+    { "permission": "ask", "action": "deny", "pattern": "*" },
+    { "permission": "task", "action": "deny", "pattern": "*" },
+    { "permission": "edit", "action": "deny", "pattern": "*" },
+    { "permission": "bash", "action": "deny", "pattern": "*" },
+    { "permission": "webfetch", "action": "deny", "pattern": "*" }
+  ]
 }

@@ -1,1 +1,1 @@
-{"type": "message.part.updated", "sessionID": "ses_exit_nonzero", "part": {"id": "prt_1", "messageID": "msg_1", "type": "tool", "tool": "bash", "state": {"status": "completed", "output": "Traceback (most recent call last):\n  ...\nRuntimeError: unexpected internal error"}}}
+{"type": "tool_use", "sessionID": "ses_exit_nonzero", "part": {"id": "prt_1", "messageID": "msg_1", "type": "tool", "tool": "bash", "state": {"status": "completed", "output": "Traceback (most recent call last):\n  ...\nRuntimeError: unexpected internal error"}}}

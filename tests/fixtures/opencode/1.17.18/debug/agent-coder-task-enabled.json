@@ -1,6 +1,15 @@
 {
   "name": "coder",
   "mode": "primary",
-  "tools": { "ask": false, "task": true },
-  "permission": { "edit": "allow", "bash": "allow", "webfetch": "deny" }
+  "tools": { "question": false, "task": true },
+  "permission": [
+    { "permission": "*", "action": "allow", "pattern": "*" },
+    { "permission": "question", "action": "deny", "pattern": "*" },
+    { "permission": "read", "action": "allow", "pattern": "*" },
+    { "permission": "ask", "action": "deny", "pattern": "*" },
+    { "permission": "task", "action": "allow", "pattern": "*" },
+    { "permission": "edit", "action": "allow", "pattern": "*" },
+    { "permission": "bash", "action": "allow", "pattern": "*" },
+    { "permission": "webfetch", "action": "deny", "pattern": "*" }
+  ]
 }

@@ -1,1 +1,1 @@
-{"type": "message.part.updated", "sessionID": "ses_reviewer_failed", "part": {"id": "prt_1", "messageID": "msg_1", "type": "text", "text": "The coder's diff could not be located in the target worktree; review cannot proceed.\nAGENT_STATUS: FAILED", "time": {"start": 1, "end": 2}}}
+{"type": "text", "sessionID": "ses_reviewer_failed", "part": {"id": "prt_1", "messageID": "msg_1", "type": "text", "text": "The coder's diff could not be located in the target worktree; review cannot proceed.\nAGENT_STATUS: FAILED", "time": {"start": 1, "end": 2}}}
