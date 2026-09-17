@@ -96,17 +96,36 @@ def _load_agent_definition(token: str) -> tuple[dict[str, object], str]:
 
 
 def _synthetic_debug_agent_response(token: str) -> dict[str, object]:
-    """Build a dict shaped exactly like a real `opencode debug agent
-    <role>` response, derived only from what was parsed out of that role's
-    `.md` file -- never hand-typed.
+    """Build a dict shaped like a real `opencode debug agent <role>`
+    response, derived only from what was parsed out of that role's `.md`
+    file -- never hand-typed -- and transformed from OpenCode's
+    config-time shape into its response-time shape.
+
+    The two shapes are not the same, confirmed live during the M15-03
+    qualification: `.opencode/agents/*.md` declares `tools.ask` and a flat
+    `permission` dict (OpenCode's documented config-time names), but a
+    real `debug agent` response reports the resolved tool under
+    `tools.question` instead, and `permission` as an ordered
+    `{permission, action, pattern}` rule list resolved last-match-wins
+    (https://opencode.ai/docs/permissions/), never a flat dict.
     """
 
     front_matter, _ = _load_agent_definition(token)
+    tools = front_matter["tools"]
+    assert isinstance(tools, dict)
+    permission = front_matter["permission"]
+    assert isinstance(permission, dict)
     return {
         "name": token,
         "mode": front_matter["mode"],
-        "tools": front_matter["tools"],
-        "permission": front_matter["permission"],
+        "tools": {"question": tools["ask"], "task": tools["task"]},
+        "permission": [
+            {"permission": "*", "action": "allow", "pattern": "*"},
+            *(
+                {"permission": key, "action": value, "pattern": "*"}
+                for key, value in permission.items()
+            ),
+        ],
     }
 
 
@@ -417,7 +436,12 @@ def test_a_more_permissive_synthetic_permission_than_declared_is_rejected() -> N
     """
 
     synthetic = _synthetic_debug_agent_response("architect")
-    synthetic["permission"] = {"edit": "allow", "bash": "deny", "webfetch": "deny"}
+    synthetic["permission"] = [
+        {"permission": "*", "action": "allow", "pattern": "*"},
+        {"permission": "edit", "action": "allow", "pattern": "*"},
+        {"permission": "bash", "action": "deny", "pattern": "*"},
+        {"permission": "webfetch", "action": "deny", "pattern": "*"},
+    ]
 
     with pytest.raises(PreflightError) as exc_info:
         check_debug_agent(AgentRole.ARCHITECT, synthetic)

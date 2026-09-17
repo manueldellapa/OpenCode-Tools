@@ -53,7 +53,14 @@ _ROLE_TOKENS: dict[AgentRole, str] = {
     AgentRole.CODER: "coder",
     AgentRole.REVIEWER: "reviewer",
 }
-_REQUIRED_RUN_HELP_TOKENS: tuple[str, ...] = ("--agent", "--format json", "--dir")
+# "--format" and "json" are two independent tokens, not one contiguous
+# "--format json" substring: the real `1.17.18` binary's help text puts
+# them multiple words apart ("--format       format: default (formatted)
+# or json (raw JSON events)"), confirmed against a real, locally installed
+# `1.17.18` binary during the M15-03 live qualification. Requiring them
+# adjacent was an unverified assumption from the offline fixture pack that
+# a real run --help call never actually matched.
+_REQUIRED_RUN_HELP_TOKENS: tuple[str, ...] = ("--agent", "--format", "json", "--dir")
 
 # Flags this adapter must never pass to `opencode run` (System Design
 # SS10.3): auto/share/model overrides and every form of session
@@ -567,16 +574,38 @@ def _require_process_succeeded(
 
 
 def _decode_or_raise(
-    sink: _BoundedCapturingSink, *, error_cls: type[OpenCodeToolsError], code: str
+    sink: _BoundedCapturingSink,
+    *,
+    error_cls: type[OpenCodeToolsError],
+    code: str,
+    include_stderr: bool = False,
 ) -> str:
-    if sink.overflowed("stdout"):
+    """Decode a utility call's captured `stdout`, or `stdout` + `stderr`.
+
+    Every other utility call (`--version`, `debug config`, `debug agent`,
+    `export`) puts its payload on `stdout`, confirmed live against the real
+    `1.17.18` binary. `opencode run --help` is the one exception: it writes
+    its entire help text to `stderr` with `stdout` empty, also confirmed
+    live -- a real CLI behavior the offline fixture pack's hand-authored
+    text never modeled. `include_stderr=True` decodes and concatenates both
+    channels so a capability check reads whichever one the real binary
+    actually used, rather than assuming a single fixed channel.
+    """
+
+    channels: tuple[LogChannel, ...] = (
+        ("stdout", "stderr") if include_stderr else ("stdout",)
+    )
+    if any(sink.overflowed(channel) for channel in channels):
         raise error_cls(
             code, "OpenCode utility output exceeded the defensive size limit."
         )
-    text = _strict_utf8(sink.bytes_for("stdout"))
-    if text is None:
-        raise error_cls(code, "OpenCode utility output was not valid UTF-8.")
-    return text
+    parts: list[str] = []
+    for channel in channels:
+        text = _strict_utf8(sink.bytes_for(channel))
+        if text is None:
+            raise error_cls(code, "OpenCode utility output was not valid UTF-8.")
+        parts.append(text)
+    return "".join(parts)
 
 
 def _parse_json_object(
@@ -659,7 +688,7 @@ def check_debug_config(config: dict[str, object]) -> None:
 
 
 def check_debug_agent(role: AgentRole, agent: dict[str, object]) -> None:
-    """Reject a missing/fallback, non-primary, ask/task-enabled, or
+    """Reject a missing/fallback, non-primary, question/task-enabled, or
     over-permissive agent.
 
     The identity check comes first and on its own: OpenCode `1.17.18` can
@@ -668,6 +697,14 @@ def check_debug_agent(role: AgentRole, agent: dict[str, object]) -> None:
     does not itself claim to be `role` -- whether because the role is not
     defined at all or because the CLI substituted a different one -- must
     fail closed before any policy field is even inspected.
+
+    `.opencode/agents/*.md` frontmatter configures this capability under
+    the key `tools.ask` (OpenCode's documented config-time name), but the
+    real `1.17.18` binary's `debug agent` response reports the resolved,
+    effective tool under `tools.question` instead -- confirmed live
+    against a real, locally installed binary during the M15-03
+    qualification; `ask` never appears in a real response at all. This
+    checks the response-side name, not the config-time one.
     """
 
     if agent.get("name") != _ROLE_TOKENS[role]:
@@ -688,25 +725,186 @@ def check_debug_agent(role: AgentRole, agent: dict[str, object]) -> None:
             "opencode.debug_agent_invalid",
             f"opencode debug agent {_ROLE_TOKENS[role]} has no tools object.",
         )
-    if tools.get("ask") is not False or tools.get("task") is not False:
+    if tools.get("question") is not False or tools.get("task") is not False:
         raise PreflightError(
             "opencode.debug_agent_rejected",
-            f"opencode debug agent {_ROLE_TOKENS[role]} enables ask or task.",
+            f"opencode debug agent {_ROLE_TOKENS[role]} enables question or task.",
         )
     permission = agent.get("permission")
-    if not isinstance(permission, dict):
+    if not isinstance(permission, list):
         raise PreflightError(
             "opencode.debug_agent_invalid",
-            f"opencode debug agent {_ROLE_TOKENS[role]} has no permission object.",
+            f"opencode debug agent {_ROLE_TOKENS[role]} has no permission rule list.",
         )
     expected = _PERMISSION_BASELINE[role]
-    observed = {key: permission.get(key) for key in expected}
+    observed = {
+        key: _effective_permission_action(role, permission, key) for key in expected
+    }
     if observed != expected:
         raise PreflightError(
             "opencode.debug_agent_rejected",
             f"opencode debug agent {_ROLE_TOKENS[role]} permission matrix "
             "does not match the reviewed baseline.",
         )
+
+
+def _effective_permission_action(
+    role: AgentRole, rules: list[object], permission_name: str
+) -> str | None:
+    """Resolve `permission_name`'s effective action from `1.17.18`'s ordered
+    permission rule list (a real response shape -- {permission, action,
+    pattern} objects, confirmed live during the M15-03 qualification --
+    not the flat dict the offline fixture pack originally assumed).
+
+    Per OpenCode's own documented resolution order
+    (https://opencode.ai/docs/permissions/): "Rules are evaluated by
+    pattern match, with the last matching rule winning." A rule matches
+    `permission_name` when its own `permission` field equals it exactly,
+    or is the wildcard `"*"` (matching every permission kind -- the
+    canonical catch-all OpenCode's own docs recommend placing first).
+    Every other permission kind (`read`, `doom_loop`, `external_directory`,
+    and machine-local entries a user's own global OpenCode config may add)
+    is irrelevant here and is skipped without affecting the result.
+
+    Every rule entry must be a well-formed object with string `permission`
+    and `action` fields; a malformed one fails closed rather than being
+    silently skipped. No match at all (an empty or entirely irrelevant
+    list) resolves to `None`, which can never equal a real baseline
+    action string, so the caller's equality check already fails closed on
+    that case without needing a separate error here.
+    """
+
+    effective: str | None = None
+    for rule in rules:
+        if not isinstance(rule, dict):
+            raise PreflightError(
+                "opencode.debug_agent_invalid",
+                f"opencode debug agent {_ROLE_TOKENS[role]} has a permission "
+                "rule that is not an object.",
+            )
+        name = rule.get("permission")
+        action = rule.get("action")
+        if not isinstance(name, str) or not isinstance(action, str):
+            raise PreflightError(
+                "opencode.debug_agent_invalid",
+                f"opencode debug agent {_ROLE_TOKENS[role]} has a permission "
+                "rule with a non-string permission or action.",
+            )
+        if name == permission_name or name == "*":
+            effective = action
+    return effective
+
+
+def _permission_rule_sort_key(rule: dict[str, object]) -> tuple[str, str, str]:
+    return (
+        str(rule.get("permission", "")),
+        str(rule.get("pattern", "")),
+        str(rule.get("action", "")),
+    )
+
+
+def _external_directory_patterns_may_overlap(pattern_a: str, pattern_b: str) -> bool:
+    """Conservative overlap test for two `external_directory` rule patterns.
+
+    Only a pair of distinct, `"<literal-directory-prefix>*"`-shaped
+    patterns -- a single trailing wildcard, no wildcard elsewhere, neither
+    prefix nested inside the other -- is provably non-overlapping (moving
+    one relative to the other can never change which directory either one
+    matches). Anything else -- an identical pattern, a bare `"*"`, a
+    wildcard anywhere but the very end, or one prefix nested inside the
+    other -- is treated as potentially overlapping, so reordering it is
+    never assumed safe.
+    """
+
+    if pattern_a == pattern_b:
+        return True
+    for pattern in (pattern_a, pattern_b):
+        if pattern == "*" or not pattern.endswith("*") or "*" in pattern[:-1]:
+            return True
+    prefix_a, prefix_b = pattern_a[:-1], pattern_b[:-1]
+    return prefix_a.startswith(prefix_b) or prefix_b.startswith(prefix_a)
+
+
+def _canonicalize_permission_rules(rules: object) -> object:
+    """Stabilize digest-irrelevant reordering in a real `1.17.18`
+    `debug agent` permission rule list, without ever reordering anything
+    whose position could affect OpenCode's documented last-match-wins
+    resolution (https://opencode.ai/docs/permissions/) for any permission
+    kind.
+
+    Confirmed live during the M15-03 qualification: successive `debug
+    agent` calls return the same *set* of `external_directory` rules --
+    entries a user's own global OpenCode config adds, granting access to
+    specific, mutually unrelated local directories such as installed
+    skill folders -- in a *different order* each time, while every other
+    rule's position stays stable. That noisy run is not internally
+    uniform, though: it typically opens with a genuinely ambiguous
+    `external_directory` rule (e.g. `pattern: "*"`, overlapping with every
+    other one) before the mutually-distinct directory grants. Treating the
+    whole contiguous run as one atomic sort-or-don't unit -- as an earlier
+    version of this function did -- lets that one ambiguous rule poison
+    the entire run, leaving the genuinely noisy part unsorted and the
+    digest unstable. Instead, entries are grouped *incrementally*: a new
+    `external_directory` entry joins the current subgroup only if it is
+    provably non-overlapping (`_external_directory_patterns_may_overlap`)
+    with every entry already in it; otherwise the current subgroup is
+    closed (and sorted, if it has more than one entry) and a new one
+    starts with just this entry. Each closed subgroup is emitted in its
+    original position -- only entries *within* one provably-safe subgroup
+    are ever reordered relative to each other. Anything that is not a
+    well-formed `{permission, pattern, action}` `external_directory`
+    object closes the current subgroup and passes through unchanged in
+    its original position, so a reordering there, or a set that genuinely
+    changed, still registers as drift rather than being silently
+    normalized. This is never asked to interpret a rule list
+    `check_debug_agent` has not already validated -- a malformed list
+    simply fails to canonicalize and its raw form still hashes, correctly
+    registering as drift.
+    """
+
+    if not isinstance(rules, list):
+        return rules
+
+    def _run_entry(entry: object) -> dict[str, object] | None:
+        if (
+            isinstance(entry, dict)
+            and entry.get("permission") == "external_directory"
+            and isinstance(entry.get("pattern"), str)
+            and isinstance(entry.get("action"), str)
+        ):
+            return entry
+        return None
+
+    canonical: list[object] = []
+    subgroup: list[dict[str, object]] = []
+
+    def flush_subgroup() -> None:
+        if not subgroup:
+            return
+        ordered: list[dict[str, object]] = sorted(
+            subgroup, key=_permission_rule_sort_key
+        )
+        canonical.extend(ordered)
+        subgroup.clear()
+
+    for entry in rules:
+        run_entry = _run_entry(entry)
+        if run_entry is None:
+            flush_subgroup()
+            canonical.append(entry)
+            continue
+        pattern = cast(str, run_entry["pattern"])
+        conflicts = any(
+            _external_directory_patterns_may_overlap(
+                pattern, cast(str, existing["pattern"])
+            )
+            for existing in subgroup
+        )
+        if conflicts:
+            flush_subgroup()
+        subgroup.append(run_entry)
+    flush_subgroup()
+    return canonical
 
 
 def compute_control_plane_digest(
@@ -720,12 +918,26 @@ def compute_control_plane_digest(
     rather than raw bytes, means a harmless re-serialization difference
     between two `debug` calls -- key order, whitespace -- never registers as
     drift; only a genuine change to the effective policy does (ADR-005,
-    System Design SS18.2).
+    System Design SS18.2). `sort_keys` alone only orders JSON *object* keys,
+    never list elements: each role's `permission` rule list is separately
+    canonicalized first (`_canonicalize_permission_rules`) so the real
+    binary's own non-deterministic `external_directory` rule ordering,
+    confirmed live during the M15-03 qualification, cannot register as
+    drift either, without ever reordering anything last-match-wins
+    resolution could actually depend on.
     """
 
     canonical = {
         "config": config,
-        "agents": {role.value: agents[role] for role in _PRIMARY_ROLES},
+        "agents": {
+            role.value: {
+                **agents[role],
+                "permission": _canonicalize_permission_rules(
+                    agents[role].get("permission")
+                ),
+            }
+            for role in _PRIMARY_ROLES
+        },
     }
     encoded = json.dumps(canonical, sort_keys=True, separators=(",", ":")).encode(
         "utf-8"
@@ -862,7 +1074,10 @@ def run_preflight(
         message="opencode run --help did not complete successfully.",
     )
     help_text = _decode_or_raise(
-        help_sink, error_cls=PreflightError, code="opencode.capability_call_failed"
+        help_sink,
+        error_cls=PreflightError,
+        code="opencode.capability_call_failed",
+        include_stderr=True,
     )
     check_run_help_capability(help_text)
 

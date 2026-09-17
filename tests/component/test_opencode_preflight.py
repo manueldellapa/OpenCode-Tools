@@ -150,8 +150,11 @@ def test_ac_007_version_capability_and_effective_agents(
     fallback_file = tmp_path / "agent-fallback.json"
     fallback_file.write_text(
         '{"name": "general", "mode": "primary", '
-        '"tools": {"ask": false, "task": false}, '
-        '"permission": {"edit": "deny", "bash": "deny", "webfetch": "deny"}}',
+        '"tools": {"question": false, "task": false}, '
+        '"permission": [{"permission": "*", "action": "allow", "pattern": "*"}, '
+        '{"permission": "edit", "action": "deny", "pattern": "*"}, '
+        '{"permission": "bash", "action": "deny", "pattern": "*"}, '
+        '{"permission": "webfetch", "action": "deny", "pattern": "*"}]}',
         encoding="utf-8",
     )
     _set_baseline_debug_fixtures(monkeypatch)
@@ -252,8 +255,11 @@ def test_run_preflight_fails_closed_on_a_silent_fallback_to_another_agent(
     fallback_file = tmp_path / "agent-fallback.json"
     fallback_file.write_text(
         '{"name": "general", "mode": "primary", '
-        '"tools": {"ask": false, "task": false}, '
-        '"permission": {"edit": "deny", "bash": "deny", "webfetch": "deny"}}',
+        '"tools": {"question": false, "task": false}, '
+        '"permission": [{"permission": "*", "action": "allow", "pattern": "*"}, '
+        '{"permission": "edit", "action": "deny", "pattern": "*"}, '
+        '{"permission": "bash", "action": "deny", "pattern": "*"}, '
+        '{"permission": "webfetch", "action": "deny", "pattern": "*"}]}',
         encoding="utf-8",
     )
     _set_baseline_debug_fixtures(monkeypatch)

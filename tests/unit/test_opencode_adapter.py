@@ -373,8 +373,16 @@ def test_check_version_rejects_anything_but_an_exact_match(raw_output: str) -> N
 
 
 def test_check_run_help_capability_accepts_all_required_tokens() -> None:
+    # Modeled on the real `1.17.18` binary's actual `run --help` shape
+    # (confirmed live, M15-03): "--format" and "json" are several words
+    # apart, never adjacent as a literal "--format json" substring -- a
+    # contrived, adjacent-tokens fixture string would not have caught the
+    # real mismatch this test now guards against.
     check_run_help_capability(
-        "Usage: opencode run [--agent <name>] [--format json] [--dir <path>]"
+        "      --agent        agent to use                            [string]\n"
+        "      --format       format: default (formatted) or json (raw JSON events)\n"
+        '                     [string] [choices: "default", "json"]\n'
+        "      --dir          directory to run in                     [string]\n"
     )
 
 
@@ -383,6 +391,7 @@ def test_check_run_help_capability_accepts_all_required_tokens() -> None:
     [
         "Usage: opencode run [--format json] [--dir <path>]",
         "Usage: opencode run [--agent <name>] [--dir <path>]",
+        "Usage: opencode run [--agent <name>] [--format] [--dir <path>]",
         "Usage: opencode run [--agent <name>] [--format json]",
         "",
     ],
@@ -465,12 +474,109 @@ def test_check_debug_agent_rejects_a_fallback_to_a_different_named_agent() -> No
     fallback_agent: dict[str, object] = {
         "name": "general",
         "mode": "primary",
-        "tools": {"ask": False, "task": False},
-        "permission": {"edit": "deny", "bash": "deny", "webfetch": "deny"},
+        "tools": {"question": False, "task": False},
+        "permission": [
+            {"permission": "*", "action": "allow", "pattern": "*"},
+            {"permission": "edit", "action": "deny", "pattern": "*"},
+            {"permission": "bash", "action": "deny", "pattern": "*"},
+            {"permission": "webfetch", "action": "deny", "pattern": "*"},
+        ],
     }
     with pytest.raises(PreflightError) as exc_info:
         check_debug_agent(AgentRole.ARCHITECT, fallback_agent)
     assert exc_info.value.code == "opencode.debug_agent_identity_mismatch"
+
+
+def test_check_debug_agent_last_matching_rule_wins_over_an_earlier_broad_one() -> None:
+    # A real 1.17.18 response's permission list is ordered and resolved
+    # last-match-wins (https://opencode.ai/docs/permissions/), not a flat
+    # dict: an earlier, broader "allow" for edit must lose to a later,
+    # more specific "deny" -- the exact shape already exercised implicitly
+    # by debug/agent-architect-baseline.json, asserted explicitly here.
+    agent: dict[str, object] = {
+        "name": "architect",
+        "mode": "primary",
+        "tools": {"question": False, "task": False},
+        "permission": [
+            {"permission": "*", "action": "allow", "pattern": "*"},
+            {"permission": "edit", "action": "allow", "pattern": "*.md"},
+            {"permission": "edit", "action": "deny", "pattern": "*"},
+            {"permission": "bash", "action": "deny", "pattern": "*"},
+            {"permission": "webfetch", "action": "deny", "pattern": "*"},
+        ],
+    }
+    check_debug_agent(AgentRole.ARCHITECT, agent)
+
+
+def test_check_debug_agent_ignores_unrelated_and_machine_specific_rules() -> None:
+    # Rules for permission kinds outside the reviewed baseline (read,
+    # doom_loop, plan_enter/exit, and external_directory entries a user's
+    # own global OpenCode config can add, tied to paths that exist only on
+    # that machine) must never affect whether edit/bash/webfetch match the
+    # baseline, in any position in the list.
+    agent: dict[str, object] = {
+        "name": "coder",
+        "mode": "primary",
+        "tools": {"question": False, "task": False},
+        "permission": [
+            {"permission": "*", "action": "allow", "pattern": "*"},
+            {"permission": "doom_loop", "action": "ask", "pattern": "*"},
+            {
+                "permission": "external_directory",
+                "action": "allow",
+                "pattern": "/Users/someone/.local/share/opencode/tool-output/*",
+            },
+            {"permission": "plan_enter", "action": "deny", "pattern": "*"},
+            {"permission": "read", "action": "allow", "pattern": "*"},
+            {"permission": "edit", "action": "allow", "pattern": "*"},
+            {"permission": "bash", "action": "allow", "pattern": "*"},
+            {"permission": "plan_exit", "action": "deny", "pattern": "*"},
+            {"permission": "webfetch", "action": "deny", "pattern": "*"},
+            {
+                "permission": "external_directory",
+                "action": "allow",
+                "pattern": "/Users/someone/.claude/skills/some-skill/*",
+            },
+        ],
+    }
+    check_debug_agent(AgentRole.CODER, agent)
+
+
+def test_check_debug_agent_rejects_when_a_baseline_permission_has_no_rule_at_all() -> (
+    None
+):
+    # No rule anywhere names "webfetch" or the wildcard "*" -- the
+    # effective action cannot be determined, so it must fail closed
+    # (None can never equal a real baseline action) rather than being
+    # treated as an implicit allow or skipped.
+    agent: dict[str, object] = {
+        "name": "architect",
+        "mode": "primary",
+        "tools": {"question": False, "task": False},
+        "permission": [
+            {"permission": "edit", "action": "deny", "pattern": "*"},
+            {"permission": "bash", "action": "deny", "pattern": "*"},
+        ],
+    }
+    with pytest.raises(PreflightError) as exc_info:
+        check_debug_agent(AgentRole.ARCHITECT, agent)
+    assert exc_info.value.code == "opencode.debug_agent_rejected"
+
+
+def test_check_debug_agent_rejects_a_malformed_permission_rule_entry() -> None:
+    agent: dict[str, object] = {
+        "name": "architect",
+        "mode": "primary",
+        "tools": {"question": False, "task": False},
+        "permission": [
+            {"permission": "*", "action": "allow", "pattern": "*"},
+            "not-an-object",
+            {"permission": "edit", "action": "deny", "pattern": "*"},
+        ],
+    }
+    with pytest.raises(PreflightError) as exc_info:
+        check_debug_agent(AgentRole.ARCHITECT, agent)
+    assert exc_info.value.code == "opencode.debug_agent_invalid"
 
 
 # --- compute_control_plane_digest ---------------------------------------------
@@ -501,6 +607,123 @@ def test_compute_control_plane_digest_changes_when_content_changes() -> None:
     )
     digest_after = compute_control_plane_digest(config={"share": "auto"}, agents=agents)
     assert digest_before != digest_after
+
+
+def _architect_agent_with_permission(
+    permission: list[object],
+) -> dict[AgentRole, dict[str, object]]:
+    architect: dict[str, object] = {
+        "name": "architect",
+        "mode": "primary",
+        "tools": {"question": False, "task": False},
+        "permission": permission,
+    }
+    agents = _baseline_agents()
+    agents[AgentRole.ARCHITECT] = architect
+    return agents
+
+
+def test_compute_control_plane_digest_is_stable_across_external_directory_reorder() -> (
+    None
+):
+    # Confirmed live during M15-03: successive real `debug agent` calls
+    # return the same set of external_directory rules (a user's own
+    # global OpenCode config, e.g. installed skill folders) in a
+    # different order each time. Two non-overlapping, distinct-prefix
+    # patterns reordered must hash identically.
+    base: list[object] = [
+        {"permission": "*", "action": "allow", "pattern": "*"},
+        {"permission": "edit", "action": "deny", "pattern": "*"},
+    ]
+    order_a: list[object] = [
+        *base,
+        {"permission": "external_directory", "action": "allow", "pattern": "/a/*"},
+        {"permission": "external_directory", "action": "allow", "pattern": "/b/*"},
+        {"permission": "external_directory", "action": "allow", "pattern": "/c/*"},
+    ]
+    order_b: list[object] = [
+        *base,
+        {"permission": "external_directory", "action": "allow", "pattern": "/c/*"},
+        {"permission": "external_directory", "action": "allow", "pattern": "/a/*"},
+        {"permission": "external_directory", "action": "allow", "pattern": "/b/*"},
+    ]
+    digest_a = compute_control_plane_digest(
+        config={}, agents=_architect_agent_with_permission(order_a)
+    )
+    digest_b = compute_control_plane_digest(
+        config={}, agents=_architect_agent_with_permission(order_b)
+    )
+    assert digest_a == digest_b
+
+
+def test_compute_control_plane_digest_changes_when_a_permission_rule_changes() -> None:
+    permission_before: list[object] = [
+        {"permission": "*", "action": "allow", "pattern": "*"},
+        {"permission": "edit", "action": "deny", "pattern": "*"},
+    ]
+    permission_after: list[object] = [
+        {"permission": "*", "action": "allow", "pattern": "*"},
+        {"permission": "edit", "action": "allow", "pattern": "*"},
+    ]
+    digest_before = compute_control_plane_digest(
+        config={}, agents=_architect_agent_with_permission(permission_before)
+    )
+    digest_after = compute_control_plane_digest(
+        config={}, agents=_architect_agent_with_permission(permission_after)
+    )
+    assert digest_before != digest_after
+
+
+def test_compute_control_plane_digest_changes_on_overlapping_external_directory_reorder() -> (
+    None
+):
+    # Two external_directory rules for the SAME pattern with different
+    # actions are ambiguous to reorder (which one would apply to a real
+    # path is exactly a function of their relative order) -- proven
+    # overlapping by `_external_directory_patterns_may_overlap`, so this
+    # run is never canonicalized and a reordering still registers as
+    # drift, per the fail-closed requirement.
+    order_a: list[object] = [
+        {"permission": "*", "action": "allow", "pattern": "*"},
+        {"permission": "external_directory", "action": "ask", "pattern": "/a/*"},
+        {"permission": "external_directory", "action": "allow", "pattern": "/a/*"},
+    ]
+    order_b: list[object] = [
+        {"permission": "*", "action": "allow", "pattern": "*"},
+        {"permission": "external_directory", "action": "allow", "pattern": "/a/*"},
+        {"permission": "external_directory", "action": "ask", "pattern": "/a/*"},
+    ]
+    digest_a = compute_control_plane_digest(
+        config={}, agents=_architect_agent_with_permission(order_a)
+    )
+    digest_b = compute_control_plane_digest(
+        config={}, agents=_architect_agent_with_permission(order_b)
+    )
+    assert digest_a != digest_b
+
+
+def test_compute_control_plane_digest_stays_order_sensitive_for_non_external_directory_rules() -> (
+    None
+):
+    # Only external_directory runs are ever canonicalized -- reordering
+    # any other permission kind (here, two differently-scoped `read`
+    # rules) must still register as drift; their order is meaningfully
+    # part of the effective policy and is never touched.
+    order_a: list[object] = [
+        {"permission": "read", "action": "allow", "pattern": "*"},
+        {"permission": "read", "action": "ask", "pattern": "*.env"},
+    ]
+    order_b: list[object] = [
+        {"permission": "read", "action": "ask", "pattern": "*.env"},
+        {"permission": "read", "action": "allow", "pattern": "*"},
+    ]
+    digest_a = compute_control_plane_digest(
+        config={}, agents=_architect_agent_with_permission(order_a)
+    )
+    digest_b = compute_control_plane_digest(
+        config={}, agents=_architect_agent_with_permission(order_b)
+    )
+    assert digest_a != digest_b
 
 
 # --- ControlPlaneEvidence ------------------------------------------------------

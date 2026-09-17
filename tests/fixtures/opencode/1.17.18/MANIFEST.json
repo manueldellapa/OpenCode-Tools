@@ -10,6 +10,22 @@
       "https://raw.githubusercontent.com/anomalyco/opencode/v1.17.18/packages/opencode/src/cli/cmd/run.ts",
       "https://raw.githubusercontent.com/anomalyco/opencode/v1.17.18/packages/opencode/src/cli/cmd/export.ts",
       "https://raw.githubusercontent.com/anomalyco/opencode/v1.17.18/packages/opencode/src/cli/cmd/debug/agent.ts"
+    ],
+    "corrections": [
+      {
+        "date": "2026-09-17",
+        "authored_for": "OpenCode-Tools GitHub issue #59 (work package M15-03)",
+        "reason": "The M07-01 pack's seven debug/agent-*.json fixtures modeled `debug agent <role>` with a flat `permission: {edit, bash, webfetch}` dict and a `tools.ask` boolean -- an assumption never checked against a real binary. Live qualification against a real, locally installed 1.17.18 binary showed the actual response uses `tools.question` (not `tools.ask`, which never appears at all) and an ordered `permission: [{permission, action, pattern}, ...]` rule list resolved last-match-wins (https://opencode.ai/docs/permissions/), not a flat dict. All seven fixtures were corrected to the real shape and re-hashed; `src/opencode_tools/opencode.py`'s check_debug_agent and run --help's stdout/stderr capture were corrected to match.",
+        "affected_fixtures": [
+          "debug/agent-architect-baseline.json",
+          "debug/agent-architect-ask-enabled.json",
+          "debug/agent-architect-permissive-edit.json",
+          "debug/agent-coder-baseline.json",
+          "debug/agent-coder-task-enabled.json",
+          "debug/agent-reviewer-baseline.json",
+          "debug/agent-reviewer-subagent-mode.json"
+        ]
+      }
     ]
   },
   "fixtures": [
@@ -234,56 +250,56 @@
       "category": "debug-agent",
       "kind": "positive",
       "role": "architect",
-      "sha256": "b24fdf4571da2bd6c217d143a3fee96f2953f07cb41c025849de9bd4b0388c76",
-      "description": "opencode debug agent architect output: primary mode, no ask/task tools, read-only permission matrix."
+      "sha256": "d57199c480875f7efb18d9566a34cbc17a9e258e24b6c74d002000bc5673a115",
+      "description": "opencode debug agent architect output: primary mode, question/task tools both false, read-only permission matrix as an ordered rule list (M15-03-corrected: the real response uses tools.question and an ordered {permission,action,pattern} rule array, not tools.ask and a flat permission dict as originally hand-authored -- confirmed live)."
     },
     {
       "path": "debug/agent-coder-baseline.json",
       "category": "debug-agent",
       "kind": "positive",
       "role": "coder",
-      "sha256": "a4899a8544e65e61ef680a2e47527a0d9b305e2f6dab96c39ca378157ffb4c8d",
-      "description": "opencode debug agent coder output: primary mode, no ask/task tools, edit/bash permission allowed for the target."
+      "sha256": "27d13b8095ce3d9d226ad274887c4b72b6892e6a1f4b8b4524e37f2c471fb8a9",
+      "description": "opencode debug agent coder output: primary mode, question/task tools both false, edit/bash permission allowed for the target as an ordered rule list (M15-03-corrected, see agent-architect-baseline.json's note)."
     },
     {
       "path": "debug/agent-reviewer-baseline.json",
       "category": "debug-agent",
       "kind": "positive",
       "role": "reviewer",
-      "sha256": "c1dcc8ad975dd5c614aa5bd3b2ce38c72cbb6c35280ebd07e9076d78998e1b8f",
-      "description": "opencode debug agent reviewer output: primary mode, no ask/task tools, read-only permission matrix."
+      "sha256": "08dcfb100837993fc9a804cbd12c02d46eea2f5180ae3c3c4bbd634fd220af52",
+      "description": "opencode debug agent reviewer output: primary mode, question/task tools both false, read-only permission matrix as an ordered rule list (M15-03-corrected, see agent-architect-baseline.json's note)."
     },
     {
       "path": "debug/agent-architect-ask-enabled.json",
       "category": "debug-agent",
       "kind": "negative",
       "role": "architect",
-      "sha256": "0fa2bca4bed34f06fbd355ed2e41f1614197e15ebcba2454c6c371b96b8db802",
-      "description": "opencode debug agent architect output with the ask tool enabled; preflight must reject it."
+      "sha256": "c6464ee0678081b8718678d7ee978d774233125d40a16ad43c5b15371031abc6",
+      "description": "opencode debug agent architect output with the question tool enabled; preflight must reject it (M15-03-corrected: tools.question, not tools.ask -- see agent-architect-baseline.json's note)."
     },
     {
       "path": "debug/agent-coder-task-enabled.json",
       "category": "debug-agent",
       "kind": "negative",
       "role": "coder",
-      "sha256": "9b875102c518b9ef2cbcb14a8660e55f45dec106f4ba8aebe5bd39736e40a53d",
-      "description": "opencode debug agent coder output with the task tool enabled; preflight must reject any subagent delegation capability."
+      "sha256": "32e4b1065aa79615ebaee33cc43cdf12dadc91c51bfb8b361817dfd8ff59c467",
+      "description": "opencode debug agent coder output with the task tool enabled; preflight must reject any subagent delegation capability (M15-03-corrected rule-list shape, see agent-architect-baseline.json's note)."
     },
     {
       "path": "debug/agent-reviewer-subagent-mode.json",
       "category": "debug-agent",
       "kind": "negative",
       "role": "reviewer",
-      "sha256": "0ad554e9a44a1a633c1ebd95bcc44e3f42f29745610c2ab02f71460d50d680f0",
-      "description": "opencode debug agent reviewer output reporting mode subagent instead of primary; preflight must reject non-primary agents."
+      "sha256": "9ff7c286bc60813b74c7b1fe5de63f0e1f0a448a53153de98266b71ed6080eef",
+      "description": "opencode debug agent reviewer output reporting mode subagent instead of primary; preflight must reject non-primary agents (M15-03-corrected rule-list shape, see agent-architect-baseline.json's note)."
     },
     {
       "path": "debug/agent-architect-permissive-edit.json",
       "category": "debug-agent",
       "kind": "negative",
       "role": "architect",
-      "sha256": "d7da782bdff3b5b8772aead657b78ba11e306375c310d19177ff169779f5f1a2",
-      "description": "opencode debug agent architect output granting edit permission; preflight must reject any effective policy more permissive than the reviewed read-only baseline."
+      "sha256": "055a359dfad210bc4fda1afee428e0e40f8261435388f3eeb3c5797f1d4988eb",
+      "description": "opencode debug agent architect output granting edit permission; preflight must reject any effective policy more permissive than the reviewed read-only baseline (M15-03-corrected rule-list shape, see agent-architect-baseline.json's note)."
     },
     {
       "path": "debug/agent-missing.json",

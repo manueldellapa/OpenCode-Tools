@@ -1,6 +1,25 @@
 {
   "name": "coder",
   "mode": "primary",
-  "tools": { "ask": false, "task": false },
-  "permission": { "edit": "allow", "bash": "allow", "webfetch": "deny" }
+  "tools": { "question": false, "task": false },
+  "permission": [
+    { "permission": "*", "action": "allow", "pattern": "*" },
+    { "permission": "doom_loop", "action": "ask", "pattern": "*" },
+    { "permission": "external_directory", "action": "ask", "pattern": "*" },
+    {
+      "permission": "external_directory",
+      "action": "allow",
+      "pattern": "/tmp/opencode/*"
+    },
+    { "permission": "question", "action": "deny", "pattern": "*" },
+    { "permission": "plan_enter", "action": "deny", "pattern": "*" },
+    { "permission": "plan_exit", "action": "deny", "pattern": "*" },
+    { "permission": "read", "action": "allow", "pattern": "*" },
+    { "permission": "read", "action": "ask", "pattern": "*.env" },
+    { "permission": "ask", "action": "deny", "pattern": "*" },
+    { "permission": "task", "action": "deny", "pattern": "*" },
+    { "permission": "edit", "action": "allow", "pattern": "*" },
+    { "permission": "bash", "action": "allow", "pattern": "*" },
+    { "permission": "webfetch", "action": "deny", "pattern": "*" }
+  ]
 }
