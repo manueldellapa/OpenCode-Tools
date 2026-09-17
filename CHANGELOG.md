@@ -3,6 +3,23 @@
 All notable changes to this project are documented in this file. The format
 loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.1.1] - 2026-09-17
+
+### Fixed
+
+- Provider-overload misclassification (issue #80, PR #81): OpenCode
+  `1.17.18` can emit a top-level `error` event whose `error.data.message`
+  carries a serialized JSON provider payload; a `503`
+  `provider_overloaded` Nvidia/OpenRouter overload in that shape was
+  previously misclassified as `PROCESS_ERROR` with `provider_diagnostic =
+  null` instead of the retryable `PROVIDER_ERROR`. The classifier now
+  recognizes this exact, qualified transport shape via a narrow allowlist,
+  preserves fail-closed behavior for malformed or lookalike variants
+  outside the trusted structure, and leaves the coder's target-change
+  retry suppression unchanged. The persisted provider diagnostic is also
+  now surfaced in the final stderr summary when the last attempt has no
+  terminal agent response.
+
 ## [0.1.0] - 2026-09-17
 
 Initial implementation, delivered across milestones M01-M15 (15 merged
