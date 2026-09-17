@@ -19,14 +19,18 @@ all of them (NFR-006) without this module ever knowing the difference.
 FR-047-FR-050): after a run was initialized, exactly one `FINAL_STATUS:
 APPROVED|FAILED` line on stdout and nothing else there ever; a concise,
 display-safe summary (run ID, last phase, terminal outcome, artifact path,
-persisted errors, and the preserved-changes inventory grouped by staged/
-unstaged/untracked) on stderr; and the canonical exit code -- `IssueResult.
-expected_exit_code` when a run was initialized, `state_machine.
+the last attempt's provider diagnostic when it left no terminal agent
+response, persisted errors, and the preserved-changes inventory grouped by
+staged/unstaged/untracked) on stderr; and the canonical exit code --
+`IssueResult.expected_exit_code` when a run was initialized, `state_machine.
 resolve_exit_code` applied to the raw error's own outcome otherwise. A
 failure before a run directory could ever exist (including a pre-init
 SIGINT) promises no artifact and prints no `FINAL_STATUS` line, per FR-047.
 This module never recomputes precedence, outcome, or the final gate --
-those stay `state_machine.py`/`orchestrator.py`'s alone.
+those stay `state_machine.py`/`orchestrator.py`'s alone; the provider
+diagnostic line is a verbatim readout of `AttemptRecord.agent_result`'s own
+already-decided fields, never a re-derivation of which attempt or outcome
+was terminal.
 """
 
 from __future__ import annotations
@@ -63,6 +67,7 @@ from opencode_tools.domain import (
     ParsedAgentResponse,
     PersistenceStatus,
     PipelinePhase,
+    ProviderDiagnostic,
     RepositoryIdentity,
     ReviewStatus,
     RunOutcome,
@@ -824,6 +829,40 @@ def _render_git_state_summary(state: GitState) -> tuple[str, ...]:
     return tuple(lines)
 
 
+def _render_provider_diagnostic_summary(diagnostic: ProviderDiagnostic) -> str:
+    """Render a `ProviderDiagnostic` as one display-safe summary line.
+
+    A verbatim field readout -- `signature`/`source`/`code`/`status_code`
+    are already-decided facts on the persisted record, never recomputed or
+    reclassified here."""
+
+    status_part = (
+        f" status={diagnostic.status_code}"
+        if diagnostic.status_code is not None
+        else ""
+    )
+    return (
+        f"provider diagnostic: {diagnostic.signature} "
+        f"(source={diagnostic.source} code={diagnostic.code}{status_part})"
+    )
+
+
+def _last_attempt_unexplained_provider_diagnostic(
+    last_record: RunRecord | None,
+) -> ProviderDiagnostic | None:
+    """Return the last attempt's `ProviderDiagnostic` iff it left no
+    terminal agent response, straight off the persisted `AttemptRecord` --
+    never a re-derivation of `classify_attempt_outcome`'s own precedence,
+    only a read of the two fields that already answer this question."""
+
+    if last_record is None or not last_record.attempts:
+        return None
+    last_agent_result = last_record.attempts[-1].agent_result
+    if last_agent_result.terminal_response is not None:
+        return None
+    return last_agent_result.provider_diagnostic
+
+
 def _print_stderr_lines(lines: tuple[str, ...]) -> None:
     for line in lines:
         print(line, file=sys.stderr)
@@ -854,9 +893,11 @@ def _render_preinit_interrupted() -> int:
 
 def _render_issue_result(result: IssueResult, *, last_record: RunRecord | None) -> int:
     """The canonical terminal contract for an initialized run: exactly one
-    `FINAL_STATUS` line on stdout, a display-safe summary on stderr, and
-    `IssueResult.expected_exit_code` (already the full precedence/gate
-    decision -- never recomputed here)."""
+    `FINAL_STATUS` line on stdout, a display-safe summary on stderr --
+    including the last attempt's provider diagnostic when it left no
+    terminal agent response (issue #80) -- and `IssueResult.
+    expected_exit_code` (already the full precedence/gate decision --
+    never recomputed here)."""
 
     print(f"FINAL_STATUS: {result.final_status.value}")
 
@@ -882,6 +923,10 @@ def _render_issue_result(result: IssueResult, *, last_record: RunRecord | None) 
             f"changes preserved: {'yes' if result.changes_preserved else 'no'}"
         )
         lines.extend(_render_git_state_summary(git_state))
+
+    diagnostic = _last_attempt_unexplained_provider_diagnostic(last_record)
+    if diagnostic is not None:
+        lines.append(_render_provider_diagnostic_summary(diagnostic))
 
     if last_record is not None and last_record.errors:
         lines.extend(_render_error_records(last_record.errors))

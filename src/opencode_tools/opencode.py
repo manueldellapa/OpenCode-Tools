@@ -180,6 +180,22 @@ _TRUSTED_PROVIDER_CODES: dict[str, str] = {
     "rate_limit": "rate_limit",
 }
 
+# A second, independent trusted shape (System Design SS10.6, GitHub issue
+# #80): a top-level `error` event -- `session.error`'s sibling, untagged
+# message-lifecycle type -- whose `error.data.message` is itself a
+# *serialized* JSON string (not a nested object) carrying a numeric `code`
+# and `metadata.error_type`. Proven by a genuine OpenCode 1.17.18 capture of
+# an Nvidia/OpenRouter overload relayed this way after the coder had already
+# modified the target. Keyed by the exact `(code, error_type)` pair the
+# parsed payload must carry; a pair outside this map -- or the same digits
+# and string anywhere other than this exact double-encoded structure -- is
+# never trusted. Deliberately narrow: only the one condition this adapter
+# has genuine evidence for; a new one is added only alongside its own exact
+# fixture (never a guessed extrapolation).
+_TRUSTED_NESTED_ERROR_CONDITIONS: dict[tuple[int, str], str] = {
+    (503, "provider_overloaded"): "overload",
+}
+
 
 class _BoundedCapturingSink:
     """An in-memory `AttemptLogSink` that bounds and exposes captured bytes.
@@ -570,11 +586,96 @@ def open_run_capture_sink(log_name: str) -> _BoundedCapturingSink:
     return _BoundedCapturingSink(path=Path(log_name), max_bytes=RUN_OUTPUT_LIMIT_BYTES)
 
 
+def _classify_session_error_event(
+    event: dict[str, object],
+) -> ProviderDiagnostic | None:
+    """Classify a `session.error` event's allowlisted `error.data.code`."""
+
+    error = event.get("error")
+    if not isinstance(error, dict):
+        return None
+    data = error.get("data")
+    if not isinstance(data, dict):
+        return None
+    code = data.get("code")
+    if not isinstance(code, str):
+        return None
+    signature = _TRUSTED_PROVIDER_CODES.get(code)
+    if signature is None:
+        return None
+
+    status_code = data.get("status")
+    return ProviderDiagnostic(
+        source="session.error",
+        signature=signature,
+        retryable=True,
+        status_code=status_code if isinstance(status_code, int) else None,
+        code=code,
+    )
+
+
+def _classify_nested_error_event(
+    event: dict[str, object],
+) -> ProviderDiagnostic | None:
+    """Classify a top-level `error` event's nested, serialized payload.
+
+    `error.data.message` must itself parse as JSON (not merely contain a
+    lookalike substring) into an object carrying a numeric `code` and a
+    string `metadata.error_type`, and that exact pair must be allowlisted
+    in `_TRUSTED_NESTED_ERROR_CONDITIONS`. Any structural mismatch --
+    `message` missing or not a string, invalid nested JSON, a non-object
+    payload, a missing/mistyped `code` or `metadata.error_type`, or an
+    unlisted pair -- is skipped, never guessed (System Design SS10.6, issue
+    #80).
+    """
+
+    error = event.get("error")
+    if not isinstance(error, dict):
+        return None
+    data = error.get("data")
+    if not isinstance(data, dict):
+        return None
+    raw_message = data.get("message")
+    if not isinstance(raw_message, str):
+        return None
+    try:
+        nested = json.loads(raw_message)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(nested, dict):
+        return None
+
+    code = nested.get("code")
+    if not isinstance(code, int) or isinstance(code, bool):
+        return None
+    metadata = nested.get("metadata")
+    if not isinstance(metadata, dict):
+        return None
+    error_type = metadata.get("error_type")
+    if not isinstance(error_type, str):
+        return None
+
+    signature = _TRUSTED_NESTED_ERROR_CONDITIONS.get((code, error_type))
+    if signature is None:
+        return None
+
+    return ProviderDiagnostic(
+        source="error",
+        signature=signature,
+        retryable=True,
+        status_code=code,
+        code=error_type,
+    )
+
+
 def classify_provider_signal(stdout_text: str) -> ProviderDiagnostic | None:
     """Return the first trusted transient-provider signal in `stdout_text`.
 
-    Reads only `session.error` events and only their allowlisted
-    `error.data.code` field (System Design SS10.6, FR-028); every other
+    Reads only two trusted, structurally exact shapes and nothing else
+    (System Design SS10.6, FR-028, issue #80): a `session.error` event's
+    allowlisted `error.data.code` field, and a top-level `error` event
+    whose `error.data.message` is itself a serialized JSON payload carrying
+    an allowlisted numeric `code` / `metadata.error_type` pair. Every other
     event type and every other channel -- issue text, assistant/tool/
     reasoning content, stderr -- is structurally invisible to this
     function, so the same string appearing there can never be classified
@@ -595,29 +696,18 @@ def classify_provider_signal(stdout_text: str) -> ProviderDiagnostic | None:
             event = json.loads(line)
         except json.JSONDecodeError:
             continue
-        if not isinstance(event, dict) or event.get("type") != "session.error":
-            continue
-        error = event.get("error")
-        if not isinstance(error, dict):
-            continue
-        data = error.get("data")
-        if not isinstance(data, dict):
-            continue
-        code = data.get("code")
-        if not isinstance(code, str):
-            continue
-        signature = _TRUSTED_PROVIDER_CODES.get(code)
-        if signature is None:
+        if not isinstance(event, dict):
             continue
 
-        status_code = data.get("status")
-        return ProviderDiagnostic(
-            source="session.error",
-            signature=signature,
-            retryable=True,
-            status_code=status_code if isinstance(status_code, int) else None,
-            code=code,
-        )
+        diagnostic: ProviderDiagnostic | None = None
+        event_type = event.get("type")
+        if event_type == "session.error":
+            diagnostic = _classify_session_error_event(event)
+        elif event_type == "error":
+            diagnostic = _classify_nested_error_event(event)
+
+        if diagnostic is not None:
+            return diagnostic
 
     return None
 

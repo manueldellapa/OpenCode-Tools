@@ -69,6 +69,15 @@
         "authored_for": "OpenCode-Tools GitHub issue #59 (work package M15-03)",
         "reason": "AC-027 live re-qualification PASSED twice, independently, against a disposable private GitHub repository and a controlled issue on this project's own macOS (darwin) development machine, using the real, project-local architect/coder/reviewer agent definitions and their own configured openrouter provider/model with zero fallback. Both runs: exact version 1.17.18, verified_agent matching the requested role for every attempt via sanitized export, three distinct session_id values, git_safety_status SAFE, no remote/local HEAD or commit-count change, final_status APPROVED. compatibility_status moves from 'candidate' to 'supported' per ADR-005's three-step gate; the corresponding prose lives in docs/compatibility.md.",
         "affected_fixtures": []
+      },
+      {
+        "date": "2026-09-17",
+        "authored_for": "OpenCode-Tools GitHub issue #80",
+        "reason": "The first production-like run against House-Hold-Hub/Backend issue #1 (run 20260917T124944.374451Z-bfee6257f6f8) captured a genuine OpenCode 1.17.18 top-level `error` event -- session.error's untagged sibling type -- carrying a transient Nvidia/OpenRouter provider overload as a serialized JSON string in error.data.message (code 503, metadata.error_type 'provider_overloaded'), emitted after the coder had already modified the target. classify_provider_signal previously read only session.error's error.data.code, so this genuine signal fell through to PROCESS_ERROR with provider_diagnostic=null. Two new fixtures were added, sanitized from and structurally faithful to that capture: a trusted positive (the nested error event itself) and a lookalike negative (the same code/error_type strings on an ordinary tool-output/assistant-text channel, outside the trusted error.data.message structure). No existing fixture's bytes changed.",
+        "affected_fixtures": [
+          "provider/nested-error-provider-overloaded.ndjson",
+          "provider/lookalike-nested-error-in-tool-output.ndjson"
+        ]
       }
     ]
   },
@@ -186,6 +195,14 @@
       "description": "Trusted session.error event carrying a textual rate_limit code distinct from the numeric 429 signature."
     },
     {
+      "path": "provider/nested-error-provider-overloaded.ndjson",
+      "category": "provider-trusted",
+      "kind": "positive",
+      "role": null,
+      "sha256": "5c04c902ed04dca0c3e7e0d3e7d785060dbcd006b677bc56a109dde17b4017d8",
+      "description": "Sanitized, structurally faithful reproduction of a genuine OpenCode 1.17.18 top-level `error` event (issue #80, run 20260917T124944.374451Z-bfee6257f6f8): a session.error-sibling event type carrying a serialized JSON string in error.data.message (code 503, metadata.error_type 'provider_overloaded' -- an Nvidia/OpenRouter overload), emitted after a tool call had already modified the target."
+    },
+    {
       "path": "provider/lookalike-in-assistant-text.ndjson",
       "category": "provider-lookalike",
       "kind": "negative",
@@ -200,6 +217,14 @@
       "role": "coder",
       "sha256": "53ba7fef2d66ff44fcd6b0570cacc7e16a7d4362d7273d6d5d99ca1bfd2986a8",
       "description": "Trust-boundary case: a tool call's captured output mentions 502 Bad Gateway with no session.error event; must not be classified as a trusted provider signal. (M15-03-transport-corrected: real step_start/text/step_finish/tool_use/reasoning/error top-level event shape, not the unproven message.part.updated envelope.)"
+    },
+    {
+      "path": "provider/lookalike-nested-error-in-tool-output.ndjson",
+      "category": "provider-lookalike",
+      "kind": "negative",
+      "role": "coder",
+      "sha256": "6d27cc6083ae9e26839a84df7ae7773b1d77b5df1584fe22e89acb5baef8a68e",
+      "description": "Trust-boundary case (issue #80): the same code 503 / provider_overloaded strings from the trusted nested-error payload appear as plain tool output and assistant prose, never inside a top-level `error` event's own error.data.message field; must not be classified as a trusted provider signal."
     },
     {
       "path": "malformed/invalid-json-line.ndjson",
