@@ -1,2 +1,2 @@
-{"type": "message.part.updated", "sessionID": "ses_malformed_unknown_event", "part": {"id": "prt_1", "messageID": "msg_1", "type": "text", "text": "Work in progress.", "time": {"start": 1}}}
+{"type": "text", "sessionID": "ses_malformed_unknown_event", "part": {"id": "prt_1", "messageID": "msg_1", "type": "text", "text": "Work in progress.", "time": {"start": 1}}}
 {"type": "session.debug", "sessionID": "ses_malformed_unknown_event", "payload": {"note": "internal diagnostic event not covered by the 1.17.18 schema allowlist"}}

@@ -1,2 +1,2 @@
-{"type": "message.part.updated", "sessionID": "ses_multi_terminal", "part": {"id": "prt_1", "messageID": "msg_1", "type": "text", "text": "First attempt at a summary.\nAGENT_STATUS: COMPLETED", "time": {"start": 1, "end": 2}}}
-{"type": "message.part.updated", "sessionID": "ses_multi_terminal", "part": {"id": "prt_2", "messageID": "msg_2", "type": "text", "text": "A second, unrelated closing message.\nAGENT_STATUS: COMPLETED", "time": {"start": 3, "end": 4}}}
+{"type": "text", "sessionID": "ses_multi_terminal", "part": {"id": "prt_1", "messageID": "msg_1", "type": "text", "text": "First attempt at a summary.\nAGENT_STATUS: COMPLETED", "time": {"start": 1, "end": 2}}}
+{"type": "text", "sessionID": "ses_multi_terminal", "part": {"id": "prt_2", "messageID": "msg_2", "type": "text", "text": "A second, unrelated closing message.\nAGENT_STATUS: COMPLETED", "time": {"start": 3, "end": 4}}}

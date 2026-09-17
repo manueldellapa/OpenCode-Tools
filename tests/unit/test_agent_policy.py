@@ -52,6 +52,7 @@ from opencode_tools.domain import AgentRole
 from opencode_tools.errors import ConfigError, PreflightError
 from opencode_tools.git_safety import ALLOWED_GIT_ARGV_TAILS
 from opencode_tools.opencode import (
+    _ARCHITECT_BASH_PERMISSION_CONFIG,  # ground truth, never hand-copied
     _PERMISSION_BASELINE,  # ground truth for permission, never hand-copied
     FORBIDDEN_RUN_FLAGS,
     check_debug_agent,
@@ -102,12 +103,15 @@ def _synthetic_debug_agent_response(token: str) -> dict[str, object]:
     config-time shape into its response-time shape.
 
     The two shapes are not the same, confirmed live during the M15-03
-    qualification: `.opencode/agents/*.md` declares `tools.ask` and a flat
-    `permission` dict (OpenCode's documented config-time names), but a
-    real `debug agent` response reports the resolved tool under
-    `tools.question` instead, and `permission` as an ordered
-    `{permission, action, pattern}` rule list resolved last-match-wins
-    (https://opencode.ai/docs/permissions/), never a flat dict.
+    qualification: `.opencode/agents/*.md` declares `tools.ask` and a
+    `permission` dict (OpenCode's documented config-time names) whose
+    values are flat strings for every kind except the architect's `bash`,
+    a nested pattern-keyed object (least-privilege: deny by default, allow
+    only `gh issue view *`) -- but a real `debug agent` response reports
+    the resolved tool under `tools.question` instead, and always expands
+    `permission` into an ordered `{permission, action, pattern}` rule list
+    resolved last-match-wins (https://opencode.ai/docs/permissions/), one
+    entry per pattern, never a dict of any shape.
     """
 
     front_matter, _ = _load_agent_definition(token)
@@ -115,17 +119,24 @@ def _synthetic_debug_agent_response(token: str) -> dict[str, object]:
     assert isinstance(tools, dict)
     permission = front_matter["permission"]
     assert isinstance(permission, dict)
+
+    rules: list[dict[str, object]] = [
+        {"permission": "*", "action": "allow", "pattern": "*"}
+    ]
+    for key, value in permission.items():
+        if isinstance(value, dict):
+            rules.extend(
+                {"permission": key, "action": action, "pattern": pattern}
+                for pattern, action in value.items()
+            )
+        else:
+            rules.append({"permission": key, "action": value, "pattern": "*"})
+
     return {
         "name": token,
         "mode": front_matter["mode"],
         "tools": {"question": tools["ask"], "task": tools["task"]},
-        "permission": [
-            {"permission": "*", "action": "allow", "pattern": "*"},
-            *(
-                {"permission": key, "action": value, "pattern": "*"}
-                for key, value in permission.items()
-            ),
-        ],
+        "permission": rules,
     }
 
 
@@ -174,13 +185,19 @@ def test_agent_definition_declares_a_non_empty_model(token: str) -> None:
 def test_agent_definition_permission_matches_the_reviewed_baseline(
     token: str,
 ) -> None:
-    """Permission must match `opencode.py`'s own `_PERMISSION_BASELINE`
-    exactly, imported directly here so the two cannot silently drift apart.
+    """Permission must match `opencode.py`'s own ground truth exactly,
+    imported directly here so the two cannot silently drift apart. The
+    architect's `bash` is not in `_PERMISSION_BASELINE` at all -- it is a
+    nested least-privilege object from `_ARCHITECT_BASH_PERMISSION_CONFIG`,
+    layered in separately (see that constant's docstring).
     """
 
     role = _ROLE_BY_TOKEN[token]
     front_matter, _ = _load_agent_definition(token)
-    assert front_matter["permission"] == _PERMISSION_BASELINE[role]
+    expected: dict[str, object] = dict(_PERMISSION_BASELINE[role])
+    if role is AgentRole.ARCHITECT:
+        expected["bash"] = _ARCHITECT_BASH_PERMISSION_CONFIG
+    assert front_matter["permission"] == expected
 
 
 # =============================================================================
@@ -346,8 +363,15 @@ def test_ac_024_forbidden_action_policy_and_command_inventory() -> None:
     """
 
     # (1) AC-level allowlist/deny claim via the real permission baseline.
+    # The architect's bash is least-privilege rather than a flat "deny" --
+    # denied by default, with exactly one narrow read-only exception (the
+    # `gh issue view` command its own prompt instructs it to run) -- so its
+    # "deny by default" half is asserted directly against that config
+    # object rather than against `_PERMISSION_BASELINE`, which does not
+    # carry a "bash" key for the architect at all.
     assert _PERMISSION_BASELINE[AgentRole.ARCHITECT]["edit"] == "deny"
-    assert _PERMISSION_BASELINE[AgentRole.ARCHITECT]["bash"] == "deny"
+    assert _ARCHITECT_BASH_PERMISSION_CONFIG["*"] == "deny"
+    assert "bash" not in _PERMISSION_BASELINE[AgentRole.ARCHITECT]
     assert _PERMISSION_BASELINE[AgentRole.REVIEWER]["edit"] == "deny"
     assert _PERMISSION_BASELINE[AgentRole.REVIEWER]["bash"] == "deny"
     for role_permission in _PERMISSION_BASELINE.values():
@@ -442,6 +466,26 @@ def test_a_more_permissive_synthetic_permission_than_declared_is_rejected() -> N
         {"permission": "bash", "action": "deny", "pattern": "*"},
         {"permission": "webfetch", "action": "deny", "pattern": "*"},
     ]
+
+    with pytest.raises(PreflightError) as exc_info:
+        check_debug_agent(AgentRole.ARCHITECT, synthetic)
+    assert exc_info.value.code == "opencode.debug_agent_rejected"
+
+
+def test_a_broader_synthetic_bash_pattern_than_declared_is_rejected() -> None:
+    """The architect's bash policy is least-privilege, not a flat
+    allow/deny (`_ARCHITECT_BASH_PERMISSION_CONFIG`): proves the round-trip
+    catches drift on *that* dimension too, not only a flat kind going from
+    deny to allow -- an extra permissive bash pattern beyond the one
+    reviewed `gh issue view *` exception must still fail the real
+    validator.
+    """
+
+    synthetic = _synthetic_debug_agent_response("architect")
+    permission = cast(list[dict[str, object]], synthetic["permission"])
+    permission.append(
+        {"permission": "bash", "action": "allow", "pattern": "gh issue edit *"}
+    )
 
     with pytest.raises(PreflightError) as exc_info:
         check_debug_agent(AgentRole.ARCHITECT, synthetic)

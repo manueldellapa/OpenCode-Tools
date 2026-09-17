@@ -2,7 +2,7 @@
 {
   "description": "Read-only review agent that approves or requests changes using only what the prompt gives it.",
   "mode": "primary",
-  "model": "anthropic/claude-sonnet-4-5",
+  "model": "openrouter/cohere/north-mini-code:free",
   "tools": { "ask": false, "task": false },
   "permission": { "edit": "deny", "bash": "deny", "webfetch": "deny" }
 }

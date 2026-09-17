@@ -457,6 +457,11 @@ def test_check_debug_agent_accepts_each_role_baseline(
         ),
         (
             AgentRole.ARCHITECT,
+            "debug/agent-architect-permissive-bash.json",
+            "opencode.debug_agent_rejected",
+        ),
+        (
+            AgentRole.ARCHITECT,
             "debug/agent-missing.json",
             "opencode.debug_agent_identity_mismatch",
         ),
@@ -502,6 +507,7 @@ def test_check_debug_agent_last_matching_rule_wins_over_an_earlier_broad_one() -
             {"permission": "edit", "action": "allow", "pattern": "*.md"},
             {"permission": "edit", "action": "deny", "pattern": "*"},
             {"permission": "bash", "action": "deny", "pattern": "*"},
+            {"permission": "bash", "action": "allow", "pattern": "gh issue view *"},
             {"permission": "webfetch", "action": "deny", "pattern": "*"},
         ],
     }
@@ -577,6 +583,88 @@ def test_check_debug_agent_rejects_a_malformed_permission_rule_entry() -> None:
     with pytest.raises(PreflightError) as exc_info:
         check_debug_agent(AgentRole.ARCHITECT, agent)
     assert exc_info.value.code == "opencode.debug_agent_invalid"
+
+
+# --- check_debug_agent: the architect's least-privilege bash policy ----------
+#
+# Discovered live during the M15-03 re-qualification (2026-09-17):
+# `build_architect_prompt` instructs the architect to run `gh issue view`
+# itself to discover the issue title/body -- Python never embeds them -- so
+# a flat `bash: deny` made the architect structurally unable to ever
+# succeed. The fix is least privilege, not a broader flat allow: deny by
+# default, with exactly one narrow, reviewed exception.
+
+
+def _architect_agent_with_bash_rules(
+    *extra_bash_rules: dict[str, object],
+) -> dict[str, object]:
+    return {
+        "name": "architect",
+        "mode": "primary",
+        "tools": {"question": False, "task": False},
+        "permission": [
+            {"permission": "*", "action": "allow", "pattern": "*"},
+            {"permission": "edit", "action": "deny", "pattern": "*"},
+            *extra_bash_rules,
+            {"permission": "webfetch", "action": "deny", "pattern": "*"},
+        ],
+    }
+
+
+def test_check_debug_agent_accepts_the_exact_reviewed_architect_bash_policy() -> None:
+    agent = _architect_agent_with_bash_rules(
+        {"permission": "bash", "action": "deny", "pattern": "*"},
+        {"permission": "bash", "action": "allow", "pattern": "gh issue view *"},
+    )
+    check_debug_agent(AgentRole.ARCHITECT, agent)  # must not raise
+
+
+def test_check_debug_agent_rejects_an_architect_missing_the_gh_issue_view_allow() -> (
+    None
+):
+    agent = _architect_agent_with_bash_rules(
+        {"permission": "bash", "action": "deny", "pattern": "*"},
+    )
+    with pytest.raises(PreflightError) as exc_info:
+        check_debug_agent(AgentRole.ARCHITECT, agent)
+    assert exc_info.value.code == "opencode.debug_agent_rejected"
+
+
+def test_check_debug_agent_rejects_an_architect_with_a_broader_bash_allow() -> None:
+    agent = _architect_agent_with_bash_rules(
+        {"permission": "bash", "action": "deny", "pattern": "*"},
+        {"permission": "bash", "action": "allow", "pattern": "gh issue view *"},
+        {"permission": "bash", "action": "allow", "pattern": "*"},
+    )
+    with pytest.raises(PreflightError) as exc_info:
+        check_debug_agent(AgentRole.ARCHITECT, agent)
+    assert exc_info.value.code == "opencode.debug_agent_rejected"
+
+
+def test_check_debug_agent_rejects_an_architect_with_a_different_allowed_gh_pattern() -> (
+    None
+):
+    agent = _architect_agent_with_bash_rules(
+        {"permission": "bash", "action": "deny", "pattern": "*"},
+        {"permission": "bash", "action": "allow", "pattern": "gh issue edit *"},
+    )
+    with pytest.raises(PreflightError) as exc_info:
+        check_debug_agent(AgentRole.ARCHITECT, agent)
+    assert exc_info.value.code == "opencode.debug_agent_rejected"
+
+
+def test_check_debug_agent_rejects_an_architect_whose_deny_all_shadows_the_allow() -> (
+    None
+):
+    # Order matters under last-match-wins: a deny-all placed *after* the
+    # narrow allow would shadow it for the one command that must succeed.
+    agent = _architect_agent_with_bash_rules(
+        {"permission": "bash", "action": "allow", "pattern": "gh issue view *"},
+        {"permission": "bash", "action": "deny", "pattern": "*"},
+    )
+    with pytest.raises(PreflightError) as exc_info:
+        check_debug_agent(AgentRole.ARCHITECT, agent)
+    assert exc_info.value.code == "opencode.debug_agent_rejected"
 
 
 # --- compute_control_plane_digest ---------------------------------------------
@@ -923,7 +1011,14 @@ def _text(path: Path) -> str:
             "ses_architect_ready",
             "AGENT_STATUS: READY",
         ),
-        ("architect-failed.ndjson", "ses_architect_failed", "AGENT_STATUS: FAILED"),
+        (
+            # Genuine NDJSON captured from a real `opencode run --format
+            # json` 1.17.18 invocation during M15-03 live qualification --
+            # not hand-authored, unlike the other rows in this table.
+            "architect-failed.ndjson",
+            "ses_f515f27d1ffeeSNk4UDje4MDiK",
+            "AGENT_STATUS: FAILED",
+        ),
         (
             "coder-completed-success.ndjson",
             "ses_coder_completed",
@@ -987,6 +1082,90 @@ def test_decode_run_transport_fails_closed_when_no_events_are_present() -> None:
     with pytest.raises(ProtocolError) as exc_info:
         decode_run_transport("")
     assert exc_info.value.code == "opencode.transport_no_terminal_text"
+
+
+# --- M15-03 live-qualification correction: the real 1.17.18 event shape ------
+#
+# A live `opencode run --format json` capture (M15-03 AC-027 re-qualification,
+# 2026-09-17) proved this adapter's original assumption wrong: real NDJSON
+# carries the message-lifecycle kind directly as the top-level `type`
+# (`step_start`, `text`, `step_finish`, ...), never wrapped in a
+# `message.part.updated` envelope. These tests fix that corrected contract so
+# it cannot silently regress.
+
+
+def test_decode_run_transport_rejects_the_old_unproven_message_part_updated_envelope() -> (
+    None
+):
+    text = json.dumps(
+        {
+            "type": "message.part.updated",
+            "sessionID": "ses_old_shape",
+            "part": {
+                "id": "prt_1",
+                "messageID": "msg_1",
+                "type": "text",
+                "text": "AGENT_STATUS: COMPLETED",
+                "time": {"start": 1, "end": 2},
+            },
+        }
+    )
+    with pytest.raises(ProtocolError) as exc_info:
+        decode_run_transport(text)
+    assert exc_info.value.code == "opencode.transport_unknown_event_type"
+
+
+@pytest.mark.parametrize(
+    "event_type", ["step_start", "step_finish", "tool_use", "error"]
+)
+def test_decode_run_transport_recognizes_but_excludes_message_lifecycle_events(
+    event_type: str,
+) -> None:
+    lines = [
+        json.dumps(
+            {"type": event_type, "sessionID": "ses_lifecycle", "part": {"id": "p"}}
+        ),
+        json.dumps(
+            {
+                "type": "text",
+                "sessionID": "ses_lifecycle",
+                "part": {
+                    "id": "prt_2",
+                    "messageID": "msg_1",
+                    "type": "text",
+                    "text": "AGENT_STATUS: COMPLETED",
+                    "time": {"start": 1, "end": 2},
+                },
+            }
+        ),
+    ]
+    result = decode_run_transport("\n".join(lines))
+    assert result.session_id == "ses_lifecycle"
+    assert result.terminal_text == "AGENT_STATUS: COMPLETED"
+
+
+def test_decode_run_transport_rejects_a_message_lifecycle_event_with_no_part_object() -> (
+    None
+):
+    text = json.dumps({"type": "step_start", "sessionID": "ses_no_part"})
+    with pytest.raises(ProtocolError) as exc_info:
+        decode_run_transport(text)
+    assert exc_info.value.code == "opencode.transport_invalid_event"
+
+
+def test_decode_run_transport_rejects_a_text_event_whose_part_type_is_not_text() -> (
+    None
+):
+    text = json.dumps(
+        {
+            "type": "text",
+            "sessionID": "ses_wrong_part_type",
+            "part": {"id": "prt_1", "messageID": "msg_1", "type": "reasoning"},
+        }
+    )
+    with pytest.raises(ProtocolError) as exc_info:
+        decode_run_transport(text)
+    assert exc_info.value.code == "opencode.transport_invalid_event"
 
 
 # --- AC-035: transport and status spoofing fail closed -----------------------

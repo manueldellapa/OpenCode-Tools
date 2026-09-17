@@ -10,6 +10,7 @@
     { "permission": "task", "action": "deny", "pattern": "*" },
     { "permission": "edit", "action": "deny", "pattern": "*" },
     { "permission": "bash", "action": "deny", "pattern": "*" },
+    { "permission": "bash", "action": "allow", "pattern": "gh issue view *" },
     { "permission": "webfetch", "action": "deny", "pattern": "*" }
   ]
 }
