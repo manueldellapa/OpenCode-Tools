@@ -1893,6 +1893,200 @@ def test_decode_run_transport_and_parse_agent_response_actually_reach_the_review
     assert outcome.action is PipelineAction.INVOKE_REVIEWER
 
 
+# --- issue #87: incomplete tool-call lifecycle and blank terminal text -------
+
+
+def test_decode_run_transport_rejects_incomplete_tool_call_lifecycle_fixture() -> (
+    None
+):
+    with pytest.raises(ProtocolError) as exc_info:
+        decode_run_transport(
+            _text(RUN_FIXTURES / "coder-incomplete-tool-call-lifecycle.ndjson")
+        )
+    assert (
+        exc_info.value.code
+        == "opencode.transport_incomplete_tool_call_lifecycle"
+    )
+    assert exc_info.value.code != "protocol.marker_missing"
+
+
+def test_decode_run_transport_rejects_whitespace_only_completed_text() -> None:
+    text = json.dumps(
+        {
+            "type": "text",
+            "sessionID": "ses_blank_terminal_text",
+            "part": {
+                "id": "prt_1",
+                "messageID": "msg_1",
+                "type": "text",
+                "text": " \t ",
+                "time": {"start": 1, "end": 2},
+            },
+        }
+    )
+    with pytest.raises(ProtocolError) as exc_info:
+        decode_run_transport(text)
+    assert exc_info.value.code == "opencode.transport_no_terminal_text"
+
+
+def test_decode_run_transport_blank_last_write_invalidates_same_message_candidate() -> (
+    None
+):
+    session = "ses_blank_last_write"
+    lines = [
+        json.dumps(
+            {
+                "type": "text",
+                "sessionID": session,
+                "part": {
+                    "id": "prt_1",
+                    "messageID": "msg_1",
+                    "type": "text",
+                    "text": "AGENT_STATUS: COMPLETED",
+                    "time": {"start": 1, "end": 2},
+                },
+            }
+        ),
+        json.dumps(
+            {
+                "type": "text",
+                "sessionID": session,
+                "part": {
+                    "id": "prt_2",
+                    "messageID": "msg_1",
+                    "type": "text",
+                    "text": "   ",
+                    "time": {"start": 3, "end": 4},
+                },
+            }
+        ),
+    ]
+    with pytest.raises(ProtocolError) as exc_info:
+        decode_run_transport("\n".join(lines))
+    assert exc_info.value.code == "opencode.transport_no_terminal_text"
+
+
+def test_decode_run_transport_rejects_nonblank_text_when_final_reason_is_tool_calls() -> (
+    None
+):
+    session = "ses_final_tool_calls"
+    lines = [
+        json.dumps(
+            {
+                "type": "text",
+                "sessionID": session,
+                "part": {
+                    "id": "prt_1",
+                    "messageID": "msg_1",
+                    "type": "text",
+                    "text": "AGENT_STATUS: COMPLETED",
+                    "time": {"start": 1, "end": 2},
+                },
+            }
+        ),
+        json.dumps(
+            {
+                "type": "step_finish",
+                "sessionID": session,
+                "part": {
+                    "id": "prt_2",
+                    "messageID": "msg_1",
+                    "type": "step-finish",
+                    "reason": "tool-calls",
+                },
+            }
+        ),
+    ]
+    with pytest.raises(ProtocolError) as exc_info:
+        decode_run_transport("\n".join(lines))
+    assert (
+        exc_info.value.code
+        == "opencode.transport_incomplete_tool_call_lifecycle"
+    )
+
+
+def test_decode_run_transport_accepts_intermediate_tool_calls_then_terminal_stop() -> (
+    None
+):
+    session = "ses_tool_calls_then_stop"
+    lines = [
+        json.dumps(
+            {
+                "type": "step_start",
+                "sessionID": session,
+                "part": {
+                    "id": "prt_1",
+                    "messageID": "msg_a",
+                    "type": "step-start",
+                },
+            }
+        ),
+        json.dumps(
+            {
+                "type": "text",
+                "sessionID": session,
+                "part": {
+                    "id": "prt_2",
+                    "messageID": "msg_a",
+                    "type": "text",
+                    "text": "Intermediate progress.",
+                    "time": {"start": 1, "end": 2},
+                },
+            }
+        ),
+        json.dumps(
+            {
+                "type": "step_finish",
+                "sessionID": session,
+                "part": {
+                    "id": "prt_3",
+                    "messageID": "msg_a",
+                    "type": "step-finish",
+                    "reason": "tool-calls",
+                },
+            }
+        ),
+        json.dumps(
+            {
+                "type": "step_start",
+                "sessionID": session,
+                "part": {
+                    "id": "prt_4",
+                    "messageID": "msg_b",
+                    "type": "step-start",
+                },
+            }
+        ),
+        json.dumps(
+            {
+                "type": "text",
+                "sessionID": session,
+                "part": {
+                    "id": "prt_5",
+                    "messageID": "msg_b",
+                    "type": "text",
+                    "text": "AGENT_STATUS: COMPLETED",
+                    "time": {"start": 3, "end": 4},
+                },
+            }
+        ),
+        json.dumps(
+            {
+                "type": "step_finish",
+                "sessionID": session,
+                "part": {
+                    "id": "prt_6",
+                    "messageID": "msg_b",
+                    "type": "step-finish",
+                    "reason": "stop",
+                },
+            }
+        ),
+    ]
+    result = decode_run_transport("\n".join(lines))
+    assert result.terminal_text == "AGENT_STATUS: COMPLETED"
+
+
 # --- CRLF/CR normalization ----------------------------------------------------
 
 
