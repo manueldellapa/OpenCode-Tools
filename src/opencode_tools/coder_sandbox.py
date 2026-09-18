@@ -58,9 +58,7 @@ class _MemorySink:
     def path(self) -> Path:
         return self._path
 
-    def write(
-        self, channel: LogChannel, payload: bytes, timestamp: datetime
-    ) -> None:
+    def write(self, channel: LogChannel, payload: bytes, timestamp: datetime) -> None:
         del timestamp
         target = self._stdout if channel == "stdout" else self._stderr
         remaining = _MAX_CAPTURE_BYTES - len(target)
@@ -336,9 +334,7 @@ def prepare_coder_sandbox(
             termination_grace_seconds=termination_grace_seconds,
             log_name="coder-sandbox-baseline-head.log",
         )
-        baseline_head = _single_line(
-            baseline_head_raw, field_name="baseline HEAD"
-        )
+        baseline_head = _single_line(baseline_head_raw, field_name="baseline HEAD")
 
         return CoderSandbox(
             container_root=container_root,
@@ -385,9 +381,7 @@ def promote_coder_changes(
             "The coder sandbox top-level could not be resolved."
         ) from error
     if top != sandbox.root:
-        raise CoderSandboxError(
-            "The coder sandbox Git top-level changed unexpectedly."
-        )
+        raise CoderSandboxError("The coder sandbox Git top-level changed unexpectedly.")
 
     try:
         _, head_raw = _run_git(
