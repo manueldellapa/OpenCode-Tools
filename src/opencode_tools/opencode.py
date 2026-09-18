@@ -439,12 +439,33 @@ def decode_run_transport(text: str) -> TransportResult:
     normalization only; bounded NDJSON line splitting; per-line JSON
     validity and an allowed event-type/session-ID check; grouping completed
     `text` events' `part.text` by `messageID` (last write for a given ID
-    wins), with `step_start`, `step_finish`, `tool_use`, `reasoning`,
-    `error`, and `session.error` events excluded entirely from the result;
-    and a requirement that exactly one completed group exists once the
-    stream ends. Every violation is `ProtocolError`; this never searches
-    for a marker itself -- that is `protocol.py`'s job on the single
-    string this function returns.
+    wins), with `step_start`, `tool_use`, `reasoning`, `error`, and
+    `session.error` events excluded entirely from the result.
+
+    Terminality is derived from verified `step_finish` lifecycle structure
+    whenever the stream carries at least one such event (System Design
+    SS10.5, GitHub issue #85): the terminal candidate is the completed
+    group whose `messageID` matches the *last* `step_finish` event observed
+    before the stream ends -- and that `step_finish` must genuinely be the
+    stream's last word. Unlike `step_start` / `tool_use` / `error`, which
+    stay fully inert, `step_finish`'s own `part.type` must be the real
+    `1.17.18` `"step-finish"` value and its `messageID` must be a
+    non-empty string -- either one missing or invalid fails closed
+    immediately, the same as a malformed `text` part, never silently
+    skipped as if the event carried no lifecycle information. Any
+    recognized message-lifecycle event
+    (`step_start`, `tool_use`, `reasoning`, `error`, or `text`, complete or
+    not) observed *after* the last `step_finish` disqualifies it: that
+    activity's own conclusion is unaccounted for, so the `step_finish`
+    before it cannot be trusted as the stream's true end, and neither can
+    whatever text it would otherwise have pointed to -- even when that
+    text is the only one that ever completed. Only when the stream carries
+    no `step_finish` event at all does a lone completed group get trusted
+    outright; with no such event, more than one completed group stays
+    ambiguous. Missing terminal text or an unresolved ambiguous candidate
+    are both `ProtocolError`. This never searches for a marker itself --
+    that is `protocol.py`'s job on the single string this function
+    returns.
     """
 
     lines = _split_ndjson_lines(text)
@@ -457,6 +478,8 @@ def decode_run_transport(text: str) -> TransportResult:
     session_id: str | None = None
     completed_text_by_message: dict[str, str] = {}
     completed_order: list[str] = []
+    last_step_finish_message_id: str | None = None
+    activity_after_last_step_finish = False
 
     for line in lines:
         try:
@@ -506,10 +529,52 @@ def decode_run_transport(text: str) -> TransportResult:
                 f"A {event_type!r} event has no part object.",
             )
 
+        if event_type != "step_finish" and last_step_finish_message_id is not None:
+            # Any recognized message-lifecycle event -- step_start,
+            # tool_use, reasoning, error, or text, complete or not -- seen
+            # after the most recent step_finish means that step_finish is
+            # not actually the stream's last word: something happened
+            # afterward whose own conclusion is not yet accounted for.
+            # Cleared only by the next step_finish, which re-establishes a
+            # new, provisionally trusted boundary (issue #85).
+            activity_after_last_step_finish = True
+
+        if event_type == "step_finish":
+            # Tracks which message's step concluded last (System Design
+            # SS10.5, issue #85): the only signal this adapter trusts to
+            # separate a structurally terminal completed text from an
+            # intermediate one when a session completes more than one. Its
+            # messageID now drives that decision, so -- unlike step_start /
+            # tool_use / error, which stay fully inert -- this adapter
+            # validates its part shape as strictly as a `text` part: a
+            # part.type other than the real 1.17.18 "step-finish" value, or
+            # a missing/invalid messageID, is a transport anomaly that must
+            # fail closed, never be silently skipped as if the event
+            # carried no lifecycle information at all.
+            step_finish_part_type = part.get("type")
+            if step_finish_part_type != "step-finish":
+                raise ProtocolError(
+                    "opencode.transport_invalid_event",
+                    "A step_finish event's part has an unexpected type: "
+                    f"{step_finish_part_type!r}.",
+                )
+            step_finish_message_id = part.get("messageID")
+            if (
+                not isinstance(step_finish_message_id, str)
+                or not step_finish_message_id
+            ):
+                raise ProtocolError(
+                    "opencode.transport_invalid_event",
+                    "A step_finish event is missing a non-empty messageID.",
+                )
+            last_step_finish_message_id = step_finish_message_id
+            activity_after_last_step_finish = False
+            continue
+
         if event_type != "text":
-            # step_start / step_finish / tool_use / reasoning / error are
-            # recognized message-lifecycle events but never contribute to
-            # the terminal assistant text.
+            # step_start / tool_use / reasoning / error are recognized
+            # message-lifecycle events but never contribute to the terminal
+            # assistant text.
             continue
 
         part_type = part.get("type")
@@ -544,16 +609,37 @@ def decode_run_transport(text: str) -> TransportResult:
             "opencode.transport_no_terminal_text",
             "opencode run produced no completed terminal assistant text.",
         )
-    if len(completed_order) > 1:
+
+    if last_step_finish_message_id is not None:
+        # Lifecycle structure is available and governs terminality
+        # unconditionally (issue #85) -- even a lone completed candidate is
+        # not trusted if later step_finish activity belongs to a different,
+        # still-textless message, or if any lifecycle/text activity
+        # follows the last step_finish without itself ever concluding:
+        # either way, that later activity's own conclusion was never
+        # accounted for, so the earlier text cannot be proven terminal
+        # rather than merely intermediate.
+        if (
+            activity_after_last_step_finish
+            or last_step_finish_message_id not in completed_text_by_message
+        ):
+            raise ProtocolError(
+                "opencode.transport_multiple_terminal_candidates",
+                "opencode run produced more than one candidate terminal assistant text.",
+            )
+        terminal_message_id = last_step_finish_message_id
+    elif len(completed_order) > 1:
         raise ProtocolError(
             "opencode.transport_multiple_terminal_candidates",
             "opencode run produced more than one candidate terminal assistant text.",
         )
+    else:
+        terminal_message_id = completed_order[0]
 
     assert session_id is not None  # guaranteed once completed_order is non-empty
     return TransportResult(
         session_id=session_id,
-        terminal_text=completed_text_by_message[completed_order[0]],
+        terminal_text=completed_text_by_message[terminal_message_id],
     )
 
 

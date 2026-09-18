@@ -3,6 +3,44 @@
 All notable changes to this project are documented in this file. The format
 loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Fixed
+
+- Intermediate completed text rejected as ambiguous (issue #85): a real
+  OpenCode `1.17.18` coder invocation can complete more than one
+  message's text in a single session -- an intermediate completed text
+  followed by further tool/lifecycle activity, then a later, structurally
+  terminal completed text carrying the canonical `AGENT_STATUS: COMPLETED`
+  marker. `decode_run_transport` previously treated any more than one
+  completed `messageID` as unconditionally ambiguous
+  (`opencode.transport_multiple_terminal_candidates`), so a valid coder
+  run could never reach the reviewer phase even though OpenCode exited
+  successfully and produced the requested changes. It now derives
+  terminality from verified `step_finish` lifecycle structure whenever the
+  stream carries at least one such event: the completed group whose
+  `messageID` matches the last `step_finish` event before the stream ends
+  is terminal, and every other completed group is excluded as intermediate
+  text -- this now applies even to a lone completed candidate, so one
+  followed by unresolved `step_finish` activity for a different message is
+  no longer trusted just because no second candidate exists. Streams that
+  still cannot be resolved this way continue to fail closed with the same
+  error code. A `step_finish` event whose own `messageID` is missing,
+  `null`, empty, or not a string also fails closed immediately
+  (`opencode.transport_invalid_event`) rather than being silently skipped
+  as if it carried no lifecycle information, since that field now decides
+  terminality. The chosen `step_finish` must also genuinely be the
+  stream's last word: any recognized message-lifecycle event observed
+  after it -- including trailing activity that never gets its own
+  `step_finish` at all, e.g. a truncated capture -- disqualifies it too,
+  closing a gap where a single, otherwise-clean completed candidate could
+  still be trusted even though later, unconcluded activity followed it.
+  `step_finish`'s `part.type` is now validated too, the same way a `text`
+  part's `part.type` already was: it must equal the real `1.17.18`
+  `"step-finish"` value exactly, so a missing, wrongly-typed, or lookalike
+  value (e.g. the sibling `"step-start"`) fails closed instead of that
+  event's `messageID` being trusted for terminality anyway.
+
 ## [0.1.1] - 2026-09-17
 
 ### Fixed
