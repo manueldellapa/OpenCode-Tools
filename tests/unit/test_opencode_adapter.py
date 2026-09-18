@@ -865,28 +865,31 @@ def _workspace(tmp_path: Path) -> Workspace:
 
 
 @pytest.mark.parametrize(
-    "role,token",
+    "role,token,use_target",
     [
-        (AgentRole.ARCHITECT, "architect"),
-        (AgentRole.CODER, "coder"),
-        (AgentRole.REVIEWER, "reviewer"),
+        (AgentRole.ARCHITECT, "architect", False),
+        (AgentRole.CODER, "coder", True),
+        (AgentRole.REVIEWER, "reviewer", False),
     ],
 )
-def test_build_run_spec_produces_the_exact_argv_for_each_role(
-    role: AgentRole, token: str, tmp_path: Path
+def test_build_run_spec_uses_the_role_specific_context(
+    role: AgentRole, token: str, use_target: bool, tmp_path: Path
 ) -> None:
     executable = tmp_path / "opencode"
     workspace = _workspace(tmp_path / "workspace")
+    target_root = workspace.root / "Backend"
 
     spec = build_run_spec(
         executable,
         role,
         "the prompt",
         workspace,
+        target_root=target_root,
         timeout_seconds=30,
         termination_grace_seconds=5,
     )
 
+    expected_directory = target_root if use_target else workspace.root
     assert spec.argv == (
         str(executable),
         "run",
@@ -895,10 +898,37 @@ def test_build_run_spec_produces_the_exact_argv_for_each_role(
         "--format",
         "json",
         "--dir",
-        str(workspace.root),
+        str(expected_directory),
     )
-    assert spec.cwd == workspace.root
+    assert spec.cwd == expected_directory
     assert spec.stdin == "the prompt"
+    if use_target:
+        assert spec.environment_overrides["OPENCODE_CONFIG_DIR"] == str(
+            workspace.root / ".opencode"
+        )
+    else:
+        assert "OPENCODE_CONFIG_DIR" not in spec.environment_overrides
+
+
+def test_build_run_spec_keeps_single_repo_coder_behavior_unchanged(
+    tmp_path: Path,
+) -> None:
+    executable = tmp_path / "opencode"
+    workspace = _workspace(tmp_path / "workspace")
+
+    spec = build_run_spec(
+        executable,
+        AgentRole.CODER,
+        "the prompt",
+        workspace,
+        target_root=workspace.root,
+        timeout_seconds=30,
+        termination_grace_seconds=5,
+    )
+
+    assert spec.cwd == workspace.root
+    assert spec.argv[-1] == str(workspace.root)
+    assert "OPENCODE_CONFIG_DIR" not in spec.environment_overrides
 
 
 def test_build_run_spec_never_includes_a_forbidden_flag(tmp_path: Path) -> None:
@@ -910,6 +940,7 @@ def test_build_run_spec_never_includes_a_forbidden_flag(tmp_path: Path) -> None:
         AgentRole.CODER,
         "the prompt",
         workspace,
+        target_root=workspace.root,
         timeout_seconds=30,
         termination_grace_seconds=5,
     )
@@ -926,6 +957,21 @@ def test_build_run_spec_rejects_a_relative_executable(tmp_path: Path) -> None:
             AgentRole.ARCHITECT,
             "the prompt",
             workspace,
+            target_root=workspace.root,
+            timeout_seconds=30,
+            termination_grace_seconds=5,
+        )
+
+
+def test_build_run_spec_rejects_a_relative_target(tmp_path: Path) -> None:
+    workspace = _workspace(tmp_path / "workspace")
+    with pytest.raises(ValueError, match="target_root must be absolute"):
+        build_run_spec(
+            tmp_path / "opencode",
+            AgentRole.CODER,
+            "the prompt",
+            workspace,
+            target_root=Path("Backend"),
             timeout_seconds=30,
             termination_grace_seconds=5,
         )
