@@ -7,6 +7,17 @@ loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- Incomplete OpenCode tool-call lifecycle accepted as terminal (issue #87):
+  `decode_run_transport` now rejects a final OpenCode 1.17.18
+  `step_finish(reason="tool-calls")` at EOF with the dedicated
+  `opencode.transport_incomplete_tool_call_lifecycle` diagnostic instead
+  of trusting an associated completed text and falling through later to
+  `protocol.marker_missing`. Completed text that is empty after
+  `.strip()` is no longer a terminal candidate; a later blank completed
+  write for the same `messageID` also invalidates any earlier candidate,
+  preserving last-write-wins semantics. Intermediate `tool-calls` steps
+  followed by a genuine terminal response remain valid.
+
 - Intermediate completed text rejected as ambiguous (issue #85): a real
   OpenCode `1.17.18` coder invocation can complete more than one
   message's text in a single session -- an intermediate completed text

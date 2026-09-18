@@ -1,0 +1,4 @@
+{"type": "step_start", "sessionID": "ses_incomplete_tool_call_lifecycle", "part": {"id": "prt_1", "messageID": "msg_1", "type": "step-start"}}
+{"type": "tool_use", "sessionID": "ses_incomplete_tool_call_lifecycle", "part": {"id": "prt_2", "messageID": "msg_1", "type": "tool", "tool": "bash", "state": {"status": "error", "error": "Permission denied"}}}
+{"type": "text", "sessionID": "ses_incomplete_tool_call_lifecycle", "part": {"id": "prt_3", "messageID": "msg_1", "type": "text", "text": " ", "time": {"start": 1, "end": 2}}}
+{"type": "step_finish", "sessionID": "ses_incomplete_tool_call_lifecycle", "part": {"id": "prt_4", "messageID": "msg_1", "type": "step-finish", "reason": "tool-calls"}}
