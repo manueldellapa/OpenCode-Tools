@@ -29,7 +29,7 @@ from opencode_tools.domain import (
     RunOutcome,
     TargetRepository,
 )
-from opencode_tools.ports import AttemptLogSink, Clock, LogChannel, ProcessRunner
+from opencode_tools.ports import Clock, LogChannel, ProcessRunner
 
 _MAX_CAPTURE_BYTES = 64 * 1024 * 1024
 _SANDBOX_COMMIT_MESSAGE = "OpenCode-Tools coder sandbox baseline"
@@ -110,6 +110,7 @@ def _run_git(
     timeout_seconds: float,
     termination_grace_seconds: float,
     stdin: bytes | None = None,
+    environment_overrides: dict[str, str] | None = None,
     log_name: str,
 ) -> tuple[ProcessResult, bytes]:
     sink = _MemorySink(Path(log_name))
@@ -119,7 +120,10 @@ def _run_git(
         stdin=stdin,
         timeout_seconds=timeout_seconds,
         termination_grace_seconds=termination_grace_seconds,
-        environment_overrides={"GIT_TERMINAL_PROMPT": "0"},
+        environment_overrides={
+            "GIT_TERMINAL_PROMPT": "0",
+            **(environment_overrides or {}),
+        },
     )
     result = process_runner.run(spec, sink=sink)
     if sink.overflowed:
@@ -147,38 +151,6 @@ def _single_line(payload: bytes, *, field_name: str) -> str:
             f"Sandbox {field_name} output was missing or ambiguous."
         )
     return text
-
-
-def _copy_untracked_paths(
-    *,
-    target_root: Path,
-    sandbox_root: Path,
-    raw_paths: bytes,
-) -> None:
-    for raw_path in raw_paths.split(b"\0"):
-        if not raw_path:
-            continue
-        relative = Path(os.fsdecode(raw_path))
-        if relative.is_absolute() or ".." in relative.parts:
-            raise CoderSandboxError("An untracked path escaped the target.")
-        source = target_root / relative
-        destination = sandbox_root / relative
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        try:
-            if source.is_symlink():
-                if destination.exists() or destination.is_symlink():
-                    destination.unlink()
-                destination.symlink_to(os.readlink(source))
-            elif source.is_file():
-                shutil.copy2(source, destination, follow_symlinks=False)
-            else:
-                raise CoderSandboxError(
-                    "An untracked path had an unsupported filesystem type."
-                )
-        except OSError as error:
-            raise CoderSandboxError(
-                "An untracked target path could not be mirrored into the sandbox."
-            ) from error
 
 
 def prepare_coder_sandbox(
@@ -256,7 +228,29 @@ def prepare_coder_sandbox(
                 "The coder sandbox unexpectedly references an alternate object store."
             )
 
-        _, tracked_patch = _run_git(
+        source_index = container_root / "source.index"
+        source_index_env = {"GIT_INDEX_FILE": str(source_index)}
+        _run_git(
+            process_runner,
+            git_executable=git_executable,
+            cwd=target.root,
+            argv_tail=("-C", str(target.root), "read-tree", "HEAD"),
+            timeout_seconds=utility_timeout_seconds,
+            termination_grace_seconds=termination_grace_seconds,
+            environment_overrides=source_index_env,
+            log_name="coder-sandbox-source-read-tree.log",
+        )
+        _run_git(
+            process_runner,
+            git_executable=git_executable,
+            cwd=target.root,
+            argv_tail=("-C", str(target.root), "add", "-A", "--"),
+            timeout_seconds=utility_timeout_seconds,
+            termination_grace_seconds=termination_grace_seconds,
+            environment_overrides=source_index_env,
+            log_name="coder-sandbox-source-add.log",
+        )
+        _, source_patch = _run_git(
             process_runner,
             git_executable=git_executable,
             cwd=target.root,
@@ -264,6 +258,7 @@ def prepare_coder_sandbox(
                 "-C",
                 str(target.root),
                 "diff",
+                "--cached",
                 "--binary",
                 "--full-index",
                 "HEAD",
@@ -271,9 +266,10 @@ def prepare_coder_sandbox(
             ),
             timeout_seconds=utility_timeout_seconds,
             termination_grace_seconds=termination_grace_seconds,
+            environment_overrides=source_index_env,
             log_name="coder-sandbox-source-diff.log",
         )
-        if tracked_patch:
+        if source_patch:
             _run_git(
                 process_runner,
                 git_executable=git_executable,
@@ -288,31 +284,9 @@ def prepare_coder_sandbox(
                 ),
                 timeout_seconds=utility_timeout_seconds,
                 termination_grace_seconds=termination_grace_seconds,
-                stdin=tracked_patch,
+                stdin=source_patch,
                 log_name="coder-sandbox-seed-apply.log",
             )
-
-        _, untracked = _run_git(
-            process_runner,
-            git_executable=git_executable,
-            cwd=target.root,
-            argv_tail=(
-                "-C",
-                str(target.root),
-                "ls-files",
-                "--others",
-                "--exclude-standard",
-                "-z",
-            ),
-            timeout_seconds=utility_timeout_seconds,
-            termination_grace_seconds=termination_grace_seconds,
-            log_name="coder-sandbox-source-untracked.log",
-        )
-        _copy_untracked_paths(
-            target_root=target.root,
-            sandbox_root=sandbox_root,
-            raw_paths=untracked,
-        )
 
         _run_git(
             process_runner,
