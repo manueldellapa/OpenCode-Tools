@@ -376,12 +376,14 @@ class _CliOpenCodePreflightPort:
         *,
         executable: Path,
         workspace: Workspace,
+        target_root: Path,
         utility_timeout_seconds: float,
         termination_grace_seconds: float,
     ) -> None:
         self._process_runner = process_runner
         self._executable = executable
         self._workspace = workspace
+        self._target_root = target_root
         self._utility_timeout_seconds = utility_timeout_seconds
         self._termination_grace_seconds = termination_grace_seconds
         self._digest: str | None = None
@@ -392,6 +394,7 @@ class _CliOpenCodePreflightPort:
                 self._process_runner,
                 executable=self._executable,
                 workspace=self._workspace,
+                target_root=self._target_root,
                 utility_timeout_seconds=self._utility_timeout_seconds,
                 termination_grace_seconds=self._termination_grace_seconds,
             )
@@ -403,6 +406,7 @@ class _CliOpenCodePreflightPort:
             self._process_runner,
             executable=self._executable,
             workspace=self._workspace,
+            target_root=self._target_root,
             utility_timeout_seconds=self._utility_timeout_seconds,
             termination_grace_seconds=self._termination_grace_seconds,
             expected_digest=expected_digest,
@@ -475,12 +479,14 @@ class _CliAgentRunner:
         process_runner: ProcessRunner,
         *,
         executable: Path,
+        target_root: Path,
         opencode_timeout_seconds: float,
         utility_timeout_seconds: float,
         termination_grace_seconds: float,
     ) -> None:
         self._process_runner = process_runner
         self._executable = executable
+        self._target_root = target_root
         self._opencode_timeout_seconds = opencode_timeout_seconds
         self._utility_timeout_seconds = utility_timeout_seconds
         self._termination_grace_seconds = termination_grace_seconds
@@ -542,6 +548,7 @@ class _CliAgentRunner:
             role,
             prompt,
             workspace,
+            target_root=self._target_root,
             timeout_seconds=self._opencode_timeout_seconds,
             termination_grace_seconds=self._termination_grace_seconds,
         )
@@ -1003,12 +1010,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             process_runner,
             executable=opencode_executable,
             workspace=run_request.workspace,
+            target_root=run_request.target_root,
             utility_timeout_seconds=app_config.execution.utility_timeout_seconds,
             termination_grace_seconds=app_config.execution.termination_grace_seconds,
         )
         agent_runner = _CliAgentRunner(
             process_runner,
             executable=opencode_executable,
+            target_root=run_request.target_root,
             opencode_timeout_seconds=app_config.execution.opencode_timeout_seconds,
             utility_timeout_seconds=app_config.execution.utility_timeout_seconds,
             termination_grace_seconds=app_config.execution.termination_grace_seconds,
