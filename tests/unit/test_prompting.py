@@ -107,6 +107,7 @@ def test_architect_prompt_golden_shape() -> None:
     # only the discovered-by-you placeholder appears.
     assert "the exact, real issue title you discovered" in prompt
 
+
 def test_architect_prompt_rejects_wrong_types() -> None:
     with pytest.raises(TypeError, match="issue_locator"):
         build_architect_prompt(
@@ -159,6 +160,7 @@ def test_coder_prompt_cycle_two_includes_feedback_and_differs() -> None:
     assert "REVIEWER FEEDBACK" in cycle_two
     assert "Please add a test for the edge case." in cycle_two
     assert "Please add a test for the edge case." not in cycle_one
+
 
 def test_coder_prompt_review_cycle_cannot_exceed_max() -> None:
     with pytest.raises(ValueError, match="review_cycle"):
@@ -368,6 +370,7 @@ def test_reviewer_prompt_full_inputs_all_appear() -> None:
     assert "AGENT_STATUS: COMPLETED" not in prompt
     assert "AGENT_STATUS: READY" not in prompt
 
+
 def test_reviewer_prompt_empty_change_inventory_and_test_scope() -> None:
     prompt = build_reviewer_prompt(
         issue_ref=ISSUE_REF,
@@ -570,6 +573,7 @@ def test_architect_prompt_only_expected_parameters() -> None:
 
 
 # --- cross-cutting: no model/provider identifier anywhere ------------------
+
 
 def test_runtime_prompts_do_not_repeat_enforcement_rationale() -> None:
     prompts = (
