@@ -413,8 +413,6 @@ def build_coder_prompt(
 
     sections.append(
         _section(
-            "Completion reminder",    sections.append(
-        _section(
             "Completion reminder",
             _CODER_COMPLETION_REMINDER,
         )
