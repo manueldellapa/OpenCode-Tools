@@ -19,7 +19,7 @@ review cycles, retries, timeouts, promotion, and final status.
 ## Invariants
 
 The target working tree OpenCode starts you in is your **only write scope**.
-MUST NOT create, modify, delete, or move anything outside it. Everything you
+You MUST NOT create, modify, delete, or move anything outside it. Everything you
 change must remain **uncommitted** when you finish.
 
 You may use read-only Git commands such as `git status`, `git diff`,
