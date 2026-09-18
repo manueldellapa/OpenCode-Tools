@@ -201,6 +201,33 @@ def test_agent_definition_permission_matches_the_reviewed_baseline(
 
 
 # =============================================================================
+# Static prompt-contract shape and separation from enforcement rationale
+# =============================================================================
+
+
+@pytest.mark.parametrize("token", _ROLE_TOKENS)
+def test_agent_definition_uses_role_invariants_input_output_sections(token: str) -> None:
+    _, body = _load_agent_definition(token)
+    for heading in ("## Role", "## Invariants", "## Input", "## Output"):
+        assert heading in body
+
+
+@pytest.mark.parametrize("token", _ROLE_TOKENS)
+def test_agent_definition_omits_python_enforcement_internals(token: str) -> None:
+    _, body = _load_agent_definition(token)
+    lowered = body.lower()
+    for detail in (
+        "control-plane digest",
+        "git-state fingerprint",
+        "preflight proves",
+        "fatal precondition",
+        "cooperative control",
+        "not a sandbox",
+    ):
+        assert detail not in lowered
+
+
+# =============================================================================
 # Body content: architect/reviewer read-only, reviewer's given-context-only
 # scope, coder's write scope and FR-021 forbidden-action inventory
 # =============================================================================
@@ -380,11 +407,11 @@ def test_ac_024_forbidden_action_policy_and_command_inventory() -> None:
            already uses for model IDs, applied here to `github.py`
            specifically). Nothing before this test named this as a
            regression-proof fact for `github.py`.
-    3. "senza presentarla come sandbox contro un agent ostile" -- entirely
-       new: the cooperative-control-not-a-sandbox (ADR-010) disclaimer is
-       already present verbatim in all three agent bodies, but nothing
-       asserted that before this test; a future deletion of that wording
-       would not have failed anything.
+    3. "senza presentarla come sandbox contro un agent ostile" -- the
+       detailed containment/threat-model rationale is documentation-owned:
+       ADR-010 must retain the cooperative threat model and explicit
+       non-sandbox limitation instead of repeating that explanation in every
+       agent-facing contract.
     """
 
     # (1) AC-level allowlist/deny claim via the real permission baseline.
@@ -444,21 +471,14 @@ def test_ac_024_forbidden_action_policy_and_command_inventory() -> None:
             f"github.py must not construct the mutating command {forbidden!r}"
         )
 
-    # (3) The cooperative-control-not-a-sandbox disclaimer (ADR-010) is
-    # present verbatim in every role's body.
-    for token in _ROLE_TOKENS:
-        _, body = _load_agent_definition(token)
-        lowered = body.lower()
-        assert "cooperative control" in lowered, (
-            f"{token}.md must disclose the permission matrix is a "
-            "cooperative control (ADR-010)"
-        )
-        assert "not a sandbox" in lowered, (
-            f"{token}.md must disclaim sandbox-strength containment (ADR-010)"
-        )
-        assert "adr-010" in lowered, (
-            f"{token}.md must cite ADR-010 for the cooperative-control disclaimer"
-        )
+    # (3) Threat-model rationale remains explicit in ADR-010 while the
+    # agent-facing contracts stay focused on behavior they must cooperate with.
+    adr_010 = (
+        REPO_ROOT / "docs" / "adr" / "ADR-010-cooperative-threat-model.md"
+    ).read_text(encoding="utf-8")
+    lowered_adr = adr_010.lower()
+    assert "threat model cooperativo" in lowered_adr
+    assert "non è una sandbox os generale" in lowered_adr
 
 
 # =============================================================================
