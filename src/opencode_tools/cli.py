@@ -36,6 +36,7 @@ was terminal.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import platform
 import sys
 import time
@@ -44,7 +45,14 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Protocol, cast, runtime_checkable
 
-from opencode_tools import __version__, git_safety, github, locking, runlog
+from opencode_tools import (
+    __version__,
+    coder_sandbox,
+    git_safety,
+    github,
+    locking,
+    runlog,
+)
 from opencode_tools import opencode as opencode_adapter
 from opencode_tools.config import (
     build_run_request,
@@ -97,7 +105,7 @@ from opencode_tools.ports import (
     Sleeper,
     TargetLeaseFactory,
 )
-from opencode_tools.process import SubprocessRunner
+from opencode_tools.process import SubprocessRunner, build_process_result
 from opencode_tools.protocol import parse_agent_response
 from opencode_tools.state_machine import classify_attempt_outcome, resolve_exit_code
 
@@ -455,6 +463,13 @@ class _TeeSink:
 
 
 @runtime_checkable
+class _AcceptsTargetRepository(Protocol):
+    """An AgentRunner that needs the validated target bound after bootstrap."""
+
+    def bind_target(self, target: TargetRepository) -> None: ...
+
+
+@runtime_checkable
 class _AcceptsIssueLocator(Protocol):
     """An `AgentRunner` that needs `issue_locator` bound after bootstrap.
 
@@ -483,6 +498,9 @@ class _CliAgentRunner:
         opencode_timeout_seconds: float,
         utility_timeout_seconds: float,
         termination_grace_seconds: float,
+        git_executable: Path | None = None,
+        clock: Clock | None = None,
+        sandbox_coder: bool = True,
     ) -> None:
         self._process_runner = process_runner
         self._executable = executable
@@ -490,10 +508,17 @@ class _CliAgentRunner:
         self._opencode_timeout_seconds = opencode_timeout_seconds
         self._utility_timeout_seconds = utility_timeout_seconds
         self._termination_grace_seconds = termination_grace_seconds
+        self._git_executable = git_executable
+        self._clock = clock
+        self._sandbox_coder = sandbox_coder
         self._issue_locator: IssueLocator | None = None
+        self._target: TargetRepository | None = None
 
     def bind_issue_locator(self, issue_locator: IssueLocator) -> None:
         self._issue_locator = issue_locator
+
+    def bind_target(self, target: TargetRepository) -> None:
+        self._target = target
 
     def _decode_transport(
         self, stdout_bytes: bytes, *, overflowed: bool
@@ -530,6 +555,50 @@ class _CliAgentRunner:
             return None
         return evidence.verified_agent
 
+    def _sandbox_failure_result(
+        self,
+        *,
+        review_cycle: int | None,
+        provider_attempt: int,
+        sink: AttemptLogSink,
+        message: str,
+    ) -> AgentResult:
+        if self._clock is None or self._git_executable is None:
+            raise AssertionError("sandbox dependencies must be configured")
+        timestamp = self._clock.now()
+        sink.write(
+            "stderr",
+            f"coder sandbox failure: {message}\n".encode(),
+            timestamp,
+        )
+        empty_sha = hashlib.sha256(b"").hexdigest()
+        process_result = build_process_result(
+            command=(str(self._git_executable), "coder-sandbox"),
+            cwd=self._target_root,
+            started_at=timestamp,
+            finished_at=timestamp,
+            duration_ns=0,
+            return_code=None,
+            termination_confirmed=True,
+            stdout_byte_count=0,
+            stdout_sha256=empty_sha,
+            stderr_byte_count=0,
+            stderr_sha256=empty_sha,
+            log_path=sink.path,
+        )
+        return AgentResult(
+            role=AgentRole.CODER,
+            phase=PipelinePhase.CODER,
+            review_cycle=review_cycle,
+            provider_attempt=provider_attempt,
+            process=process_result,
+            terminal_response=None,
+            session_id=None,
+            verified_agent=None,
+            provider_diagnostic=None,
+            outcome=RunOutcome.PROCESS_ERROR,
+        )
+
     def run(
         self,
         role: AgentRole,
@@ -543,82 +612,149 @@ class _CliAgentRunner:
         if self._issue_locator is None:
             raise AssertionError("bind_issue_locator must be called before run")
 
-        spec = opencode_adapter.build_run_spec(
-            self._executable,
-            role,
-            prompt,
-            workspace,
-            target_root=self._target_root,
-            timeout_seconds=self._opencode_timeout_seconds,
-            termination_grace_seconds=self._termination_grace_seconds,
-        )
-        cycle_component = review_cycle if review_cycle is not None else 0
-        capture = opencode_adapter.open_run_capture_sink(
-            f"{role.value.lower()}-{cycle_component}-{provider_attempt}-capture"
-        )
-        process_result = self._process_runner.run(spec, sink=_TeeSink(sink, capture))
-
-        stdout_bytes = capture.bytes_for("stdout")
-        stdout_text = _decode_utf8_lenient(stdout_bytes)
-        provider_diagnostic = (
-            opencode_adapter.classify_provider_signal(stdout_text)
-            if stdout_text is not None
-            else None
-        )
-
-        session_id: str | None = None
-        terminal_response: ParsedAgentResponse | None = None
-        verified_agent: str | None = None
-
-        if provider_diagnostic is None and not process_result.timed_out:
-            transport = self._decode_transport(
-                stdout_bytes, overflowed=capture.overflowed("stdout")
-            )
-            if transport is not None:
-                session_id = transport.session_id
-                terminal_response = self._parse_response(
-                    role, transport.terminal_text, issue_locator=self._issue_locator
+        sandbox: coder_sandbox.CoderSandbox | None = None
+        execution_root = self._target_root
+        if role is AgentRole.CODER and self._sandbox_coder:
+            if (
+                self._target is None
+                or self._git_executable is None
+                or self._clock is None
+            ):
+                raise AssertionError(
+                    "bind_target and sandbox dependencies are required for coder"
                 )
-                verified_agent = self._verify_identity(role, workspace, session_id)
-                if verified_agent is None:
+            try:
+                sandbox = coder_sandbox.prepare_coder_sandbox(
+                    self._process_runner,
+                    git_executable=self._git_executable,
+                    target=self._target,
+                    clock=self._clock,
+                    utility_timeout_seconds=self._utility_timeout_seconds,
+                    termination_grace_seconds=self._termination_grace_seconds,
+                )
+            except coder_sandbox.CoderSandboxError as error:
+                return self._sandbox_failure_result(
+                    review_cycle=review_cycle,
+                    provider_attempt=provider_attempt,
+                    sink=sink,
+                    message=str(error),
+                )
+            execution_root = sandbox.root
+
+        try:
+            spec = opencode_adapter.build_run_spec(
+                self._executable,
+                role,
+                prompt,
+                workspace,
+                target_root=execution_root,
+                timeout_seconds=self._opencode_timeout_seconds,
+                termination_grace_seconds=self._termination_grace_seconds,
+            )
+            cycle_component = review_cycle if review_cycle is not None else 0
+            capture = opencode_adapter.open_run_capture_sink(
+                f"{role.value.lower()}-{cycle_component}-{provider_attempt}-capture"
+            )
+            process_result = self._process_runner.run(
+                spec, sink=_TeeSink(sink, capture)
+            )
+
+            stdout_bytes = capture.bytes_for("stdout")
+            stdout_text = _decode_utf8_lenient(stdout_bytes)
+            provider_diagnostic = (
+                opencode_adapter.classify_provider_signal(stdout_text)
+                if stdout_text is not None
+                else None
+            )
+
+            session_id: str | None = None
+            terminal_response: ParsedAgentResponse | None = None
+            verified_agent: str | None = None
+
+            if provider_diagnostic is None and not process_result.timed_out:
+                transport = self._decode_transport(
+                    stdout_bytes, overflowed=capture.overflowed("stdout")
+                )
+                if transport is not None:
+                    session_id = transport.session_id
+                    terminal_response = self._parse_response(
+                        role,
+                        transport.terminal_text,
+                        issue_locator=self._issue_locator,
+                    )
+                    verified_agent = self._verify_identity(role, workspace, session_id)
+                    if verified_agent is None:
+                        terminal_response = None
+
+            if (
+                role is AgentRole.CODER
+                and sandbox is not None
+                and provider_diagnostic is None
+                and not process_result.timed_out
+                and process_result.outcome is RunOutcome.SUCCEEDED
+                and terminal_response is not None
+                and terminal_response.agent_status is not AgentStatus.FAILED
+            ):
+                assert self._target is not None
+                assert self._git_executable is not None
+                assert self._clock is not None
+                try:
+                    coder_sandbox.promote_coder_changes(
+                        self._process_runner,
+                        git_executable=self._git_executable,
+                        target=self._target,
+                        sandbox=sandbox,
+                        clock=self._clock,
+                        utility_timeout_seconds=self._utility_timeout_seconds,
+                        termination_grace_seconds=self._termination_grace_seconds,
+                    )
+                except coder_sandbox.CoderSandboxError as error:
+                    sink.write(
+                        "stderr",
+                        (f"coder sandbox promotion blocked: {error}\n").encode(),
+                        self._clock.now(),
+                    )
                     terminal_response = None
 
-        timed_out = process_result.timed_out
-        provider_error = provider_diagnostic is not None
-        process_error = process_result.outcome in _PROCESS_ERROR_LIKE_OUTCOMES
-        higher_precedence_signal = timed_out or provider_error or process_error
-        protocol_error = not higher_precedence_signal and terminal_response is None
-        agent_reported_failure = (
-            not higher_precedence_signal
-            and terminal_response is not None
-            and terminal_response.agent_status is AgentStatus.FAILED
-        )
-        succeeded = (
-            not higher_precedence_signal
-            and terminal_response is not None
-            and terminal_response.agent_status is not AgentStatus.FAILED
-        )
-        precedence = classify_attempt_outcome(
-            timed_out=timed_out,
-            provider_error=provider_error,
-            process_error=process_error,
-            protocol_error=protocol_error,
-            agent_reported_failure=agent_reported_failure,
-            succeeded=succeeded,
-        )
+            timed_out = process_result.timed_out
+            provider_error = provider_diagnostic is not None
+            process_error = process_result.outcome in _PROCESS_ERROR_LIKE_OUTCOMES
+            higher_precedence_signal = timed_out or provider_error or process_error
+            protocol_error = not higher_precedence_signal and terminal_response is None
+            agent_reported_failure = (
+                not higher_precedence_signal
+                and terminal_response is not None
+                and terminal_response.agent_status is AgentStatus.FAILED
+            )
+            succeeded = (
+                not higher_precedence_signal
+                and terminal_response is not None
+                and terminal_response.agent_status is not AgentStatus.FAILED
+            )
+            precedence = classify_attempt_outcome(
+                timed_out=timed_out,
+                provider_error=provider_error,
+                process_error=process_error,
+                protocol_error=protocol_error,
+                agent_reported_failure=agent_reported_failure,
+                succeeded=succeeded,
+            )
 
-        return AgentResult(
-            role=role,
-            phase=_PHASE_BY_ROLE[role],
-            review_cycle=review_cycle,
-            provider_attempt=provider_attempt,
-            process=process_result,
-            terminal_response=terminal_response,
-            session_id=session_id,
-            verified_agent=verified_agent,
-            provider_diagnostic=provider_diagnostic,
-            outcome=precedence.outcome,
-        )
+            return AgentResult(
+                role=role,
+                phase=_PHASE_BY_ROLE[role],
+                review_cycle=review_cycle,
+                provider_attempt=provider_attempt,
+                process=process_result,
+                terminal_response=terminal_response,
+                session_id=session_id,
+                verified_agent=verified_agent,
+                provider_diagnostic=provider_diagnostic,
+                outcome=precedence.outcome,
+            )
+        finally:
+            if sandbox is not None:
+                coder_sandbox.cleanup_coder_sandbox(sandbox)
 
 
 def _environment_snapshot() -> Mapping[str, FrozenJsonValue]:
@@ -753,10 +889,12 @@ def run_composed_pipeline(
             "bootstrap_run must set orchestrator/issue_locator/record when error is None"
         )
 
+    target = outcome.record.target
     if isinstance(agent_runner, _AcceptsIssueLocator):
         agent_runner.bind_issue_locator(outcome.issue_locator)
+    if isinstance(agent_runner, _AcceptsTargetRepository):
+        agent_runner.bind_target(target)
 
-    target = outcome.record.target
     pipeline_result = run_issue_pipeline(
         orchestrator=outcome.orchestrator,
         issue_locator=outcome.issue_locator,
@@ -1021,6 +1159,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             opencode_timeout_seconds=app_config.execution.opencode_timeout_seconds,
             utility_timeout_seconds=app_config.execution.utility_timeout_seconds,
             termination_grace_seconds=app_config.execution.termination_grace_seconds,
+            git_executable=git_executable,
+            clock=clock,
         )
 
         result = run_composed_pipeline(

@@ -798,6 +798,7 @@ def _agent_runner(
         opencode_timeout_seconds=30,
         utility_timeout_seconds=10,
         termination_grace_seconds=2,
+        sandbox_coder=False,
     )
     runner.bind_issue_locator(_issue_locator())
     return runner, process_runner
@@ -840,7 +841,7 @@ def test_agent_runner_parses_a_successful_architect_response(tmp_path: Path) -> 
     assert result.provider_diagnostic is None
 
 
-def test_agent_runner_runs_coder_in_target_and_pins_workspace_config(
+def test_agent_runner_builds_direct_coder_spec_when_sandbox_is_disabled(
     tmp_path: Path,
 ) -> None:
     rate_limit_bytes = (
@@ -892,6 +893,7 @@ def test_agent_runner_raises_when_issue_locator_is_not_bound(tmp_path: Path) -> 
         opencode_timeout_seconds=30,
         utility_timeout_seconds=10,
         termination_grace_seconds=2,
+        sandbox_coder=False,
     )
     workspace = Workspace(root=tmp_path)
 

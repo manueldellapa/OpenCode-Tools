@@ -49,9 +49,12 @@ opencode-tools run --workspace <path> --target <path-or-.> --issue <N> [--config
 - `--workspace`: the shared OpenCode workspace. Architect and reviewer run
   with this directory as their context; it also owns the project-local
   `.opencode/` control plane. Must already exist.
-- `--target`: the Git repository the coder edits and the reviewer
-  inspects, given as `.` or a path relative to `--workspace`. The coder
-  runs with this resolved repository as its OpenCode `--dir`. After
+- `--target`: the real Git repository whose working-tree changes the coder
+  may ultimately produce and the reviewer inspects, given as `.` or a path
+  relative to `--workspace`. The coder never runs directly inside this
+  repository; OpenCode-Tools creates an independent disposable local clone,
+  runs the coder there, validates it, and promotes only the resulting
+  working-tree delta. After
   resolving symlinks it must stay inside the workspace and be the top level
   of a non-bare Git working tree, on an attached branch, with a clean index
   and working tree (no staged, unstaged, or non-ignored untracked changes) --
@@ -62,14 +65,20 @@ opencode-tools run --workspace <path> --target <path-or-.> --issue <N> [--config
   conventional `<workspace>/opencode-tools.toml` is used when present,
   otherwise built-in defaults apply.
 
-Workspace and target are deliberately distinct. Architect and reviewer use
-the workspace as their OpenCode context, while the coder uses the resolved
-target so its shell/edit boundary matches the Git repository it may change.
-For a nested target, OpenCode Tools pins `OPENCODE_CONFIG_DIR` to the
-workspace-owned `.opencode/` directory and verifies that effective target
-control plane before the coder can run. Every Git/diff operation continues
-to name the target explicitly. In the common case (`--target .`) workspace
-and target are identical and behavior is unchanged.
+Workspace, real target, and coder execution directory are deliberately
+distinct concepts. Architect and reviewer use the workspace as their
+OpenCode context. Each coder attempt receives a fresh independent clone in a
+private temporary directory; that clone has no remotes, no alternate object
+store, and no shared Git metadata with the real target. OpenCode Tools pins
+`OPENCODE_CONFIG_DIR` to the workspace-owned `.opencode/` directory so the
+reviewed coder definition remains effective inside the disposable clone.
+
+Before promotion, OpenCode-Tools verifies that the clone still has the
+sandbox baseline `HEAD`, that its `.git` directory is intact, and that the
+real target's content-sensitive Git fingerprint did not change while the
+coder was running. Only the sandbox working-tree delta is then applied to
+the real target; refs, commits, tags, branches, remotes and Git metadata are
+never promoted.
 
 ## Configuration
 
@@ -153,9 +162,12 @@ artifact.
 | 40 | Logging/persistence failure -- the run artifact may be incomplete |
 | 130 | Interrupted before a run could be initialized |
 
-Whatever changes the coder made -- complete or partial -- are always left
-uncommitted in the target, on success or on failure; the program never
-commits, stages, resets, or cleans anything. See
+Only a technically valid coder attempt whose sandbox passes validation is
+promoted to the real target. Those promoted changes are left uncommitted.
+Partial changes from a provider/process/protocol failure remain confined to
+the disposable clone and are discarded when that attempt ends. The program
+may stage and create a temporary baseline commit **inside the disposable
+clone only**; it never commits the real target. See
 [docs/recovery.md](docs/recovery.md) for how to inspect and recover a run
 manually.
 
@@ -167,11 +179,14 @@ manually.
   the user deletes old run directories manually.
 - No model or provider selection from Python; that is entirely OpenCode's
   own configuration.
-- No Git or GitHub mutation of any kind (no commit, push, branch, PR,
-  issue edit/close, or comment) and no automatic publication or sharing.
-- No sandbox: the cooperative controls this tool applies are not
-  containment against a hostile local process. See
-  [docs/security-and-privacy.md](docs/security-and-privacy.md).
+- No publication or real-target Git-history mutation: OpenCode-Tools never
+  commits, branches, tags or pushes the real target and never mutates
+  GitHub. Trusted internal Git commands are used only to build/validate the
+  disposable clone and apply a working-tree patch to the real target.
+- No general OS sandbox: issue #90 isolates the real target's Git metadata
+  with an independent disposable clone, but this is not containment against
+  an arbitrary hostile local process running with the same user credentials.
+  See [docs/security-and-privacy.md](docs/security-and-privacy.md).
 
 ## Quality gate
 

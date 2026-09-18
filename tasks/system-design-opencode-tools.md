@@ -138,7 +138,7 @@ Le OQ-001–OQ-010 sono chiuse esplicitamente in §21. I rischi R-001–R-015 so
 | FR-002 — una sola issue | `cli` | singolo argomento scalare; liste/range non hanno grammatica valida | negative CLI; AC-001 |
 | FR-003 — workspace e target separati | `cli`, `domain` | `Workspace` e `TargetRepository` distinti, entrambi canonicali | path/component test; AC-003–004 |
 | FR-004 — target relativo, contained e Git root | `cli`, `git_safety` | `resolve(strict=True)`, controllo per parent, `git -C … rev-parse --show-toplevel` | temp FS, symlink escape, nested repo; AC-004, AC-006 |
-| FR-005 — contesto OpenCode role-specific, target per Git | `orchestrator`, adapter | architect/reviewer `--dir <workspace>`; coder `--dir <target>` con config workspace pinned; ogni argv Git contiene `-C <target>` | fake command assertions; AC-003 |
+| FR-005 — contesto OpenCode role-specific, target per Git | `orchestrator`, adapter, `coder_sandbox` | architect/reviewer `--dir <workspace>`; coder `--dir <sandbox>` con config workspace pinned; Git Safety/reviewer restano sul target reale | fake command assertions + sandbox component; AC-003/037 |
 | FR-006 — TOML/default/`--config` | `config` | `tomllib`, lookup convenzionale, precedence documentata | config unit/golden; AC-002 |
 | FR-007 — tutti i limiti configurabili | `config` | value object per execution/retry/runtime | boundary tests; AC-002, AC-014 |
 | FR-008 — limiti/chiavi validi e finiti | `config`, `errors` | schema chiuso, `math.isfinite`, range espliciti, bool esclusi dai numeri | invalid TOML matrix; AC-002, AC-026 |
@@ -153,9 +153,9 @@ Le OQ-001–OQ-010 sono chiuse esplicitamente in §21. I rischi R-001–R-015 so
 | FR-017 — identity issue e handoff | `github`, `prompting`, `protocol` | remote/override deterministico; architect legge issue; envelope validato | multi-repo/fake gh/envelope; AC-029 |
 | FR-018 — issue non fidata | agent prompt, `protocol`, classifier | dati delimitati; marker solo da terminal assistant; issue esclusa dai classifier | spoofing fixtures; AC-016, AC-031, AC-035 |
 | FR-019 — handoff/feedback integrali | `prompting`, `orchestrator` | payload opaco trasportato senza riassunto Python | fake prompt capture; AC-009, AC-030 |
-| FR-020 — write scope/ruoli read-only | agent definitions, `prompting`, `git_safety` | target esplicito; effective permission check; snapshot read-only pre/post | policy + mutation tests; AC-024, AC-028 |
+| FR-020 — write scope/ruoli read-only | agent definitions, `prompting`, `coder_sandbox`, `git_safety` | coder vede solo cwd sandbox; path reale non esposto; effective permission check; snapshot target pre/post | policy + sandbox destruction + mutation tests; AC-024, AC-028, AC-037 |
 | FR-021 — least privilege e azioni proibite | agent definitions, preflight | policy allow/deny completa, nessun `ask`, `task` e mutation negati | policy fixture/linter; AC-024 |
-| FR-022 — Python non mutativo; flag vietati | tutti gli adapter | argv strutturati da allowlist; nessun `--auto/--share/--model` | command inventory test; AC-023–024 |
+| FR-022 — nessuna mutation GitHub/history target; flag vietati | adapter + `coder_sandbox` | nessun `--auto/--share/--model`; Git mutativo trusted solo per baseline sandbox e `git apply` working-tree | command inventory + sandbox tests; AC-023–024/037 |
 | FR-023 — reviewer vede issue/diff/test/untracked | `prompting`, reviewer agent | input espliciti; ispezione target e inventario Git corrente | fake reviewer input + temp repo; AC-030 |
 | FR-024 — CHANGES_REQUIRED non è errore | `domain`, `state_machine` | `ReviewStatus` separato; attempt outcome `SUCCEEDED` | transition/type tests; AC-009–010 |
 | FR-025 — cycle da 1 e limite su decisioni | `state_machine` | `ReviewCycle` positivo; incremento solo dopo decisione reviewer | state table tests; AC-009–010 |
@@ -164,7 +164,7 @@ Le OQ-001–OQ-010 sono chiuse esplicitamente in §21. I rischi R-001–R-015 so
 | FR-028 — transient trusted soltanto | `opencode` classifier | signature versionate su event/error channel; assistant/tool/issue ignorati | positive/negative fixtures; AC-011, AC-031 |
 | FR-029 — exponential backoff capped | `retry` | funzione pura con formula PRD, clock/sleeper iniettati | exact delay unit tests; AC-011 |
 | FR-030 — provider exhaustion | `retry`, `state_machine` | nessun consumo cycle; outcome resta `PROVIDER_ERROR` | scripted exhaustion; AC-012 |
-| FR-031 — coder mutation sopprime retry | `orchestrator`, `git_safety` | confronto fingerprint attempt-level prima del backoff | partial mutation scenario; AC-013 |
+| FR-031 — sandbox failure/drift guard | `coder_sandbox`, `orchestrator`, `git_safety` | fingerprint target prima/dopo coder; failure non promuove; drift blocca promozione | partial sandbox/provider/drift scenarios; AC-013/037 |
 | FR-032 — timeout per invocation | `process`, `config` | deadline monotonic per process spec | fake/real child timeout; AC-014 |
 | FR-033 — terminate/grace/kill/grace | `process` | nuova process session POSIX; segnali al process group; join bounded | descendant/resistant child tests; AC-014, AC-032 |
 | FR-034 — categorie distinte | `domain`, `errors`, `runlog` | `RunOutcome` canonico e cause ordinate | fault matrix; AC-012–020, AC-033, AC-036 |
@@ -183,7 +183,7 @@ Le OQ-001–OQ-010 sono chiuse esplicitamente in §21. I rischi R-001–R-015 so
 | FR-047 — unico FINAL_STATUS Python | `orchestrator`, `protocol`, `cli` | finalizer unico; agent `FINAL_STATUS` riservato/errore | stdout count + spoof test; AC-025, AC-035 |
 | FR-048 — approval dopo postflight safe | `state_machine`, finalizer | gate con reviewer approved + Git SAFE + invarianti | approval/drift tests; AC-008, AC-019, AC-025 |
 | FR-049 — ogni altro outcome fallisce | finalizer, `cli` | mapping totale outcome → final/exit code | exhaustive finalization test; AC-010, AC-012–020, AC-025 |
-| FR-050 — preservare modifiche | `git_safety`, `orchestrator` | assenza di recovery mutativo; inventario finale | partial/success/drift repos; AC-013, AC-018 |
+| FR-050 — preservare solo output validato | `coder_sandbox`, `git_safety`, `orchestrator` | delta sandbox promosso solo su success; failure sandbox scartato; inventario finale del target | success/failure/drift repos; AC-013, AC-018, AC-037 |
 | FR-051 — fingerprint content-sensitive | `git_safety` | hash versionato di index, tracked/untracked path/type/mode/content | same-porcelain second edit; AC-013, AC-028 |
 | FR-052 — logging failure fail-fast | `runlog`, `process`, finalizer | sink apre prima del child; errore termina child/nuove call; ultima JSON valida | open/replace failure injection; AC-033 |
 
@@ -210,7 +210,7 @@ Le OQ-001–OQ-010 sono chiuse esplicitamente in §21. I rischi R-001–R-015 so
 |---|---|---|---|
 | AC-001 — CLI singola issue | `cli`, domain | tre input e issue positiva scalare | CLI positive/negative |
 | AC-002 — config deterministica | `config` | precedence explicit/conventional/default, schema chiuso | TOML golden/invalid matrix |
-| AC-003 — multi-repo | orchestrator, OpenCode/Git adapter | workspace a architect/reviewer `--dir`; target a coder `--dir` e a ogni `git -C`; config workspace pinned nel coder | temp `workspace/Backend` + command/context capture |
+| AC-003 — multi-repo | orchestrator, OpenCode/Git adapter, `coder_sandbox` | workspace a architect/reviewer `--dir`; sandbox a coder `--dir`; Git Safety/reviewer su target; config workspace pinned | temp `workspace/Backend` + command/context capture |
 | AC-004 — path safety | domain, `git_safety` | canonical containment e root equality | outside/symlink/nested fixtures |
 | AC-005 — dirty preflight | `git_safety` | status `-z` clean obbligatorio | staged/unstaged/untracked repos |
 | AC-006 — Git shape | `git_safety` | non-bare, branch attached, commit resolvibile | detached/unborn/bare repos |
@@ -614,12 +614,12 @@ Il command builder v0.1 produce un contesto role-specific:
 <absolute-opencode> run
   --agent coder
   --format json
-  --dir <absolute-target>
+  --dir <absolute-disposable-sandbox>
 ```
 
 Il prompt completo viene scritto su stdin e il child riceve sempre `cwd` uguale al valore di `--dir`. La duplicazione intenzionale elimina dipendenze dal cwd del chiamante e rende esplicito il contesto. Non vengono mai passati `--auto`, `--share`, `--model`, `--continue`, `--session`, `--fork`, `--attach` o opzioni provider. Ogni invocation crea quindi una sessione indipendente; handoff e feedback viaggiano nei prompt trusted delimitati (FR-009, FR-016, FR-019, FR-022).
 
-L'environment child è una copia non persistita dell'environment corrente con `OPENCODE_AUTO_SHARE=false` e `OPENCODE_DISABLE_AUTOUPDATE=true` forzati dall'adapter versionato. Quando il coder usa un target annidato, l'adapter forza inoltre `OPENCODE_CONFIG_DIR=<workspace>/.opencode`: il target resta il project/worktree operativo, ma le definizioni agent/config revisionate del workspace restano disponibili senza ampliare `external_directory`. Il preflight verifica sia il control-plane del workspace sia quello effettivo del target con lo stesso override e combina entrambi nel digest; il recheck prima di ogni invocation deve riprodurre lo stesso digest. Se `target == workspace`, nessun override aggiuntivo viene impostato e il comportamento resta invariato. Il preflight rifiuta inoltre una config effettiva OpenCode con sharing automatico. Questo non seleziona né duplica modelli: questi restano nei file agent.
+L'environment child è una copia non persistita dell'environment corrente con `OPENCODE_AUTO_SHARE=false` e `OPENCODE_DISABLE_AUTOUPDATE=true` forzati dall'adapter versionato. Per il coder l'adapter forza inoltre `OPENCODE_CONFIG_DIR=<workspace>/.opencode`: le definizioni agent/config revisionate del workspace restano disponibili dentro il clone disposable senza esporre il target reale come cwd. Il clone contiene la stessa project config tracked/non-ignored del target al momento dell'attempt; il preflight/recheck continua a validare il control-plane workspace+target e la sandbox non può allargarlo. Il preflight rifiuta inoltre sharing automatico. Questo non seleziona né duplica modelli: questi restano nei file agent.
 
 ### 10.4 Compatibilità iniziale e capability preflight
 
@@ -654,6 +654,40 @@ L'export viene parsato in memoria con limite, non copiato in `run.json`, e deve 
 Il classifier non legge il body assistant. Per 1.17.18 accetta soltanto due shape trusted, entrambe strutturalmente esatte e coperte da fixture (issue #80): un evento `session.error` con il proprio `error.data.code` allowlisted, e un evento top-level `error` -- tipo message-lifecycle "gemello" non taggato di `session.error` -- il cui `error.data.message` è a sua volta una stringa JSON serializzata che deve contenere una coppia `code` numerico / `metadata.error_type` stringa allowlisted. Una allowlist di code/status/name normalizzati riconosce almeno HTTP 429, HTTP 502, `provider_unavailable`, overload e rate limiting per la prima shape; la seconda shape ha una allowlist indipendente e deliberatamente più stretta, oggi limitata all'unica condizione con evidenza reale (`code=503`, `metadata.error_type="provider_overloaded"`, osservata come overload Nvidia/OpenRouter nella run `20260917T124944.374451Z-bfee6257f6f8`). Un match in issue, testo, reasoning, tool result o stderr non è trusted, né lo è un payload che fallisce il secondo parse JSON o non contiene esattamente i campi attesi: entrambe le shape falliscono chiuse su qualunque variante malformata o non allowlisted. Diagnostiche stderr, o nuove condizioni per la seconda shape, potranno essere aggiunte soltanto insieme a una fixture esatta della medesima versione.
 
 Non esiste fallback da JSON a output testuale, da agent esplicito a default, da versione sconosciuta a “best effort” o da classifier incerto a provider retry. L'aggiunta di una versione OpenCode richiede: schema adapter separato, fixture success/failure/provider/malformed/fallback/identity, capability check aggiornato e smoke disposable documentato. Riferimenti: FR-011–FR-012, FR-028, FR-035, NFR-008–NFR-009.
+
+## 10.7 Coder disposable Git sandbox
+
+Prima di ogni provider attempt del coder, `coder_sandbox.py` cattura un
+`git-state-v1` del target reale e crea sotto una directory temporanea privata
+un clone locale con `git clone --no-hardlinks --no-tags --no-recurse-submodules`.
+Il remote `origin` viene rimosso prima di OpenCode e una sandbox con
+`.git/objects/info/alternates` viene rifiutata: refs, reflog, index, config e
+object database non devono essere condivisi con il target reale.
+
+Per rappresentare anche le modifiche già promosse da cicli precedenti senza
+toccare l'index reale, Python usa `GIT_INDEX_FILE=<temp>`, esegue
+`read-tree HEAD` + `add -A` sul target e genera una patch binaria completa.
+La patch viene applicata al clone; quindi Python crea un commit baseline
+**solo nella sandbox**, con hooks disabilitati. Il coder riceve esclusivamente
+questa directory come cwd/`--dir` e il prompt non contiene il path reale del
+target.
+
+Dopo un coder tecnicamente/protocollarmente riuscito:
+
+1. `.git` deve essere ancora una directory owned dalla sandbox;
+2. `rev-parse --show-toplevel` deve coincidere con la sandbox;
+3. `HEAD^{commit}` deve coincidere con il commit baseline;
+4. un nuovo `git-state-v1` del target reale deve uguagliare branch, HEAD e
+   fingerprint catturati prima del coder;
+5. Python esegue `add -A` solo nella sandbox, produce
+   `diff --cached --binary --full-index HEAD` e applica quella patch al
+   working tree reale con `git apply` senza modificare index/ref/history.
+
+Qualunque failure provider/process/protocol, corruzione/reinit della sandbox
+Git o drift del target blocca la promozione; la directory temporanea viene
+rimossa e le modifiche parziali del coder non raggiungono il target. Questo
+è un isolamento specifico dei metadati Git reali, non una sandbox OS
+generale (ADR-010, issue #90).
 
 ## 11. Git safety model
 
@@ -701,10 +735,11 @@ Il `before` di ogni attempt deve inoltre uguagliare l'ultimo checkpoint accettat
 | Un probe Git fallisce o lo snapshot è ambiguo | `INDETERMINATE`, approval vietata, `GIT_SAFETY_ERROR` con causa tecnica preservata |
 | Delta fingerprint durante architect/reviewer | `UNSAFE`, `GIT_SAFETY_ERROR`, nessun retry o fase successiva |
 | Delta fingerprint durante coder con attempt riuscito | Atteso; inventario aggiornato e passaggio al reviewer |
-| Delta coder con provider error | Modifiche preservate; `PROVIDER_ERROR`, `retry_suppressed_due_to_target_change = true`, niente retry |
-| Delta coder con altro errore | Modifiche preservate; outcome tecnico originale, niente recovery automatico |
+| Delta sandbox coder con provider/process/protocol error | Nessuna promozione; target reale invariato; outcome tecnico originale e sandbox scartata |
+| Sandbox Git corrotta/reinizializzata o `HEAD` cambiato | Promozione bloccata fail-closed; target reale invariato |
+| Target reale cambia durante coder | Promozione bloccata; nessun delta sandbox attribuito al coder |
 
-La permission policy nega anche staging e comandi Git mutativi, ma un eventuale index delta del coder viene comunque registrato e mostrato al reviewer: il PRD richiede che il delta coder alimenti inventario/retry e non autorizza Python a ripulirlo. Il tool non attribuisce con certezza una modifica al processo agent piuttosto che a un processo esterno.
+La permission policy continua a negare staging e comandi Git mutativi come defense in depth. Le mutation Git necessarie a costruire baseline/patch sono eseguite esclusivamente da Python nella sandbox, mai dall'agent. Il reviewer vede soltanto il delta già promosso nel target reale. Un drift del target durante il coder blocca la promozione invece di essere attribuito al ruolo.
 
 ### 11.4 Reviewer visibility
 
@@ -723,9 +758,9 @@ Il prompt reviewer contiene target canonico, issue ref, handoff architect, body/
 
 ### 11.6 Defense in depth e recovery
 
-Python non costruisce comandi Git/GitHub mutativi. Le definizioni agent negano l'intera classe commit/amend/tag/branch/push/merge/rebase/reset/clean/stash/checkout/switch distruttivo, remote write, `git add` e mutation `gh`. Architect/reviewer negano edit; coder limita edit al target dichiarato. Effective permissions vengono verificate in preflight.
+Python non muta GitHub né history/ref del target reale. Le definizioni agent negano l'intera classe commit/amend/tag/branch/push/merge/rebase/reset/clean/stash/checkout/switch distruttivo, remote write, `git add` e mutation `gh`. Architect/reviewer negano edit; coder limita edit alla sandbox. Effective permissions vengono verificate in preflight.
 
-Queste misure non sono una sandbox OS: un agent ostile potrebbe camuffare un comando, usare un altro eseguibile, scrivere fuori target o effettuare una mutation remota e ripristinare localmente `HEAD`. V0.1 rileva branch/HEAD e cambi nel target, preserva lo stato e non tenta mai reset, checkout, clean, stash o rollback. Il recupero consiste nell'ispezione manuale di target, log e `run.json` da parte dell'utente (FR-020–FR-022, FR-040–FR-041, FR-050).
+Issue #90 aggiunge una barriera concreta per i metadati Git reali: un agent che esegue `rm -rf .git`, `git init`, reset o ref rewrite distrugge soltanto il clone disposable e la promozione viene rifiutata. Questa misura non è una sandbox OS generale: un processo con gli stessi permessi utente che riuscisse a evadere il boundary OpenCode o a usare credenziali esterne resta fuori dalla garanzia. Il recupero del target reale continua a basarsi su lock, checkpoint, artifact e ispezione manuale (FR-020–FR-022, FR-040–FR-041, FR-050).
 
 ## 12. Provider retry e review cycle
 
@@ -1221,8 +1256,9 @@ Ogni fake conserva le call per asserire ordine, cwd, argv, stdin, timeout e asse
 - `SubprocessRunner` con helper child locali: stdout/stderr concorrenti, descendant, TERM-resistant process, spawn failure, partial output e termination unconfirmed simulata al boundary;
 - spawn failure ed exit non-zero non-provider producono esplicitamente `PROCESS_ERROR` senza retry (AC-015);
 - repository Git reali sotto `tempfile`: clean, staged, unstaged, untracked, ignored, detached, unborn, bare, nested/symlink escape, branch/HEAD drift e Git probe timeout/failure;
-- workspace con `Backend` e `Frontend` per provare architect/reviewer su `--dir workspace`, coder su `--dir target` con `OPENCODE_CONFIG_DIR` del workspace, contro `git -C target`;
-- mutation architect/reviewer, coder partial mutation, staged/untracked inventory e preservation;
+- workspace con `Backend` e `Frontend` per provare architect/reviewer su `--dir workspace`, coder su clone disposable con `OPENCODE_CONFIG_DIR` del workspace, e Git Safety/reviewer sul target reale;
+- test sandbox con object store indipendente/remoti rimossi, promozione delta, drift target e distruzione `rm -rf .git && git init` senza danno al target;
+- mutation architect/reviewer, inventario staged/untracked promosso e failure coder non promosso;
 - mutation esterna fra due checkpoint, durante backoff o control-plane recheck, rilevata prima dello spawn successivo;
 - runtime ignored/unignored, mode POSIX, collisioni, ultima JSON valida e log write failure;
 - due processi locali per lock stesso target, lock target diversi, crash release e quarantine;
@@ -1257,7 +1293,8 @@ I quality command esatti (`pytest`, Ruff check/format check, mypy strict) sarann
 | Preflight dopo init fallisce | `PREFLIGHT_ERROR`, postflight best effort, run JSON finalizzato | Installare/autenticare/correggere policy; nuova run |
 | Architect/coder/reviewer emette FAILED valido | `AGENT_REPORTED_FAILURE`; log e stato Git conservati | Ispezionare spiegazione e target; pulire/decidere prima di rilanciare |
 | Provider 502, target invariato | Backoff e nuovo attempt stesso phase/cycle | Nessuna azione se recupera; altrimenti ispezionare exhaustion |
-| Provider error coder dopo edit | Retry soppresso, `PROVIDER_ERROR`, modifiche preservate | Valutare/tenere/scartare manualmente; target deve tornare clean per nuova run |
+| Provider/process/protocol error coder dopo edit sandbox | Nessuna promozione; target reale invariato; sandbox scartata | Ispezionare log; retry/provider policy può procedere se gli altri guard lo consentono |
+| Coder cancella/reinizializza `.git` sandbox | Promozione bloccata; target reale intatto | Ispezionare log/agent policy; nessuna recovery Git del target necessaria |
 | Timeout con terminazione confermata | `TIMEOUT`, output parziale, postflight | Ispezionare log/modifiche; nessun rollback automatico |
 | Terminazione non confermata | FAILED, postflight indeterminato, quarantine | Fermare processi, verificare Git/files, rimuovere quarantine consapevolmente |
 | Marker/stream/agent identity invalido | `PROTOCOL_ERROR`, nessun retry | Correggere agent/compatibilità; nuova run |
@@ -1289,10 +1326,10 @@ Non esiste resume v0.1. Ogni rilancio crea un nuovo run ID e richiede target cle
 
 ### 21.3 OQ-003 — Future defense-in-depth
 
-- **Decisione proposta:** v0.1 mantiene threat model cooperativo con permission verification, immutable control-plane digest, no-share, Git checks e lock. Dopo v0.1 valutare, in ordine, credential minimization/command broker, sandbox OS con write access solo target e infine worktree/container disposable se cambia il contratto di output.
-- **Motivazione:** i primi controlli sono testabili e non richiedono infrastruttura; una sandbox multipiattaforma improvvisata creerebbe una promessa falsa.
-- **Alternative considerate:** container obbligatorio subito, esecuzione con utente OS dedicato, wrapper Git/gh allowlist, worktree per issue.
-- **Conseguenze:** R-001 e R-006 restano rischi alti dichiarati; qualunque garanzia ulteriore richiede aggiornare threat model, PRD e acceptance.
+- **Decisione aggiornata (issue #90):** v0.1 mantiene il threat model cooperativo generale ma introduce subito un isolamento specifico dei metadati Git reali tramite clone coder disposable indipendente, senza remoti e con promozione patch validata. Dopo v0.1 restano da valutare credential minimization/command broker e sandbox OS generale.
+- **Motivazione:** l'incidente live ha dimostrato che il solo postflight rileva la distruzione di `.git` troppo tardi; il clone disposable rende il danno sacrificabile senza richiedere container o privilegi OS.
+- **Alternative considerate:** deny-list shell, linked worktree (scartato perché condivide metadata), container obbligatorio, utente OS dedicato, wrapper Git/gh allowlist.
+- **Conseguenze:** la distruzione Git locale del coder non può più distruggere il target reale; R-001/R-006 restano per escape/credential misuse fuori dal boundary OpenCode.
 - **ADR necessario?** Sì, per rendere esplicito il confine di fiducia.
 
 ### 21.4 OQ-004 — Lock concorrente
@@ -1435,10 +1472,11 @@ I file agent contengono modelli, prompt e permission matrix; Python conosce solt
 |---|---|---|---|
 | R-001 — remote/history mutation e restore HEAD | effective deny policy, no auto/share, argv audit, branch/HEAD checks | Alto: processo ostile/credential misuse può sfuggire al postflight | policy fixtures, command inventory, threat-model review |
 | R-002 — prompt injection/marker falsi | untrusted delimiters, terminal-only parser, exact marker, provider trust boundary | Medio: agent cooperativo può comunque essere influenzato semanticamente | spoofing fixtures AC-016/031/035 |
-| R-003 — provider/timeout dopo edit coder | attempt fingerprint, retry suppression, preservation, no rollback | Basso per perdita dati; resta lavoro parziale manuale | AC-013 e timeout-with-change |
+| R-003 — provider/timeout dopo edit coder | sandbox disposable; failure non promuove; fingerprint target pre-promotion | Basso per target reale; lavoro parziale sandbox viene scartato | AC-013/037 |
 | R-004 — child sopravvive | process group TERM/KILL bounded, termination flag, quarantine | Medio: crash brusco del parent può precedere quarantine | descendant/resistant process AC-032 |
 | R-005 — run/process concorrente cambia Git | target lock + checkpoint per attempt | Medio: processi non conformi non rispettano lock | multiprocess lock e drift AC-018 |
-| R-006 — write in sibling/fuori target | scope prompt, effective permissions, target fingerprint | Alto: nessun sandbox OS; fuori-target non osservato | negative agent policy; future sandbox ADR-010 |
+| R-006 — write fuori sandbox/escape | cwd sandbox, path reale non esposto, effective permissions, target fingerprint | Medio/alto: nessun sandbox OS generale; escape con credenziali utente resta residuo | negative policy + ADR-010 |
+| R-016 — distruzione/reinit Git metadata | clone indipendente, no remote/alternates, HEAD/top-level validation | Basso sul target reale; sandbox può essere distrutta e viene scartata | destructive sandbox component AC-037 |
 | R-007 — formato OpenCode cambia | exact version adapter, fixtures, no fallback | Basso per comportamento silenzioso; alto attrito upgrade | fixture pack + AC-027/035 |
 | R-008 — provider/model instabile | models esterni, bounded retry/backoff, deterministic fake tests | Medio: run può fallire o richiedere ore | provider scenarios AC-011/012 |
 | R-009 — repository GitHub sbagliato | resolver target-specifico, `--repo`, envelope match | Basso dopo preflight; issue existence resta contratto agent | multi-repo AC-029 |

@@ -114,8 +114,8 @@ _CODER_CYCLE_ONE_GOLDEN_PROMPT = (
     "=====END UNTRUSTED ISSUE TITLE=====\n"
     "\n"
     "--- Write scope ---\n"
-    "Target canonical path: /workspace/repo\n"
-    "This target is your ONLY write scope. Edit files inside it as needed to implement the plan below. Never create, modify, or delete anything outside this path.\n"
+    "Your target is the current working directory OpenCode started you in. Resolve it with `pwd` if needed; that runtime path is intentionally the only writable path you are given.\n"
+    "This current working directory is your ONLY write scope. Edit files inside it as needed to implement the plan below. Never create, modify, or delete anything outside it, and never attempt to discover or access the real source repository behind this isolated working copy.\n"
     "This is review cycle 1 of at most 3.\n"
     "\n"
     "--- Architect handoff ---\n"
@@ -125,7 +125,7 @@ _CODER_CYCLE_ONE_GOLDEN_PROMPT = (
     "=====END UNTRUSTED ARCHITECT HANDOFF=====\n"
     "\n"
     "--- Policy ---\n"
-    "You only edit files in the working tree at the target path above and leave every change uncommitted for this program (or a human) to handle afterward. You must never do any of the following:\n"
+    "You only edit files in the current working directory described above and leave every change uncommitted for this program (or a human) to handle afterward. You must never do any of the following:\n"
     "  - Never stage any change (`git add`).\n"
     "  - Never commit, or amend a commit (`git commit`, `git commit --amend`).\n"
     "  - Never create, move, or delete a tag.\n"
@@ -156,8 +156,8 @@ _CODER_CYCLE_TWO_GOLDEN_PROMPT = (
     "=====END UNTRUSTED ISSUE TITLE=====\n"
     "\n"
     "--- Write scope ---\n"
-    "Target canonical path: /workspace/repo\n"
-    "This target is your ONLY write scope. Edit files inside it as needed to implement the plan below. Never create, modify, or delete anything outside this path.\n"
+    "Your target is the current working directory OpenCode started you in. Resolve it with `pwd` if needed; that runtime path is intentionally the only writable path you are given.\n"
+    "This current working directory is your ONLY write scope. Edit files inside it as needed to implement the plan below. Never create, modify, or delete anything outside it, and never attempt to discover or access the real source repository behind this isolated working copy.\n"
     "This is review cycle 2 of at most 3.\n"
     "\n"
     "--- Architect handoff ---\n"
@@ -173,7 +173,7 @@ _CODER_CYCLE_TWO_GOLDEN_PROMPT = (
     "=====END UNTRUSTED REVIEWER FEEDBACK=====\n"
     "\n"
     "--- Policy ---\n"
-    "You only edit files in the working tree at the target path above and leave every change uncommitted for this program (or a human) to handle afterward. You must never do any of the following:\n"
+    "You only edit files in the current working directory described above and leave every change uncommitted for this program (or a human) to handle afterward. You must never do any of the following:\n"
     "  - Never stage any change (`git add`).\n"
     "  - Never commit, or amend a commit (`git commit`, `git commit --amend`).\n"
     "  - Never create, move, or delete a tag.\n"
@@ -416,7 +416,8 @@ def test_coder_prompt_states_write_scope_and_final_marker_instruction() -> None:
         review_cycle=1,
         max_review_cycles=3,
     )
-    assert f"Target canonical path: {TARGET_ROOT}" in prompt
+    assert str(TARGET_ROOT) not in prompt
+    assert "current working directory OpenCode started you in" in prompt
     assert "ONLY write scope" in prompt
     assert "AGENT_STATUS: COMPLETED" in prompt
     assert "AGENT_STATUS: FAILED" in prompt
