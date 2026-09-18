@@ -14,6 +14,7 @@ call timeout or non-zero exit, and output overflow.
 
 from __future__ import annotations
 
+import json
 import time
 from datetime import UTC, datetime
 from pathlib import Path
@@ -109,6 +110,89 @@ def test_run_preflight_calls_each_endpoint_exactly_once_in_order(
         "debug agent coder",
         "debug agent reviewer",
     ]
+
+
+def test_nested_target_preflight_validates_the_actual_coder_context(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    workspace_root = tmp_path / "workspace"
+    target_root = workspace_root / "Backend"
+    target_root.mkdir(parents=True)
+    (workspace_root / ".opencode").mkdir()
+    workspace = Workspace(root=workspace_root)
+
+    context_log = tmp_path / "contexts.jsonl"
+    monkeypatch.setenv("FAKE_OPENCODE_CONTEXT_LOG_FILE", str(context_log))
+    monkeypatch.delenv("OPENCODE_CONFIG_DIR", raising=False)
+    _set_baseline_debug_fixtures(monkeypatch)
+
+    evidence = run_preflight(
+        SubprocessRunner(RealClock()),
+        executable=HELPER,
+        workspace=workspace,
+        target_root=target_root,
+        utility_timeout_seconds=UTILITY_TIMEOUT_SECONDS,
+        termination_grace_seconds=TERMINATION_GRACE_SECONDS,
+    )
+    assert evidence.control_plane_digest
+
+    contexts = [
+        json.loads(line)
+        for line in context_log.read_text(encoding="utf-8").splitlines()
+    ]
+    workspace_debug = [
+        item
+        for item in contexts
+        if item["argv"][:1] == ["debug"] and item["cwd"] == str(workspace_root)
+    ]
+    target_debug = [
+        item
+        for item in contexts
+        if item["argv"][:1] == ["debug"] and item["cwd"] == str(target_root)
+    ]
+    assert len(workspace_debug) == 4
+    assert len(target_debug) == 4
+    assert all(item["config_dir"] is None for item in workspace_debug)
+    assert all(
+        item["config_dir"] == str(workspace_root / ".opencode")
+        for item in target_debug
+    )
+
+
+def test_nested_target_preflight_rejects_a_different_effective_coder(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    workspace_root = tmp_path / "workspace"
+    target_root = workspace_root / "Backend"
+    target_root.mkdir(parents=True)
+    (workspace_root / ".opencode").mkdir()
+    _set_baseline_debug_fixtures(monkeypatch)
+    monkeypatch.delenv("OPENCODE_CONFIG_DIR", raising=False)
+
+    fallback_file = tmp_path / "target-coder-fallback.json"
+    fallback_file.write_text(
+        '{"name": "general", "mode": "primary", '
+        '"tools": {"question": false, "task": false}, '
+        '"permission": [{"permission": "*", "action": "allow", "pattern": "*"}, '
+        '{"permission": "edit", "action": "allow", "pattern": "*"}, '
+        '{"permission": "bash", "action": "allow", "pattern": "*"}, '
+        '{"permission": "webfetch", "action": "deny", "pattern": "*"}]}',
+        encoding="utf-8",
+    )
+    monkeypatch.setenv(
+        "FAKE_OPENCODE_TARGET_DEBUG_AGENT_CODER_FILE", str(fallback_file)
+    )
+
+    with pytest.raises(PreflightError) as exc_info:
+        run_preflight(
+            SubprocessRunner(RealClock()),
+            executable=HELPER,
+            workspace=Workspace(root=workspace_root),
+            target_root=target_root,
+            utility_timeout_seconds=UTILITY_TIMEOUT_SECONDS,
+            termination_grace_seconds=TERMINATION_GRACE_SECONDS,
+        )
+    assert exc_info.value.code == "opencode.debug_agent_identity_mismatch"
 
 
 # --- AC-007: version/capability proof and effective-agent identity -----------
