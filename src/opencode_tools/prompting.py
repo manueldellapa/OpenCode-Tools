@@ -386,11 +386,18 @@ def build_coder_prompt(
         "Write scope",
         "\n".join(
             (
-                f"Target canonical path: {target_root}",
                 (
-                    "This target is your ONLY write scope. Edit files inside "
-                    "it as needed to implement the plan below. Never create, "
-                    "modify, or delete anything outside this path."
+                    "Your target is the current working directory OpenCode "
+                    "started you in. Resolve it with `pwd` if needed; that "
+                    "runtime path is intentionally the only writable path "
+                    "you are given."
+                ),
+                (
+                    "This current working directory is your ONLY write scope. "
+                    "Edit files inside it as needed to implement the plan "
+                    "below. Never create, modify, or delete anything outside "
+                    "it, and never attempt to discover or access the real "
+                    "source repository behind this isolated working copy."
                 ),
                 (
                     f"This is review cycle {review_cycle} of at most "
