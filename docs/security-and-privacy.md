@@ -26,13 +26,17 @@ v0.1 defends against mistakes, malformed output, cooperative prompt
 injection, an OpenCode agent silently falling back to the wrong agent,
 concurrent conformant runs on the same target, and observable Git mutation.
 
-**v0.1 makes no containment promise against:** a local process with the
-same user permissions, a compromised `git`/`gh`/`opencode` binary, an agent
-that deliberately works around its own tool permissions, credential misuse,
-writes outside the target, or a remote mutation later hidden locally. These
-are declared residual risks, not bugs masked by a false sandbox claim. A
-future OS sandbox, credential broker, or disposable worktree/container is
-possible but not part of v0.1 -- see ADR-010 for the evaluation order.
+**v0.1 is not a general OS sandbox.** Issue #90 adds a narrow but concrete
+containment boundary for the coder's Git metadata: every coder attempt runs
+inside an independent disposable clone whose remotes are removed and whose
+object store is not shared with the real target. Destructive Git operations
+inside that clone therefore cannot destroy the target's real `.git`.
+
+Residual risks still include a process with the same user permissions that
+escapes OpenCode's directory boundary, a compromised
+`git`/`gh`/`opencode` binary, credential misuse, or remote mutation
+performed through another channel. See ADR-010 for the remaining threat
+model.
 
 ## Controls actually applied
 
@@ -57,18 +61,26 @@ possible but not part of v0.1 -- see ADR-010 for the evaluation order.
   configuration when target and workspace coincide -- is a protocol error
   and stops the pipeline before the next role runs.
 - The target's Git branch, `HEAD`, and a content-sensitive working-tree
-  fingerprint are captured before and after every invocation and compared
-  against the run's baseline; any branch/`HEAD` drift, or a content
-  fingerprint delta outside the coder's own edit, stops new invocations.
+  fingerprint are captured before and after every invocation.
+- The coder never executes in the real target. OpenCode-Tools creates a
+  private local clone with an independent `.git`, removes all remotes,
+  mirrors the current target working-tree state through a temporary Git
+  index, and runs OpenCode only inside that disposable clone.
+- Before promotion, the sandbox `.git`, top-level and baseline `HEAD`
+  must still be valid and the real target fingerprint must match the
+  pre-attempt snapshot. Only the sandbox working-tree delta is then applied
+  to the real target.
 - Runs on the same target are serialized by a per-target lock (below); an
   unconfirmed termination quarantines the target rather than releasing it
   silently.
 
-Python itself never constructs or runs a mutating Git or GitHub command
-(no commit, push, branch, reset, clean, PR, or issue mutation); whatever
-the coder changed is always left uncommitted. See
-[docs/recovery.md](recovery.md) for the lock, quarantine, and manual
-recovery this implies.
+Python never mutates GitHub or the real target's history/refs. Trusted
+internal Git mutation is now intentionally used **inside the disposable
+sandbox only** to stage and create a temporary baseline commit, and
+`git apply` is used to promote a validated working-tree patch into the
+real target. The real target is never committed, reset, cleaned, branched
+or pushed. Failed coder attempts are discarded with their sandbox; promoted
+changes remain uncommitted. See [docs/recovery.md](recovery.md).
 
 ## What is logged, and what is not
 
