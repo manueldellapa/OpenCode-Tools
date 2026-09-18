@@ -136,6 +136,9 @@ _CODER_CYCLE_ONE_GOLDEN_PROMPT = (
     "  - Never perform a destructive checkout or switch (`git checkout -- <path>`, `git switch`, or similar).\n"
     "  - Never perform ANY GitHub mutation at all -- `gh issue edit`, `gh issue close`, `gh issue comment`, `gh pr create`, `gh pr merge`, `gh pr comment`, `gh pr close`, or any equivalent.\n"
     "\n"
+    "--- Completion reminder ---\n"
+    "Once all required acceptance criteria have been implemented and verified, stop further optional exploration, summarize the required verification, and immediately report `AGENT_STATUS: COMPLETED`. If any required criterion remains unresolved or required verification fails, report `AGENT_STATUS: FAILED` instead.\n"
+    "\n"
     "When you are done, report your result with exactly one of the following as the final line of your response:\n"
     "\n"
     "  AGENT_STATUS: COMPLETED   (you made your intended changes; the body may be empty)\n"
@@ -183,6 +186,9 @@ _CODER_CYCLE_TWO_GOLDEN_PROMPT = (
     "  - Never clean or stash the working tree (`git clean`, `git stash`).\n"
     "  - Never perform a destructive checkout or switch (`git checkout -- <path>`, `git switch`, or similar).\n"
     "  - Never perform ANY GitHub mutation at all -- `gh issue edit`, `gh issue close`, `gh issue comment`, `gh pr create`, `gh pr merge`, `gh pr comment`, `gh pr close`, or any equivalent.\n"
+    "\n"
+    "--- Completion reminder ---\n"
+    "Once all required acceptance criteria have been implemented and verified, stop further optional exploration, summarize the required verification, and immediately report `AGENT_STATUS: COMPLETED`. If any required criterion remains unresolved or required verification fails, report `AGENT_STATUS: FAILED` instead.\n"
     "\n"
     "When you are done, report your result with exactly one of the following as the final line of your response:\n"
     "\n"
@@ -422,6 +428,51 @@ def test_coder_prompt_states_write_scope_and_final_marker_instruction() -> None:
     assert "AGENT_STATUS: COMPLETED" in prompt
     assert "AGENT_STATUS: FAILED" in prompt
     assert "REVIEW_STATUS" not in prompt
+
+
+def test_coder_prompt_has_concise_completion_reminder() -> None:
+    prompt = build_coder_prompt(
+        issue_ref=ISSUE_REF,
+        architect_handoff="Implementation complete; all required checks passed.",
+        target_root=TARGET_ROOT,
+        review_cycle=1,
+        max_review_cycles=3,
+    )
+    reminder = prompt.split("--- Completion reminder ---\n", 1)[1].split(
+        "\n\nWhen you are done", 1
+    )[0]
+
+    assert (
+        "all required acceptance criteria have been implemented and verified"
+        in reminder
+    )
+    assert "stop further optional exploration" in reminder
+    assert "`AGENT_STATUS: COMPLETED`" in reminder
+    assert "required verification fails" in reminder
+    assert "`AGENT_STATUS: FAILED` instead" in reminder
+
+
+def test_coder_prompt_completion_reminder_stays_concise() -> None:
+    prompt = build_coder_prompt(
+        issue_ref=ISSUE_REF,
+        architect_handoff="Implement the thing.",
+        target_root=TARGET_ROOT,
+        review_cycle=1,
+        max_review_cycles=3,
+    )
+    reminder = prompt.split("--- Completion reminder ---\n", 1)[1].split(
+        "\n\nWhen you are done", 1
+    )[0]
+
+    for static_policy_detail in (
+        "hidden tests",
+        "alternate project layouts",
+        "optional tooling",
+        "unrelated implementation variants",
+        "optional diagnostic",
+        "hard safety ceiling",
+    ):
+        assert static_policy_detail not in reminder
 
 
 def test_coder_prompt_forbids_git_and_github_mutations() -> None:

@@ -243,6 +243,31 @@ def test_coder_body_states_everything_must_stay_uncommitted() -> None:
     assert "uncommitted" in body.lower()
 
 
+def test_coder_body_has_full_completion_contract() -> None:
+    _, body = _load_agent_definition("coder")
+    lowered = " ".join(body.lower().split())
+
+    assert (
+        "required acceptance criteria and their required verification define" in lowered
+    )
+    assert "stop further exploratory or optional work" in lowered
+    assert "hidden tests" in lowered
+    assert "alternate project layouts" in lowered
+    assert "optional tooling" in lowered
+    assert "unrelated implementation variants" in lowered
+    assert "extra refactors" in lowered
+    assert (
+        "failed or inconclusive optional diagnostic does not block completion"
+        in lowered
+    )
+    assert "independently verified by another valid method" in lowered
+    assert "agent_status: completed" in lowered
+    assert "required verification fails" in lowered
+    assert "agent_status: failed" in lowered
+    assert "hard safety ceiling" in lowered
+    assert "not the normal success-path stopping mechanism" in lowered
+
+
 # One assertion per FR-021 forbidden-action item, each with its own failure
 # message, so a future regression names exactly which item went missing
 # instead of failing one giant regex.
