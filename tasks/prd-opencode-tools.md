@@ -189,8 +189,8 @@ Questi identificativi sono esempi operativi, non requisiti di prodotto. Devono v
 **Acceptance Criteria:**
 
 - [ ] Il coder non viene invocato se l'architect non ha concluso con `READY`.
-- [ ] Il prompt del coder include issue ref, handoff dell'architect, target canonico, review cycle e policy di safety.
-- [ ] Il target è dichiarato come unico write scope del coder; i sibling repository e gli altri file del workspace non sono autorizzati alla modifica.
+- [ ] Il prompt del coder include issue ref, handoff dell'architect, review cycle e policy di safety, ma non espone il path reale del target; il current working directory OpenCode è il solo write scope dichiarato.
+- [ ] Ogni attempt coder usa un clone locale disposable indipendente del target, senza remote né object store condiviso; sibling repository, workspace e target reale non sono autorizzati alla modifica diretta.
 - [ ] Il coder può modificare file e svolgere i test pertinenti; prompt e permission policy gli vietano le azioni Git/GitHub proibite previste dal threat model v0.1.
 - [ ] Un tentativo riuscito termina con una sola riga `AGENT_STATUS: COMPLETED`; un fallimento dichiarato usa `AGENT_STATUS: FAILED` con spiegazione non vuota.
 - [ ] Le modifiche restano non committate.
@@ -239,7 +239,7 @@ Questi identificativi sono esempi operativi, non requisiti di prodotto. Devono v
 - [ ] La classificazione usa soltanto eventi provider/OpenCode strutturati o diagnostica di processo esplicitamente riconosciuta, mai issue text, messaggi assistant o output dei tool dell'agent.
 - [ ] Ogni provider attempt ha un record e un log distinti.
 - [ ] Esauriti gli attempt, la pipeline termina `FAILED` con outcome `PROVIDER_ERROR`.
-- [ ] Un tentativo coder che ha già cambiato il working tree non viene ritentato automaticamente: conserva outcome `PROVIDER_ERROR`, registra `retry_suppressed_due_to_target_change = true`, preserva le modifiche e termina `FAILED` senza rollback.
+- [ ] Un provider/process/protocol failure del coder non promuove modifiche parziali al target reale: la sandbox disposable viene scartata. Un retry provider può procedere soltanto se il target reale è rimasto invariato e gli altri guard lo consentono.
 
 ### US-009: Distinguere timeout, process error e protocol error
 
@@ -309,7 +309,7 @@ Questi identificativi sono esempi operativi, non requisiti di prodotto. Devono v
 **Acceptance Criteria:**
 
 - [ ] Gli agenti sono definiti nel workspace come `.opencode/agents/architect.md`, `coder.md` e `reviewer.md` e sono invocabili come agenti primari.
-- [ ] Python invoca `opencode run --agent <ruolo> --format json --dir <contesto>` senza `--model`, `--share` o `--auto`: architect/reviewer usano il workspace, il coder usa il target; su target annidato il coder conserva la `.opencode/` del workspace tramite `OPENCODE_CONFIG_DIR`.
+- [ ] Python invoca `opencode run --agent <ruolo> --format json --dir <contesto>` senza `--model`, `--share` o `--auto`: architect/reviewer usano il workspace, il coder usa un clone disposable indipendente; il coder conserva la `.opencode/` del workspace tramite `OPENCODE_CONFIG_DIR`.
 - [ ] La configurazione agent contiene modello e permessi; la configurazione Python contiene solo parametri di orchestrazione.
 - [ ] Sostituire tutti e tre i model ID validi non richiede modifiche né ai moduli Python né al file TOML dell'orchestratore.
 - [ ] Un agent mancante, disabilitato o risolto in fallback a un ruolo diverso causa preflight o protocol error fail-closed.
@@ -324,7 +324,7 @@ Questi identificativi sono esempi operativi, non requisiti di prodotto. Devono v
 - **FR-002:** Ogni invocation deve gestire esattamente una issue; liste, range e batch devono essere rifiutati.
 - **FR-003:** Workspace e target devono essere risolti, canonicalizzati e conservati come concetti separati.
 - **FR-004:** In v0.1 il target deve essere `.` o un percorso relativo che, dopo la risoluzione dei symlink, resta dentro il workspace e coincide con il top-level di un working tree Git non bare.
-- **FR-005:** Architect e reviewer devono essere eseguiti con il workspace come directory di contesto; il coder deve essere eseguito con il target come directory di contesto. Se il target è annidato, il control-plane `.opencode/` del workspace deve restare esplicitamente disponibile e verificato. Ogni operazione Git/diff deve indicare esplicitamente il target.
+- **FR-005:** Architect e reviewer devono essere eseguiti con il workspace come directory di contesto; il coder deve essere eseguito in un clone locale disposable indipendente del target reale, con remote rimossi e Git object store non condiviso. Il control-plane `.opencode/` del workspace deve restare esplicitamente disponibile e verificato. Il target reale resta l'unico repository su cui Git Safety e reviewer operano.
 - **FR-006:** La configurazione deve essere letta con `tomllib` e validata prima degli agenti. `--config` seleziona il file; se omesso si usa `<workspace>/opencode-tools.toml` quando presente, altrimenti default documentati. Override di singoli valori non sono richiesti in v0.1.
 - **FR-007:** Devono essere configurabili `max_review_cycles`, timeout OpenCode, timeout dei processi utility, termination grace, numero massimo di provider attempt, delay iniziale, moltiplicatore, delay massimo e `runtime_root`.
 - **FR-008:** I limiti devono essere finiti e positivi dove richiesto; valori o chiavi invalidi devono produrre un config error fail-closed.
@@ -339,9 +339,9 @@ Questi identificativi sono esempi operativi, non requisiti di prodotto. Devono v
 - **FR-017:** Prima dell'architect, Python deve associare il numero a un repository target non ambiguo. L'architect deve acquisire la issue tramite `gh issue view` in quel contesto e, per procedere, restituire host, owner/repository, numero, URL canonico e titolo nell'envelope versionato `ISSUE_REF_JSON`; Python valida l'envelope ma non deve sostituirsi all'agent nella lettura o analisi del body.
 - **FR-018:** La issue deve essere trattata come input non fidato e non deve poter sovrascrivere istruzioni di ruolo, safety policy o protocollo.
 - **FR-019:** L'output utile dell'architect deve essere passato al coder; il feedback `CHANGES_REQUIRED` deve essere passato integralmente al coder del ciclo successivo.
-- **FR-020:** Prompt e configurazione devono dichiarare il target come unico write scope del coder e architect/reviewer come read-only rispetto ai file sorgente. La garanzia contro un agent ostile oltre alle policy verificabili non fa parte del threat model v0.1.
+- **FR-020:** Prompt e configurazione devono dichiarare la current working directory sandbox come unico write scope del coder senza esporre il path reale del target; architect/reviewer restano read-only rispetto ai file sorgente. Questa garanzia isola i metadati Git reali ma non costituisce una sandbox OS generale.
 - **FR-021:** Le definizioni agent devono usare permessi OpenCode minimi per ruolo: consentire operazioni Git read-only necessarie e, per il coder, edit del working tree, negando l'intera classe di mutation Git history/ref/worktree distruttive, remote write e GitHub mutation. La policy deve coprire almeno commit/amend, tag, branch creation, push/force-push, merge/rebase, reset, clean, stash, checkout/switch distruttivi e mutation di PR/issue.
-- **FR-022:** Python non deve costruire o eseguire comandi Git/GitHub mutativi e non deve passare `--auto`, `--share` o `--model` a OpenCode.
+- **FR-022:** Python non deve mutare GitHub né la history/ref del target reale e non deve passare `--auto`, `--share` o `--model` a OpenCode. Sono ammessi comandi Git trusted e bounded per costruire/validare la sandbox, creare un baseline commit solo nella sandbox e applicare al target reale esclusivamente un working-tree patch validato.
 - **FR-023:** Il reviewer deve basare la decisione su issue, handoff, modifiche correnti del target, inclusi nuovi file non ignorati, e risultati di test disponibili.
 - **FR-024:** `CHANGES_REQUIRED` deve essere un `ReviewStatus`, non un error outcome né un final status.
 - **FR-025:** Il review cycle deve partire da 1 e `max_review_cycles` deve contare le decisioni logiche del reviewer.
@@ -350,7 +350,7 @@ Questi identificativi sono esempi operativi, non requisiti di prodotto. Devono v
 - **FR-028:** Devono essere riconosciuti come transient provider failure almeno 429, 502, `provider_unavailable`, overload e rate limiting, ma soltanto da eventi di errore OpenCode/provider strutturati o diagnostica di trasporto/processo strettamente riconosciuta. Issue text, messaggi assistant e tool output dell'agent non sono fonti attendibili per questa classificazione.
 - **FR-029:** Il retry provider deve usare exponential backoff configurabile, capped, senza jitter obbligatorio in v0.1.
 - **FR-030:** Esauriti gli attempt, l'outcome deve restare `PROVIDER_ERROR`; il limite di review non deve essere consumato.
-- **FR-031:** Prima di ritentare un coder dopo provider failure, Python deve confrontare lo stato del target con quello immediatamente precedente all'attempt; se sono presenti nuove modifiche, deve preservarle, mantenere `outcome = PROVIDER_ERROR`, registrare `retry_suppressed_due_to_target_change = true` e terminare `FAILED` senza retry o rollback.
+- **FR-031:** Prima di promuovere o ritentare un coder, Python deve confrontare il fingerprint del target reale con quello catturato prima dell'attempt. Un failure tecnico/protocollo/provider non promuove la sandbox; un drift del target blocca la promozione e il retry. Le modifiche parziali esistenti solo nella sandbox vengono scartate con essa.
 - **FR-032:** Ogni invocazione OpenCode deve avere un timeout configurabile indipendente dal tempo di backoff.
 - **FR-033:** Il timeout deve applicare una sequenza bounded terminate → grace → kill → grace all'intero process group e acquisire l'output parziale. Se la terminazione resta non confermabile, deve registrare `termination_confirmed = false`, eseguire soltanto un postflight best effort marcato indeterminato e terminare `FAILED` senza attesa infinita.
 - **FR-034:** Timeout, provider error, process error, protocol error, agent-reported failure, Git safety error, review limit e logging error devono restare categorie distinguibili.
@@ -438,7 +438,7 @@ Questi identificativi sono esempi operativi, non requisiti di prodotto. Devono v
 - Model selection, provider credential management o disponibilità garantita di un modello specifico in Python.
 - Commit o pubblicazione automatica degli artifact del run.
 - Garanzia che l'output AI sia semanticamente corretto oltre ai controlli, test e review osservabili definiti.
-- Contenimento di sicurezza contro un agent, processo locale o utente deliberatamente ostile; v0.1 applica policy, controlli e fail-closed entro il threat model dichiarato, non una sandbox OS-level.
+- Contenimento OS generale contro un agent, processo locale o utente deliberatamente ostile. v0.1 include invece un isolamento specifico dei metadati Git del target reale tramite clone coder disposable; non promette una sandbox OS-level completa.
 
 ## 6. Design Considerations
 
@@ -489,7 +489,7 @@ Questa grammatica è il contratto v0.1, mentre lo stream JSON OpenCode è un for
 ### 6.3 Permessi e ruoli OpenCode
 
 - `architect` può leggere workspace, target e issue con `gh`, ma non modificare sorgenti o Git/GitHub.
-- `coder` può leggere il workspace, modificare il solo target ed eseguire test, ma non operazioni Git/GitHub proibite.
+- `coder` riceve come current working directory solo un clone disposable indipendente, può modificarlo ed eseguire test, ma non deve accedere al target reale né eseguire operazioni Git/GitHub proibite.
 - `reviewer` può leggere e ispezionare il target ed eseguire verifiche consentite, ma non modificare sorgenti o Git/GitHub.
 - I tre agenti devono essere invocabili direttamente come agenti primari e non devono avviare una propria orchestrazione multi-agent.
 - Prompt e definizioni agent devono codificare la policy verificabile richiesta; il postflight rileva una parte delle violazioni. Contenimento di un agent ostile, shell alternative, credential misuse e scritture fuori target richiedono un meccanismo ulteriore da valutare nel system design e non sono implicitamente promessi.
@@ -592,7 +592,7 @@ Per ogni invocation in `ARCHITECT`, `CODER` o `REVIEWER`, un provider error retr
 ### 7.4 Processo e retry
 
 - Le invocazioni devono usare argomenti strutturati con `shell=False`, evitando interpolazione di issue text o path in una shell. Il comando registrato deve sostituire il prompt con un placeholder sanitizzato; il system design deve scegliere il canale meno esposto supportato da OpenCode per il contenuto privato.
-- Il comando concettuale è `opencode run --agent <role> --format json --dir <workspace|target> <prompt>`: architect/reviewer usano il workspace, coder il target; il dettaglio dell'API subprocess, del trasporto prompt e del pinning della config appartiene al system design.
+- Il comando concettuale è `opencode run --agent <role> --format json --dir <workspace|sandbox> <prompt>`: architect/reviewer usano il workspace, coder un clone disposable indipendente; il dettaglio di creazione/promozione sandbox, API subprocess, trasporto prompt e pinning config appartiene al system design.
 - stdout e stderr devono essere drenati senza deadlock e conservati nel log del singolo attempt.
 - La classificazione del singolo attempt deve essere deterministica: timeout; trusted provider error; exit code non-zero/process error; protocol parser; agent/review status. A livello pipeline non esiste un `primary_failure` che schiaccia le altre dimensioni: `trigger_outcome`, `git_safety_status` e `persistence_status` restano campi separati, mentre la timeline causale è ordinata per sequence number. Git safety o logging error forzano sempre il final failure.
 - Un riferimento a 429/502 o rate limiting in issue, assistant text o tool output non autorizza un retry. Solo canali di errore coperti da fixture per la versione OpenCode sono attendibili.
@@ -603,8 +603,8 @@ Per ogni invocation in `ARCHITECT`, `CODER` o `REVIEWER`, un provider error retr
 ### 7.5 Git safety e diff
 
 - Il target deve iniziare pulito secondo il default conservativo proposto da FR-014, così da rendere attribuibili al run tutte le modifiche successive.
-- Tutti i check devono essere equivalenti a operazioni read-only indirizzate esplicitamente al target.
-- Branch e `HEAD` sono invarianti; il working tree può cambiare soltanto durante il coder.
+- I checkpoint Git Safety sul target reale restano read-only. I comandi mutativi trusted sono confinati alla sandbox, salvo `git apply` usato per promuovere il working-tree delta validato.
+- Branch e `HEAD` del target reale sono invarianti; il coder può cambiare solo la sandbox e il target cambia esclusivamente durante la promozione trusted.
 - Il working-tree snapshot content-sensitive viene raccolto prima e dopo ogni attempt. Deve rilevare anche una seconda modifica a un file già marcato `M`, non soltanto variazioni delle righe porcelain. Una modifica non ignorata prodotta da architect o reviewer è un safety violation rilevata prima di qualsiasi retry o fase successiva.
 - Il reviewer deve vedere sia i diff dei file tracked sia l'inventario/contenuto dei nuovi file non ignorati.
 - Le modifiche del coder sono output del prodotto e non sono un errore; non vengono committate.
@@ -707,7 +707,7 @@ Non vengono definiti KPI di adozione o business per v0.1: il primo successo è l
 - `gh` e OpenCode sono già autenticati con le rispettive credenziali; il tool non gestisce login o token.
 - Il target corrisponde a un repository GitHub e la issue è leggibile dall'architect.
 - Gli agenti project-local richiesti esistono nel workspace e hanno permessi compatibili con i loro ruoli.
-- Workspace e target sono leggibili; il target è scrivibile dal coder.
+- Workspace e target sono leggibili; il target reale è scrivibile dal processo Python per la sola promozione trusted, mentre il coder scrive esclusivamente nella sandbox disposable.
 - Come default conservativo proposto da questo PRD, il target è pulito, su branch nominato e con `HEAD` risolvibile all'avvio; un futuro opt-in per baseline dirty non è implicito.
 - Una sola pipeline e nessun processo umano o esterno modifica branch o `HEAD` del target durante il run.
 - Come default di scope proposto si assume un ambiente locale POSIX, almeno macOS/Linux; il supporto Windows richiede una decisione esplicita sulla terminazione dei process tree, sui permessi e sui lock.
@@ -715,7 +715,7 @@ Non vengono definiti KPI di adozione o business per v0.1: il primo successo è l
 - Issue, repository e log possono contenere dati privati; gli artifact restano locali salvo azione esplicita dell'utente.
 - I modelli sperimentali indicati possono cambiare o non essere disponibili e non fanno parte del contratto Python.
 - Le invocazioni OpenCode v0.1 possono essere indipendenti: Python trasporta esplicitamente handoff e feedback.
-- Le permission policy OpenCode vengono rispettate dal runtime; v0.1 non viene presentata come sandbox ostile di livello sistema operativo.
+- Le permission policy OpenCode vengono rispettate dal runtime; l'isolamento coder protegge i metadati Git reali ma v0.1 non viene presentata come sandbox ostile di livello sistema operativo.
 
 ## 10. Open Questions
 
@@ -738,10 +738,11 @@ Queste domande non impediscono l'uso del PRD come fonte prodotto, ma alcune poss
 |---|---|---:|---|
 | R-001 | Un agent esegue push, mutation GitHub o una sequenza che ripristina la stessa `HEAD`, non dimostrabile dal solo postflight. | Alto | Permessi OpenCode minimi, comandi negati, niente `--auto`, test di policy, threat model e possibile isolamento credential/command. |
 | R-002 | Prompt injection nella issue induce azioni vietate o marker falsi. | Alto | Issue come input non fidato, istruzioni di ruolo prioritarie, parser sul solo messaggio assistant terminale e marker exact/anchored. |
-| R-003 | Un coder incontra provider error o timeout dopo modifiche parziali. | Alto | Confronto attempt-level, nessun retry automatico se il target è cambiato, preservazione artifact e nessun rollback. |
+| R-003 | Un coder incontra provider error o timeout dopo modifiche parziali. | Alto | Modifiche parziali confinate alla sandbox disposable e non promosse; retry solo se il target reale è invariato. |
 | R-004 | Un processo figlio sopravvive al timeout e modifica il target dopo il postflight. | Alto | Process group, escalation terminate/kill, termination grace e failure esplicito se la terminazione non è confermata. |
 | R-005 | Un altro processo o run modifica branch/`HEAD` durante la pipeline. | Alto | Assunzione di esclusività, controlli dopo ogni attempt, lock should-have e fallimento safety. |
-| R-006 | Il coder modifica un sibling repository o file workspace fuori target. | Alto | Write scope esplicito, permission policy, reviewer focalizzato sul target; definire enforcement più forte nel system design. |
+| R-006 | Il coder tenta di modificare target reale, sibling repository o file workspace fuori sandbox. | Alto | `--dir` sulla sandbox, path reale non esposto nel prompt, permission boundary OpenCode e clone disposable; resta rischio residuo di escape OS-level. |
+| R-016 | Il coder cancella/reinizializza `.git` o riscrive ref/history. | Critico | Clone disposable con object store indipendente e remoti rimossi; `.git`/top-level/`HEAD` validati prima della promozione; nessun metadata Git promosso. |
 | R-007 | Il formato JSON degli eventi OpenCode cambia. | Medio | Version recording, adapter isolato, fixture per versioni supportate e fail-closed. |
 | R-008 | I modelli/provider free sono instabili o indisponibili. | Medio | Model config esterna, retry bounded, backoff e nessun test automatico legato ai modelli correnti. |
 | R-009 | `gh issue view` usa il repository sbagliato in un workspace multi-repository. | Alto | Issue ref legato al target, cwd o `--repo` esplicito, fallimento su identità ambigua. |
@@ -756,7 +757,7 @@ Queste domande non impediscono l'uso del PRD come fonte prodotto, ma alcune poss
 
 - **AC-001 — CLI:** il comando canonico avvia una issue valida e rifiuta batch o issue non positive.
 - **AC-002 — Config:** selezione `--config`, file convenzionale e default producono una configurazione effettiva deterministica; input invalidi non avviano agenti.
-- **AC-003 — Multi-repo:** in un fixture `workspace/Backend/.git`, architect/reviewer ricevono il workspace, il coder riceve `Backend` come `--dir` mantenendo verificabile la `.opencode/` del workspace, e ogni comando Git/diff riceve `Backend`.
+- **AC-003 — Multi-repo:** in un fixture `workspace/Backend/.git`, architect/reviewer ricevono il workspace, il coder riceve un path sandbox diverso da `Backend` come `--dir` mantenendo verificabile la `.opencode/` del workspace, e Git Safety/reviewer continuano a operare su `Backend`.
 - **AC-004 — Path safety:** target outside-workspace, symlink escape e target non top-level vengono rifiutati.
 - **AC-005 — Dirty preflight:** staged, unstaged e untracked non ignorati causano fallimento prima di OpenCode.
 - **AC-006 — Git shape:** detached HEAD, unborn branch e repository bare vengono rifiutati.
@@ -766,7 +767,7 @@ Queste domande non impediscono l'uso del PRD come fonte prodotto, ma alcune poss
 - **AC-010 — Review limit:** `CHANGES_REQUIRED` all'ultimo ciclo non invoca un nuovo coder e termina `FAILED/REVIEW_CYCLES_EXHAUSTED`.
 - **AC-011 — Provider recovery:** un 429 seguito da successo produce due provider attempt nella stessa phase/cycle e non aggiunge review cycle.
 - **AC-012 — Provider exhaustion:** tutti gli attempt sono registrati e il run termina `FAILED/PROVIDER_ERROR`.
-- **AC-013 — Partial mutation guard:** provider failure del coder dopo una modifica non attiva retry, mantiene outcome `PROVIDER_ERROR`, registra `retry_suppressed_due_to_target_change = true`, non resetta file e segnala la modifica preservata.
+- **AC-013 — Partial mutation guard:** provider/process/protocol failure del coder dopo modifiche nella sandbox non promuove tali modifiche al target reale; il target resta invariato e un retry provider può avvenire solo secondo i guard configurati.
 - **AC-014 — Timeout:** un child con discendenti viene terminato entro la policy configurata; output parziale e `TIMEOUT` vengono registrati con return code nullable.
 - **AC-015 — Process error:** spawn failure ed exit non-zero non-provider producono `PROCESS_ERROR`, non provider retry.
 - **AC-016 — Protocol safety:** marker presenti in issue, prompt, tool event o stderr non sono accettati; marker mancante, duplicato o incompatibile produce `PROTOCOL_ERROR`.
@@ -777,7 +778,7 @@ Queste domande non impediscono l'uso del PRD come fonte prodotto, ma alcune poss
 - **AC-021 — Logging:** retry e review multipli producono file distinti e record coerenti per sequence, phase, role, cycle, attempt, duration, return code, classifier source, retry decision/delay e outcome.
 - **AC-022 — Runtime ignore:** una runtime path interna a un repo ma non ignorata viene rifiutata senza edit automatico; una path ignorata viene usata senza apparire nello status.
 - **AC-023 — Model separation:** nessun comando o config Python contiene i tre model ID sperimentali o passa `--model`; sostituirli lato OpenCode non richiede modifiche Python.
-- **AC-024 — Forbidden actions:** test e code review confermano che Python non costruisce mutazioni Git/GitHub e che prompt/definizioni agent codificano l'allowlist/deny policy richiesta, senza presentarla come sandbox contro un agent ostile.
+- **AC-024 — Forbidden actions:** test e code review confermano che Python non muta GitHub né history/ref del target reale; le sole mutation Git trusted sono quelle necessarie alla sandbox e alla promozione working-tree. Prompt/definizioni agent mantengono l'allowlist/deny policy senza presentare l'isolamento Git come sandbox OS generale.
 - **AC-025 — Final consistency:** ogni run inizializzato produce esattamente un final status coerente con exit code e, quando la persistenza finale riesce, con `run.json`; errori pre-inizializzazione e logging failure seguono le eccezioni esplicite del PRD.
 - **AC-026 — Quality gates:** tutti i test pertinenti, Ruff check, Ruff format check e mypy strict passano con i comandi documentati nel repository.
 - **AC-027 — Compatibility smoke:** è documentato almeno un run disposable contro una versione OpenCode dichiarata supportata, con artifact ispezionati e nessuna pubblicazione automatica.
@@ -856,3 +857,4 @@ Il solo artifact creato da questa attività è `tasks/prd-opencode-tools.md`. No
 - [x] Repository Impact cita come esistenti soltanto path verificati e marca gli altri come proposti.
 - [x] Il PRD è salvato nel percorso canonico `tasks/prd-opencode-tools.md`.
 - [x] Non è stato scritto codice né modificata configurazione di prodotto.
+\n- **AC-037 — Coder Git metadata isolation:** un test distruttivo esegue `rm -rf .git && git init` nella sandbox coder e prova che target `.git`, `HEAD`, commit history e reflog restano intatti; la sandbox corrotta non viene promossa.\n
