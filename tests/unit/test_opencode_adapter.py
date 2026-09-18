@@ -24,9 +24,11 @@ import pytest
 
 from opencode_tools.domain import (
     AgentRole,
+    AgentStatus,
     GitSafetyStatus,
     IssueLocator,
     PersistenceStatus,
+    PipelinePhase,
     ProcessSpec,
     ProviderRetryConfig,
     RepositoryIdentity,
@@ -58,6 +60,13 @@ from opencode_tools.opencode import (
 )
 from opencode_tools.protocol import parse_agent_response
 from opencode_tools.retry import decide_retry
+from opencode_tools.state_machine import (
+    PipelineAction,
+    PipelineState,
+    TransitionEvent,
+    TransitionEventKind,
+    transition,
+)
 
 REPO_ROOT: Final = Path(__file__).resolve().parents[2]
 FIXTURES_ROOT: Final = REPO_ROOT / "tests" / "fixtures" / "opencode" / "1.17.18"
@@ -1023,6 +1032,13 @@ def _text(path: Path) -> str:
             "ses_coder_completed",
             "AGENT_STATUS: COMPLETED",
         ),
+        (
+            # Issue #85: a session that completes more than one message's
+            # text; only the last-to-conclude (by step_finish) is terminal.
+            "coder-intermediate-then-terminal-text.ndjson",
+            "ses_coder_intermediate_then_terminal",
+            "AGENT_STATUS: COMPLETED",
+        ),
         ("coder-failed.ndjson", "ses_coder_failed", "AGENT_STATUS: FAILED"),
         (
             "reviewer-approved-success.ndjson",
@@ -1114,12 +1130,13 @@ def test_decode_run_transport_rejects_the_old_unproven_message_part_updated_enve
     assert exc_info.value.code == "opencode.transport_unknown_event_type"
 
 
-@pytest.mark.parametrize(
-    "event_type", ["step_start", "step_finish", "tool_use", "error"]
-)
+@pytest.mark.parametrize("event_type", ["step_start", "tool_use", "error"])
 def test_decode_run_transport_recognizes_but_excludes_message_lifecycle_events(
     event_type: str,
 ) -> None:
+    # step_finish is deliberately excluded from this table: unlike these
+    # three, its own messageID is semantically load-bearing (issue #85) and
+    # is covered by its own stricter tests below instead.
     lines = [
         json.dumps(
             {"type": event_type, "sessionID": "ses_lifecycle", "part": {"id": "p"}}
@@ -1149,6 +1166,168 @@ def test_decode_run_transport_rejects_a_message_lifecycle_event_with_no_part_obj
     text = json.dumps({"type": "step_start", "sessionID": "ses_no_part"})
     with pytest.raises(ProtocolError) as exc_info:
         decode_run_transport(text)
+    assert exc_info.value.code == "opencode.transport_invalid_event"
+
+
+# --- issue #85: step_finish's part shape is fully validated -----------------
+
+
+@pytest.mark.parametrize(
+    "part",
+    [
+        pytest.param({"id": "p", "messageID": "msg_1"}, id="missing"),
+        pytest.param(
+            {"id": "p", "messageID": "msg_1", "type": "step-start"},
+            id="wrong_lifecycle_type",
+        ),
+        pytest.param({"id": "p", "messageID": "msg_1", "type": "text"}, id="text_type"),
+        pytest.param(
+            {"id": "p", "messageID": "msg_1", "type": 42}, id="wrong_python_type"
+        ),
+    ],
+)
+def test_decode_run_transport_rejects_a_step_finish_event_whose_part_type_is_not_step_finish(
+    part: dict[str, object],
+) -> None:
+    lines = [
+        json.dumps(
+            {
+                "type": "step_finish",
+                "sessionID": "ses_bad_step_finish_type",
+                "part": part,
+            }
+        ),
+        json.dumps(
+            {
+                "type": "text",
+                "sessionID": "ses_bad_step_finish_type",
+                "part": {
+                    "id": "prt_2",
+                    "messageID": "msg_1",
+                    "type": "text",
+                    "text": "AGENT_STATUS: COMPLETED",
+                    "time": {"start": 1, "end": 2},
+                },
+            }
+        ),
+    ]
+    with pytest.raises(ProtocolError) as exc_info:
+        decode_run_transport("\n".join(lines))
+    assert exc_info.value.code == "opencode.transport_invalid_event"
+
+
+def test_decode_run_transport_rejects_a_step_finish_with_wrong_part_type_even_when_the_only_completed_candidate_is_otherwise_clean() -> (
+    None
+):
+    # Mirrors the equivalent messageID test below: a step_finish whose
+    # part.type is wrong must never be silently treated as "no lifecycle
+    # information present", which would let the stream resolve to a
+    # single, unverified candidate exactly the way the pre-#85 adapter did.
+    session = "ses_bad_step_finish_type_sole_candidate"
+    lines = [
+        json.dumps(
+            {
+                "type": "text",
+                "sessionID": session,
+                "part": {
+                    "id": "prt_1",
+                    "messageID": "msg_1",
+                    "type": "text",
+                    "text": "AGENT_STATUS: COMPLETED",
+                    "time": {"start": 1, "end": 2},
+                },
+            }
+        ),
+        json.dumps(
+            {
+                "type": "step_finish",
+                "sessionID": session,
+                # part.type is "step-start", not the real "step-finish" --
+                # a structurally wrong lifecycle event masquerading as the
+                # top-level step_finish event type.
+                "part": {"id": "prt_2", "messageID": "msg_1", "type": "step-start"},
+            }
+        ),
+    ]
+    with pytest.raises(ProtocolError) as exc_info:
+        decode_run_transport("\n".join(lines))
+    assert exc_info.value.code == "opencode.transport_invalid_event"
+
+
+@pytest.mark.parametrize(
+    "part",
+    [
+        pytest.param({"id": "p", "type": "step-finish"}, id="missing"),
+        pytest.param(
+            {"id": "p", "type": "step-finish", "messageID": ""}, id="empty_string"
+        ),
+        pytest.param({"id": "p", "type": "step-finish", "messageID": None}, id="null"),
+        pytest.param(
+            {"id": "p", "type": "step-finish", "messageID": 42}, id="wrong_type"
+        ),
+    ],
+)
+def test_decode_run_transport_rejects_a_step_finish_event_with_no_messageID(
+    part: dict[str, object],
+) -> None:
+    lines = [
+        json.dumps(
+            {"type": "step_finish", "sessionID": "ses_bad_step_finish", "part": part}
+        ),
+        json.dumps(
+            {
+                "type": "text",
+                "sessionID": "ses_bad_step_finish",
+                "part": {
+                    "id": "prt_2",
+                    "messageID": "msg_1",
+                    "type": "text",
+                    "text": "AGENT_STATUS: COMPLETED",
+                    "time": {"start": 1, "end": 2},
+                },
+            }
+        ),
+    ]
+    with pytest.raises(ProtocolError) as exc_info:
+        decode_run_transport("\n".join(lines))
+    assert exc_info.value.code == "opencode.transport_invalid_event"
+
+
+def test_decode_run_transport_rejects_a_step_finish_with_bad_messageID_even_when_the_only_completed_candidate_is_otherwise_clean() -> (
+    None
+):
+    # A step_finish this malformed must never be silently treated as "no
+    # lifecycle information present" -- that would let a stream resolve to
+    # a single, unverified candidate exactly the way the pre-#85 adapter
+    # did, defeating the whole point of trusting step_finish lifecycle
+    # structure at all.
+    session = "ses_bad_step_finish_sole_candidate"
+    lines = [
+        json.dumps(
+            {
+                "type": "text",
+                "sessionID": session,
+                "part": {
+                    "id": "prt_1",
+                    "messageID": "msg_1",
+                    "type": "text",
+                    "text": "AGENT_STATUS: COMPLETED",
+                    "time": {"start": 1, "end": 2},
+                },
+            }
+        ),
+        json.dumps(
+            {
+                "type": "step_finish",
+                "sessionID": session,
+                # messageID missing entirely; part.type is otherwise valid
+                # so this test isolates messageID validation specifically.
+                "part": {"id": "prt_2", "type": "step-finish"},
+            }
+        ),
+    ]
+    with pytest.raises(ProtocolError) as exc_info:
+        decode_run_transport("\n".join(lines))
     assert exc_info.value.code == "opencode.transport_invalid_event"
 
 
@@ -1260,6 +1439,412 @@ def test_decode_run_transport_excludes_a_provider_error_event_from_the_result() 
     with pytest.raises(ProtocolError) as exc_info:
         decode_run_transport(_text(PROVIDER_FIXTURES / "http-429-rate-limit.ndjson"))
     assert exc_info.value.code == "opencode.transport_no_terminal_text"
+
+
+# --- issue #85: intermediate vs. structurally terminal completed text --------
+
+
+def test_decode_run_transport_excludes_intermediate_completed_text_from_the_result() -> (
+    None
+):
+    result = decode_run_transport(
+        _text(RUN_FIXTURES / "coder-intermediate-then-terminal-text.ndjson")
+    )
+    assert "Now I have a clear picture" not in result.terminal_text
+    assert result.terminal_text == (
+        "Implemented the requested module and added regression coverage.\n"
+        "AGENT_STATUS: COMPLETED"
+    )
+
+
+def test_decode_run_transport_resolves_multiple_completed_groups_via_last_step_finish() -> (
+    None
+):
+    session = "ses_lifecycle_resolves"
+    lines = [
+        json.dumps(
+            {
+                "type": "text",
+                "sessionID": session,
+                "part": {
+                    "id": "prt_1",
+                    "messageID": "msg_a",
+                    "type": "text",
+                    "text": "Intermediate summary, not the terminal response.",
+                    "time": {"start": 1, "end": 2},
+                },
+            }
+        ),
+        json.dumps(
+            {
+                "type": "step_finish",
+                "sessionID": session,
+                "part": {"id": "prt_2", "messageID": "msg_a", "type": "step-finish"},
+            }
+        ),
+        json.dumps(
+            {
+                "type": "text",
+                "sessionID": session,
+                "part": {
+                    "id": "prt_3",
+                    "messageID": "msg_b",
+                    "type": "text",
+                    "text": "AGENT_STATUS: COMPLETED",
+                    "time": {"start": 3, "end": 4},
+                },
+            }
+        ),
+        json.dumps(
+            {
+                "type": "step_finish",
+                "sessionID": session,
+                "part": {"id": "prt_4", "messageID": "msg_b", "type": "step-finish"},
+            }
+        ),
+    ]
+    result = decode_run_transport("\n".join(lines))
+    assert result.terminal_text == "AGENT_STATUS: COMPLETED"
+
+
+def test_decode_run_transport_fails_closed_when_the_last_step_finish_message_never_completed_text() -> (
+    None
+):
+    session = "ses_lifecycle_unresolved"
+    lines = [
+        json.dumps(
+            {
+                "type": "text",
+                "sessionID": session,
+                "part": {
+                    "id": "prt_1",
+                    "messageID": "msg_a",
+                    "type": "text",
+                    "text": "AGENT_STATUS: COMPLETED",
+                    "time": {"start": 1, "end": 2},
+                },
+            }
+        ),
+        json.dumps(
+            {
+                "type": "step_finish",
+                "sessionID": session,
+                "part": {"id": "prt_2", "messageID": "msg_a", "type": "step-finish"},
+            }
+        ),
+        json.dumps(
+            {
+                "type": "text",
+                "sessionID": session,
+                "part": {
+                    "id": "prt_3",
+                    "messageID": "msg_b",
+                    "type": "text",
+                    "text": "A second completed candidate.",
+                    "time": {"start": 3, "end": 4},
+                },
+            }
+        ),
+        json.dumps(
+            {
+                "type": "step_finish",
+                "sessionID": session,
+                # The stream's last step_finish belongs to msg_c, which
+                # never completed any text -- still genuinely ambiguous.
+                "part": {"id": "prt_4", "messageID": "msg_c", "type": "step-finish"},
+            }
+        ),
+    ]
+    with pytest.raises(ProtocolError) as exc_info:
+        decode_run_transport("\n".join(lines))
+    assert exc_info.value.code == "opencode.transport_multiple_terminal_candidates"
+
+
+def test_decode_run_transport_fails_closed_on_a_single_candidate_superseded_by_later_lifecycle_activity() -> (
+    None
+):
+    # Edge case closed alongside issue #85: a lone completed candidate is
+    # not automatically terminal just because no *other* completed text
+    # exists. If the stream's last step_finish belongs to a different,
+    # still-textless message, that later step's own conclusion was never
+    # accounted for, so trusting the earlier text as terminal would be a
+    # guess, not a proof -- the pre-fix code returned it unconditionally
+    # whenever `completed_order` held exactly one entry.
+    session = "ses_lifecycle_single_candidate_superseded"
+    lines = [
+        json.dumps(
+            {
+                "type": "text",
+                "sessionID": session,
+                "part": {
+                    "id": "prt_1",
+                    "messageID": "msg_a",
+                    "type": "text",
+                    "text": "AGENT_STATUS: COMPLETED",
+                    "time": {"start": 1, "end": 2},
+                },
+            }
+        ),
+        json.dumps(
+            {
+                "type": "step_finish",
+                "sessionID": session,
+                "part": {"id": "prt_2", "messageID": "msg_a", "type": "step-finish"},
+            }
+        ),
+        json.dumps(
+            {
+                "type": "step_start",
+                "sessionID": session,
+                "part": {"id": "prt_3", "messageID": "msg_b", "type": "step-start"},
+            }
+        ),
+        json.dumps(
+            {
+                "type": "tool_use",
+                "sessionID": session,
+                "part": {
+                    "id": "prt_4",
+                    "messageID": "msg_b",
+                    "type": "tool",
+                    "tool": "bash",
+                    "state": {"status": "completed", "output": "still working"},
+                },
+            }
+        ),
+        json.dumps(
+            {
+                "type": "step_finish",
+                "sessionID": session,
+                # msg_b's step concludes last but msg_b never completed
+                # text: msg_a's earlier completed text must not be trusted
+                # just because it is the sole candidate.
+                "part": {"id": "prt_5", "messageID": "msg_b", "type": "step-finish"},
+            }
+        ),
+    ]
+    with pytest.raises(ProtocolError) as exc_info:
+        decode_run_transport("\n".join(lines))
+    assert exc_info.value.code == "opencode.transport_multiple_terminal_candidates"
+
+
+def test_decode_run_transport_fails_closed_when_trailing_tool_activity_never_concludes() -> (
+    None
+):
+    # Distinct edge case from the "superseded by a later step_finish" test
+    # above: here the trailing activity after msg_a's step_finish never
+    # gets *any* step_finish of its own -- the stream just ends mid-step.
+    # last_step_finish_message_id would still (wrongly) point at msg_a
+    # unless trailing activity is tracked independently of it, since
+    # nothing ever overwrites that pointer. msg_a must not be trusted as
+    # terminal: the stream never proved it was the last word.
+    session = "ses_trailing_tool_activity_never_concludes"
+    lines = [
+        json.dumps(
+            {
+                "type": "text",
+                "sessionID": session,
+                "part": {
+                    "id": "prt_1",
+                    "messageID": "msg_a",
+                    "type": "text",
+                    "text": "AGENT_STATUS: COMPLETED",
+                    "time": {"start": 1, "end": 2},
+                },
+            }
+        ),
+        json.dumps(
+            {
+                "type": "step_finish",
+                "sessionID": session,
+                "part": {"id": "prt_2", "messageID": "msg_a", "type": "step-finish"},
+            }
+        ),
+        json.dumps(
+            {
+                "type": "step_start",
+                "sessionID": session,
+                "part": {"id": "prt_3", "messageID": "msg_b", "type": "step-start"},
+            }
+        ),
+        json.dumps(
+            {
+                "type": "tool_use",
+                "sessionID": session,
+                "part": {
+                    "id": "prt_4",
+                    "messageID": "msg_b",
+                    "type": "tool",
+                    "tool": "bash",
+                    "state": {"status": "completed", "output": "still working"},
+                },
+            }
+        ),
+        # Stream ends here -- no step_finish for msg_b at all.
+    ]
+    with pytest.raises(ProtocolError) as exc_info:
+        decode_run_transport("\n".join(lines))
+    assert exc_info.value.code == "opencode.transport_multiple_terminal_candidates"
+
+
+def test_decode_run_transport_fails_closed_when_trailing_incomplete_text_never_concludes() -> (
+    None
+):
+    # Same gap, triggered by a trailing *text* part instead of a tool call:
+    # an in-progress (no time.end) text update for a different message
+    # after msg_a's step_finish, with the stream ending before that
+    # message ever gets its own step_finish or completes any text.
+    session = "ses_trailing_incomplete_text_never_concludes"
+    lines = [
+        json.dumps(
+            {
+                "type": "text",
+                "sessionID": session,
+                "part": {
+                    "id": "prt_1",
+                    "messageID": "msg_a",
+                    "type": "text",
+                    "text": "AGENT_STATUS: COMPLETED",
+                    "time": {"start": 1, "end": 2},
+                },
+            }
+        ),
+        json.dumps(
+            {
+                "type": "step_finish",
+                "sessionID": session,
+                "part": {"id": "prt_2", "messageID": "msg_a", "type": "step-finish"},
+            }
+        ),
+        json.dumps(
+            {
+                "type": "text",
+                "sessionID": session,
+                "part": {
+                    "id": "prt_3",
+                    "messageID": "msg_b",
+                    "type": "text",
+                    "text": "Still drafting the actual response...",
+                    "time": {"start": 3},  # no "end" -- still in progress
+                },
+            }
+        ),
+        # Stream ends here -- msg_b never completes and never gets a
+        # step_finish either.
+    ]
+    with pytest.raises(ProtocolError) as exc_info:
+        decode_run_transport("\n".join(lines))
+    assert exc_info.value.code == "opencode.transport_multiple_terminal_candidates"
+
+
+def test_decode_run_transport_accepts_trailing_activity_that_concludes_with_its_own_step_finish() -> (
+    None
+):
+    # Contrast case: trailing activity for a *different* message than the
+    # earlier completed one is fine when it goes on to conclude with its
+    # own step_finish and its own completed text -- this is the ordinary
+    # multi-step shape (also covered by the
+    # coder-intermediate-then-terminal-text.ndjson fixture) and must keep
+    # working after the trailing-activity check above was added.
+    session = "ses_trailing_activity_properly_concludes"
+    lines = [
+        json.dumps(
+            {
+                "type": "text",
+                "sessionID": session,
+                "part": {
+                    "id": "prt_1",
+                    "messageID": "msg_a",
+                    "type": "text",
+                    "text": "Now scaffolding the requested change.",
+                    "time": {"start": 1, "end": 2},
+                },
+            }
+        ),
+        json.dumps(
+            {
+                "type": "step_finish",
+                "sessionID": session,
+                "part": {"id": "prt_2", "messageID": "msg_a", "type": "step-finish"},
+            }
+        ),
+        json.dumps(
+            {
+                "type": "step_start",
+                "sessionID": session,
+                "part": {"id": "prt_3", "messageID": "msg_b", "type": "step-start"},
+            }
+        ),
+        json.dumps(
+            {
+                "type": "text",
+                "sessionID": session,
+                "part": {
+                    "id": "prt_4",
+                    "messageID": "msg_b",
+                    "type": "text",
+                    "text": "AGENT_STATUS: COMPLETED",
+                    "time": {"start": 3, "end": 4},
+                },
+            }
+        ),
+        json.dumps(
+            {
+                "type": "step_finish",
+                "sessionID": session,
+                "part": {"id": "prt_5", "messageID": "msg_b", "type": "step-finish"},
+            }
+        ),
+    ]
+    result = decode_run_transport("\n".join(lines))
+    assert result.terminal_text == "AGENT_STATUS: COMPLETED"
+
+
+def test_decode_run_transport_and_parse_agent_response_actually_reach_the_reviewer_phase() -> (
+    None
+):
+    # Regression for issue #85: before the fix, this exact transcript raised
+    # PROTOCOL_ERROR at decode_run_transport and never reached protocol
+    # parsing at all, so the pipeline's own state machine never saw a
+    # CODER_COMPLETED event and could never leave the CODER phase. This
+    # drives the real, pure `state_machine.transition` with the same
+    # agent_status -> TransitionEventKind mapping
+    # `orchestrator._coder_event` applies (response.agent_status is
+    # AgentStatus.COMPLETED -> TransitionEventKind.CODER_COMPLETED),
+    # proving the pipeline actually advances to REVIEWER -- not just that
+    # the marker parses.
+    result = decode_run_transport(
+        _text(RUN_FIXTURES / "coder-intermediate-then-terminal-text.ndjson")
+    )
+    locator = IssueLocator(
+        RepositoryIdentity(
+            host="github.com",
+            owner="octocat",
+            repository="hello-world",
+            source="test",
+        ),
+        number=1,
+    )
+    parsed = parse_agent_response(
+        AgentRole.CODER, result.terminal_text, issue_locator=locator
+    )
+    assert parsed.agent_status is AgentStatus.COMPLETED
+
+    event = (
+        TransitionEvent(kind=TransitionEventKind.CODER_COMPLETED)
+        if parsed.agent_status is AgentStatus.COMPLETED
+        else TransitionEvent(
+            kind=TransitionEventKind.TERMINAL_OUTCOME,
+            outcome=RunOutcome.PROTOCOL_ERROR,
+        )
+    )
+    outcome = transition(
+        PipelineState(phase=PipelinePhase.CODER, review_cycle=1),
+        event,
+        max_review_cycles=3,
+    )
+    assert outcome.state.phase is PipelinePhase.REVIEWER
+    assert outcome.action is PipelineAction.INVOKE_REVIEWER
 
 
 # --- CRLF/CR normalization ----------------------------------------------------

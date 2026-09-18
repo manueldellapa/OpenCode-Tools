@@ -111,6 +111,65 @@ boundary) -- sanitized from and structurally faithful to that capture; no
 existing fixture's bytes changed, and `compatibility_status` remains
 `"supported"`.
 
+**Transport: intermediate completed text no longer rejected as ambiguous
+(issue #85), 2026-09-18.** The first production-like coder run against a
+real target (House-Hold-Hub/Backend#1, run outcome `PROTOCOL_ERROR`, CLI
+exit code 20) surfaced a genuine `1.17.18` session shape
+`decode_run_transport` did not yet handle: the coder process itself exited
+`0` and produced the requested filesystem changes, but the captured
+NDJSON contained two distinct completed `text` `messageID`s -- an
+intermediate one, followed by further `step_start`/`tool_use`/`step_finish`
+activity, then a later, structurally terminal one carrying the canonical
+`AGENT_STATUS: COMPLETED` marker. The adapter previously treated any more
+than one completed `messageID` as unconditionally ambiguous and rejected
+the stream before `protocol.py` ever saw the terminal text, so a valid
+coder invocation could never reach the reviewer phase.
+`src/opencode_tools/opencode.py`'s `decode_run_transport` now derives
+terminality from verified `step_finish` lifecycle structure whenever the
+stream carries at least one such event: the terminal candidate is the
+completed group whose `messageID` matches the *last* `step_finish` event
+observed before the stream ends, and every other completed group is
+excluded as intermediate text -- this applies even when only one
+`messageID` ever completes text, since a later `step_finish` for a
+*different*, still-textless message means that later step's own
+conclusion was never accounted for, so the earlier text cannot be proven
+terminal either -- and that `step_finish` must genuinely be the stream's
+last word. Any recognized message-lifecycle event (`step_start`,
+`tool_use`, `reasoning`, `error`, or `text`, complete or not) observed
+after the last `step_finish` disqualifies it too, even when a stream is
+truncated right after that trailing activity with no further
+`step_finish` at all: the earlier `step_finish`'s own claim to being the
+end of the stream is unproven, so the text it would otherwise point to
+cannot be trusted either. A later `step_finish` clears this and
+re-establishes a new, provisionally trusted boundary -- the ordinary
+multi-step shape `run/coder-intermediate-then-terminal-text.ndjson`
+models keeps working exactly as before. Only when the stream carries no
+`step_finish` event at all is a lone completed candidate trusted without
+this check, matching the adapter's pre-#85 behavior for the many
+hand-authored fixtures that never emit `step_finish` at all. A stream
+that still cannot resolve to exactly one terminal group -- no
+`step_finish` events present with more than one completed candidate, the
+last `step_finish` resolves to a `messageID` with no completed text, or
+unresolved activity trails the last `step_finish` -- continues to fail
+closed with the same `opencode.transport_multiple_terminal_candidates`
+code, exactly preserving the existing
+`malformed/multi-terminal-candidates.ndjson` fixture's behavior. Since
+`step_finish`'s own `messageID` is now load-bearing, a `step_finish`
+event whose `messageID` is missing, `null`, empty, or not a string is
+never silently treated as carrying no lifecycle information (unlike
+`step_start`/`tool_use`/`error`, which stay fully inert regardless of
+their `part` shape) -- it fails closed immediately with
+`opencode.transport_invalid_event`, the same as a malformed `text`
+part. `step_finish`'s `part.type` gets the same scrutiny a `text` part's
+`part.type` already had: it must equal the real `1.17.18` `"step-finish"`
+value exactly, so a missing, wrongly-typed, or lookalike value (e.g. the
+sibling `"step-start"`) fails closed the same way instead of being
+treated as an inert, unrecognized lifecycle event. One new fixture,
+`run/coder-intermediate-then-terminal-text.ndjson`, sanitized from and
+structurally faithful to the real capture, was added; no existing
+fixture's bytes changed, and `compatibility_status` remains
+`"supported"`.
+
 ### Platform baseline
 
 Per ADR-009, only macOS and Linux on a local POSIX filesystem are supported,
