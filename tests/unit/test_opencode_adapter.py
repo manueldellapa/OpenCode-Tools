@@ -1896,17 +1896,12 @@ def test_decode_run_transport_and_parse_agent_response_actually_reach_the_review
 # --- issue #87: incomplete tool-call lifecycle and blank terminal text -------
 
 
-def test_decode_run_transport_rejects_incomplete_tool_call_lifecycle_fixture() -> (
-    None
-):
+def test_decode_run_transport_rejects_incomplete_tool_call_lifecycle_fixture() -> None:
     with pytest.raises(ProtocolError) as exc_info:
         decode_run_transport(
             _text(RUN_FIXTURES / "coder-incomplete-tool-call-lifecycle.ndjson")
         )
-    assert (
-        exc_info.value.code
-        == "opencode.transport_incomplete_tool_call_lifecycle"
-    )
+    assert exc_info.value.code == "opencode.transport_incomplete_tool_call_lifecycle"
     assert exc_info.value.code != "protocol.marker_missing"
 
 
@@ -1999,10 +1994,7 @@ def test_decode_run_transport_rejects_nonblank_text_when_final_reason_is_tool_ca
     ]
     with pytest.raises(ProtocolError) as exc_info:
         decode_run_transport("\n".join(lines))
-    assert (
-        exc_info.value.code
-        == "opencode.transport_incomplete_tool_call_lifecycle"
-    )
+    assert exc_info.value.code == "opencode.transport_incomplete_tool_call_lifecycle"
 
 
 def test_decode_run_transport_accepts_intermediate_tool_calls_then_terminal_stop() -> (
