@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 import time
@@ -11,6 +12,7 @@ from pathlib import Path
 import pytest
 
 from opencode_tools.coder_sandbox import (
+    CoderSandbox,
     CoderSandboxError,
     cleanup_coder_sandbox,
     prepare_coder_sandbox,
@@ -36,7 +38,7 @@ def _git(args: list[str], *, cwd: Path) -> str:
         capture_output=True,
         text=True,
         env={
-            **__import__("os").environ,
+            **os.environ,
             "GIT_AUTHOR_NAME": "Test",
             "GIT_AUTHOR_EMAIL": "test@example.com",
             "GIT_COMMITTER_NAME": "Test",
@@ -62,9 +64,8 @@ def _repository(tmp_path: Path) -> tuple[Path, TargetRepository]:
 
 
 def _prepare(
-    root: Path,
     target: TargetRepository,
-):
+) -> tuple[Path, RealClock, SubprocessRunner, CoderSandbox]:
     git = shutil.which("git")
     assert git is not None
     clock = RealClock()
@@ -85,7 +86,7 @@ def test_coder_sandbox_promotes_only_working_tree_delta(tmp_path: Path) -> None:
     original_head = _git(["rev-parse", "HEAD"], cwd=root)
     original_count = _git(["rev-list", "--count", "HEAD"], cwd=root)
 
-    git, clock, runner, sandbox = _prepare(root, target)
+    git, clock, runner, sandbox = _prepare(target)
     try:
         assert sandbox.root != root
         assert (sandbox.root / ".git").is_dir()
@@ -122,7 +123,7 @@ def test_destroying_and_reinitializing_sandbox_git_cannot_damage_target(
     original_head = _git(["rev-parse", "HEAD"], cwd=root)
     original_log = _git(["log", "--oneline", "--decorate"], cwd=root)
 
-    git, clock, runner, sandbox = _prepare(root, target)
+    git, clock, runner, sandbox = _prepare(target)
     try:
         shutil.rmtree(sandbox.root / ".git")
         _git(["init", "--quiet", "--initial-branch=main"], cwd=sandbox.root)
@@ -150,7 +151,7 @@ def test_destroying_and_reinitializing_sandbox_git_cannot_damage_target(
 def test_target_drift_blocks_sandbox_promotion(tmp_path: Path) -> None:
     root, target = _repository(tmp_path)
 
-    git, clock, runner, sandbox = _prepare(root, target)
+    git, clock, runner, sandbox = _prepare(target)
     try:
         (sandbox.root / "README.md").write_text("coder change\n", encoding="utf-8")
         (root / "README.md").write_text("external change\n", encoding="utf-8")
