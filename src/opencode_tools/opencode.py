@@ -468,10 +468,11 @@ def decode_run_transport(text: str) -> TransportResult:
 
     Applies, in order (System Design SS9.2/SS10.5, ADR-002/ADR-005): CRLF/CR
     normalization only; bounded NDJSON line splitting; per-line JSON
-    validity and an allowed event-type/session-ID check; grouping completed
-    `text` events' `part.text` by `messageID` (last write for a given ID
-    wins), with `step_start`, `tool_use`, `reasoning`, `error`, and
-    `session.error` events excluded entirely from the result.
+    validity and an allowed event-type/session-ID check; grouping completed,
+    non-blank `text` events' `part.text` by `messageID` (last completed
+    write for a given ID wins, while a later whitespace-only completed write
+    invalidates that candidate), with `step_start`, `tool_use`, `reasoning`,
+    `error`, and `session.error` events excluded entirely from the result.
 
     Terminality is derived from verified `step_finish` lifecycle structure
     whenever the stream carries at least one such event (System Design
@@ -490,11 +491,15 @@ def decode_run_transport(text: str) -> TransportResult:
     activity's own conclusion is unaccounted for, so the `step_finish`
     before it cannot be trusted as the stream's true end, and neither can
     whatever text it would otherwise have pointed to -- even when that
-    text is the only one that ever completed. Only when the stream carries
-    no `step_finish` event at all does a lone completed group get trusted
-    outright; with no such event, more than one completed group stays
-    ambiguous. Missing terminal text or an unresolved ambiguous candidate
-    are both `ProtocolError`. This never searches for a marker itself --
+    text is the only one that ever completed. A final `step_finish` whose
+    reason is the OpenCode 1.17.18 non-terminal `"tool-calls"` conclusion is
+    rejected explicitly as an incomplete tool-call lifecycle, even if a
+    completed non-blank text exists for that message. Only when the stream
+    carries no `step_finish` event at all does a lone completed non-blank
+    group get trusted outright; with no such event, more than one completed
+    group stays ambiguous. Missing terminal text, an incomplete tool-call
+    lifecycle, or an unresolved ambiguous candidate are all
+    `ProtocolError`. This never searches for a marker itself --
     that is `protocol.py`'s job on the single string this function
     returns.
     """
@@ -510,6 +515,7 @@ def decode_run_transport(text: str) -> TransportResult:
     completed_text_by_message: dict[str, str] = {}
     completed_order: list[str] = []
     last_step_finish_message_id: str | None = None
+    last_step_finish_reason: str | None = None
     activity_after_last_step_finish = False
 
     for line in lines:
@@ -598,7 +604,16 @@ def decode_run_transport(text: str) -> TransportResult:
                     "opencode.transport_invalid_event",
                     "A step_finish event is missing a non-empty messageID.",
                 )
+            step_finish_reason = part.get("reason")
+            if step_finish_reason is not None and (
+                not isinstance(step_finish_reason, str) or not step_finish_reason
+            ):
+                raise ProtocolError(
+                    "opencode.transport_invalid_event",
+                    "A step_finish event has an invalid reason.",
+                )
             last_step_finish_message_id = step_finish_message_id
+            last_step_finish_reason = step_finish_reason
             activity_after_last_step_finish = False
             continue
 
@@ -631,9 +646,28 @@ def decode_run_transport(text: str) -> TransportResult:
         time_info = part.get("time")
         is_complete = isinstance(time_info, dict) and "end" in time_info
         if is_complete:
+            if not text_value.strip():
+                # A completed blank/whitespace-only text is not proof of a
+                # terminal assistant response (issue #87). Preserve the
+                # existing last-write-wins rule for a messageID by removing
+                # any earlier completed candidate for the same message too.
+                if message_id in completed_text_by_message:
+                    del completed_text_by_message[message_id]
+                    completed_order.remove(message_id)
+                continue
             if message_id not in completed_text_by_message:
                 completed_order.append(message_id)
             completed_text_by_message[message_id] = text_value
+
+    if (
+        last_step_finish_message_id is not None
+        and not activity_after_last_step_finish
+        and last_step_finish_reason == "tool-calls"
+    ):
+        raise ProtocolError(
+            "opencode.transport_incomplete_tool_call_lifecycle",
+            "opencode run ended after a non-terminal tool-call lifecycle conclusion.",
+        )
 
     if not completed_order:
         raise ProtocolError(
