@@ -345,12 +345,12 @@ def test_a_full_approved_pipeline_renders_exit_zero_and_one_final_status_line(
     assert "staged=0 unstaged=0 untracked=0" in captured.err
 
 
-def test_multi_repo_pipeline_runs_only_the_coder_in_the_git_target(
+def test_multi_repo_pipeline_runs_coder_in_disposable_sandbox(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """Regression for #88: a nested Git target is the coder OpenCode
-    directory, while architect/reviewer keep the workspace context and the
-    workspace-owned .opencode directory is explicitly pinned for the coder."""
+    """Regression for #88/#90: architect/reviewer keep workspace context,
+    while the coder runs in an isolated clone and retains the workspace-owned
+    OpenCode control plane."""
 
     workspace = tmp_path / "workspace"
     workspace.mkdir()
@@ -434,7 +434,10 @@ def test_multi_repo_pipeline_runs_only_the_coder_in_the_git_target(
     ]
     assert run_contexts[0]["cwd"] == str(workspace.resolve())
     assert run_contexts[0]["config_dir"] is None
-    assert run_contexts[1]["cwd"] == str(target.resolve())
+    coder_cwd = Path(run_contexts[1]["cwd"])
+    assert coder_cwd != target.resolve()
+    assert coder_cwd.name == "target"
+    assert coder_cwd.parent.name.startswith("opencode-tools-coder-sandbox-")
     assert run_contexts[1]["config_dir"] == str(workspace.resolve() / ".opencode")
     assert run_contexts[2]["cwd"] == str(workspace.resolve())
     assert run_contexts[2]["config_dir"] is None
@@ -445,7 +448,7 @@ def test_multi_repo_pipeline_runs_only_the_coder_in_the_git_target(
     )
     assert (
         Path(record["attempts"][1]["agent_result"]["process"]["cwd"])
-        == target.resolve()
+        == coder_cwd
     )
     assert (
         Path(record["attempts"][2]["agent_result"]["process"]["cwd"])
