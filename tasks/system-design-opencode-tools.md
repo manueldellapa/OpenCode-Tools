@@ -138,7 +138,7 @@ Le OQ-001–OQ-010 sono chiuse esplicitamente in §21. I rischi R-001–R-015 so
 | FR-002 — una sola issue | `cli` | singolo argomento scalare; liste/range non hanno grammatica valida | negative CLI; AC-001 |
 | FR-003 — workspace e target separati | `cli`, `domain` | `Workspace` e `TargetRepository` distinti, entrambi canonicali | path/component test; AC-003–004 |
 | FR-004 — target relativo, contained e Git root | `cli`, `git_safety` | `resolve(strict=True)`, controllo per parent, `git -C … rev-parse --show-toplevel` | temp FS, symlink escape, nested repo; AC-004, AC-006 |
-| FR-005 — workspace per OpenCode, target per Git | `orchestrator`, adapter | `--dir <workspace>`; ogni argv Git contiene `-C <target>` | fake command assertions; AC-003 |
+| FR-005 — contesto OpenCode role-specific, target per Git | `orchestrator`, adapter | architect/reviewer `--dir <workspace>`; coder `--dir <target>` con config workspace pinned; ogni argv Git contiene `-C <target>` | fake command assertions; AC-003 |
 | FR-006 — TOML/default/`--config` | `config` | `tomllib`, lookup convenzionale, precedence documentata | config unit/golden; AC-002 |
 | FR-007 — tutti i limiti configurabili | `config` | value object per execution/retry/runtime | boundary tests; AC-002, AC-014 |
 | FR-008 — limiti/chiavi validi e finiti | `config`, `errors` | schema chiuso, `math.isfinite`, range espliciti, bool esclusi dai numeri | invalid TOML matrix; AC-002, AC-026 |
@@ -210,7 +210,7 @@ Le OQ-001–OQ-010 sono chiuse esplicitamente in §21. I rischi R-001–R-015 so
 |---|---|---|---|
 | AC-001 — CLI singola issue | `cli`, domain | tre input e issue positiva scalare | CLI positive/negative |
 | AC-002 — config deterministica | `config` | precedence explicit/conventional/default, schema chiuso | TOML golden/invalid matrix |
-| AC-003 — multi-repo | orchestrator, OpenCode/Git adapter | workspace a `--dir`, target a ogni `git -C` | temp `workspace/Backend` + command capture |
+| AC-003 — multi-repo | orchestrator, OpenCode/Git adapter | workspace a architect/reviewer `--dir`; target a coder `--dir` e a ogni `git -C`; config workspace pinned nel coder | temp `workspace/Backend` + command/context capture |
 | AC-004 — path safety | domain, `git_safety` | canonical containment e root equality | outside/symlink/nested fixtures |
 | AC-005 — dirty preflight | `git_safety` | status `-z` clean obbligatorio | staged/unstaged/untracked repos |
 | AC-006 — Git shape | `git_safety` | non-bare, branch attached, commit resolvibile | detached/unborn/bare repos |
@@ -601,18 +601,25 @@ SH-001 viene incluso in v0.1 perché riusa lo stesso meccanismo: `SIGINT`/`SIGTE
 
 ### 10.3 Command building OpenCode
 
-Il command builder v0.1 produce esattamente:
+Il command builder v0.1 produce un contesto role-specific:
 
 ```text
+# architect / reviewer
 <absolute-opencode> run
-  --agent <architect|coder|reviewer>
+  --agent <architect|reviewer>
   --format json
   --dir <absolute-workspace>
+
+# coder
+<absolute-opencode> run
+  --agent coder
+  --format json
+  --dir <absolute-target>
 ```
 
-Il prompt completo viene scritto su stdin e il child riceve anche `cwd = workspace`. La duplicazione intenzionale fra `cwd` e `--dir` elimina dipendenze dal cwd del chiamante e rende esplicito il contesto. Non vengono mai passati `--auto`, `--share`, `--model`, `--continue`, `--session`, `--fork`, `--attach` o opzioni provider. Ogni invocation crea quindi una sessione indipendente; handoff e feedback viaggiano nei prompt trusted delimitati (FR-009, FR-016, FR-019, FR-022).
+Il prompt completo viene scritto su stdin e il child riceve sempre `cwd` uguale al valore di `--dir`. La duplicazione intenzionale elimina dipendenze dal cwd del chiamante e rende esplicito il contesto. Non vengono mai passati `--auto`, `--share`, `--model`, `--continue`, `--session`, `--fork`, `--attach` o opzioni provider. Ogni invocation crea quindi una sessione indipendente; handoff e feedback viaggiano nei prompt trusted delimitati (FR-009, FR-016, FR-019, FR-022).
 
-L'environment child è una copia non persistita dell'environment corrente con `OPENCODE_AUTO_SHARE=false` e `OPENCODE_DISABLE_AUTOUPDATE=true` forzati dall'adapter versionato. Il preflight rifiuta inoltre una config effettiva OpenCode con sharing automatico. Questo non seleziona né duplica modelli: questi restano nei file agent.
+L'environment child è una copia non persistita dell'environment corrente con `OPENCODE_AUTO_SHARE=false` e `OPENCODE_DISABLE_AUTOUPDATE=true` forzati dall'adapter versionato. Quando il coder usa un target annidato, l'adapter forza inoltre `OPENCODE_CONFIG_DIR=<workspace>/.opencode`: il target resta il project/worktree operativo, ma le definizioni agent/config revisionate del workspace restano disponibili senza ampliare `external_directory`. Il preflight verifica sia il control-plane del workspace sia quello effettivo del target con lo stesso override e combina entrambi nel digest; il recheck prima di ogni invocation deve riprodurre lo stesso digest. Se `target == workspace`, nessun override aggiuntivo viene impostato e il comportamento resta invariato. Il preflight rifiuta inoltre una config effettiva OpenCode con sharing automatico. Questo non seleziona né duplica modelli: questi restano nei file agent.
 
 ### 10.4 Compatibilità iniziale e capability preflight
 
@@ -1214,7 +1221,7 @@ Ogni fake conserva le call per asserire ordine, cwd, argv, stdin, timeout e asse
 - `SubprocessRunner` con helper child locali: stdout/stderr concorrenti, descendant, TERM-resistant process, spawn failure, partial output e termination unconfirmed simulata al boundary;
 - spawn failure ed exit non-zero non-provider producono esplicitamente `PROCESS_ERROR` senza retry (AC-015);
 - repository Git reali sotto `tempfile`: clean, staged, unstaged, untracked, ignored, detached, unborn, bare, nested/symlink escape, branch/HEAD drift e Git probe timeout/failure;
-- workspace con `Backend` e `Frontend` per provare `--dir workspace` contro `git -C target`;
+- workspace con `Backend` e `Frontend` per provare architect/reviewer su `--dir workspace`, coder su `--dir target` con `OPENCODE_CONFIG_DIR` del workspace, contro `git -C target`;
 - mutation architect/reviewer, coder partial mutation, staged/untracked inventory e preservation;
 - mutation esterna fra due checkpoint, durante backoff o control-plane recheck, rilevata prima dello spawn successivo;
 - runtime ignored/unignored, mode POSIX, collisioni, ultima JSON valida e log write failure;
