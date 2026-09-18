@@ -449,7 +449,7 @@ def build_coder_prompt(
     sections.append(
         _section(
             "Policy",
-            f"You only edit files in the working tree at the target path above and leave every change uncommitted for this program (or a human) to handle afterward. You must never do any of the following:\n{policy_lines}",
+            f"You only edit files in the current working directory described above and leave every change uncommitted for this program (or a human) to handle afterward. You must never do any of the following:\n{policy_lines}",
         )
     )
 
