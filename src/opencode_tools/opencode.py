@@ -44,6 +44,24 @@ _ENVIRONMENT_OVERRIDES: dict[str, str] = {
     "OPENCODE_DISABLE_AUTOUPDATE": "true",
 }
 
+
+def _environment_overrides(*, config_directory: Path | None = None) -> dict[str, str]:
+    """Return the versioned child environment for one OpenCode context.
+
+    A nested coder target deliberately changes OpenCode project/worktree
+    discovery. OPENCODE_CONFIG_DIR pins the workspace-owned .opencode
+    directory back into that target context so the exact agent definitions
+    validated by preflight remain available without widening
+    external_directory permissions (GitHub issue #88).
+    """
+
+    overrides = dict(_ENVIRONMENT_OVERRIDES)
+    if config_directory is not None:
+        if not config_directory.is_absolute():
+            raise ValueError("config_directory must be absolute")
+        overrides["OPENCODE_CONFIG_DIR"] = str(config_directory)
+    return overrides
+
 _PRIMARY_ROLES: tuple[AgentRole, ...] = (
     AgentRole.ARCHITECT,
     AgentRole.CODER,
@@ -354,21 +372,33 @@ def build_run_spec(
     prompt: str,
     workspace: Workspace,
     *,
+    target_root: Path,
     timeout_seconds: float,
     termination_grace_seconds: float,
 ) -> ProcessSpec:
-    """Build the exact `opencode run` invocation for `role` (System Design
-    SS10.3).
+    """Build one exact OpenCode run invocation for the requested role.
 
-    Produces exactly `<executable> run --agent <role> --format json --dir
-    <workspace>` with one absolute executable path and no other flags.
-    `prompt` reaches the child only through stdin, so it can never appear in
-    argv, shell history, or a process listing; `cwd` is also set to
-    `workspace.root`, duplicating `--dir` deliberately so the invocation
-    never depends on the caller's own cwd. Every call therefore starts an
-    independent OpenCode session -- there is no `--continue`/`--session`
-    that could attach it to a prior one.
+    Architect and reviewer keep the workspace as their OpenCode context.
+    The coder instead runs inside the resolved Git target, so its shell/edit
+    boundary matches the repository it is allowed to change. When that
+    target is nested below the workspace, OPENCODE_CONFIG_DIR explicitly
+    points at the workspace-owned .opencode directory. This preserves the
+    reviewed project-local agent/config control plane even though --dir
+    moved to the target (GitHub issue #88).
+
+    The prompt reaches the child only through stdin. cwd deliberately
+    matches --dir, removing any dependency on the caller cwd. Every call
+    starts an independent OpenCode session.
     """
+
+    if not target_root.is_absolute():
+        raise ValueError("target_root must be absolute")
+    run_directory = target_root if role is AgentRole.CODER else workspace.root
+    config_directory = (
+        workspace.root / ".opencode"
+        if role is AgentRole.CODER and target_root != workspace.root
+        else None
+    )
 
     argv = (
         str(executable),
@@ -378,17 +408,19 @@ def build_run_spec(
         "--format",
         "json",
         "--dir",
-        str(workspace.root),
+        str(run_directory),
     )
     check_no_forbidden_flags(argv)
 
     return ProcessSpec(
         argv=argv,
-        cwd=workspace.root,
+        cwd=run_directory,
         stdin=prompt,
         timeout_seconds=timeout_seconds,
         termination_grace_seconds=termination_grace_seconds,
-        environment_overrides=_ENVIRONMENT_OVERRIDES,
+        environment_overrides=_environment_overrides(
+            config_directory=config_directory
+        ),
     )
 
 
@@ -871,6 +903,7 @@ def _run_utility(
     cwd: Path,
     timeout_seconds: float,
     termination_grace_seconds: float,
+    config_directory: Path | None = None,
 ) -> tuple[ProcessResult, _BoundedCapturingSink]:
     spec = ProcessSpec(
         argv=(str(executable), *argv_tail),
@@ -878,7 +911,9 @@ def _run_utility(
         stdin=None,
         timeout_seconds=timeout_seconds,
         termination_grace_seconds=termination_grace_seconds,
-        environment_overrides=_ENVIRONMENT_OVERRIDES,
+        environment_overrides=_environment_overrides(
+            config_directory=config_directory
+        ),
     )
     sink = _BoundedCapturingSink(
         path=Path(log_name), max_bytes=_UTILITY_OUTPUT_LIMIT_BYTES
@@ -1260,6 +1295,8 @@ def _fetch_raw_control_plane(
     workspace: Workspace,
     utility_timeout_seconds: float,
     termination_grace_seconds: float,
+    cwd: Path | None = None,
+    config_directory: Path | None = None,
 ) -> tuple[dict[str, object], dict[AgentRole, dict[str, object]]]:
     """Fetch and JSON-parse `debug config` and the three `debug agent` calls.
 
@@ -1268,14 +1305,19 @@ def _fetch_raw_control_plane(
     it for a pure digest comparison without re-running full validation.
     """
 
+    effective_cwd = workspace.root if cwd is None else cwd
+    if not effective_cwd.is_absolute():
+        raise ValueError("control-plane cwd must be absolute")
+
     config_result, config_sink = _run_utility(
         process_runner,
         executable,
         ("debug", "config"),
         log_name="preflight-debug-config.log",
-        cwd=workspace.root,
+        cwd=effective_cwd,
         timeout_seconds=utility_timeout_seconds,
         termination_grace_seconds=termination_grace_seconds,
+        config_directory=config_directory,
     )
     _require_process_succeeded(
         config_result,
@@ -1303,9 +1345,10 @@ def _fetch_raw_control_plane(
             executable,
             ("debug", "agent", token),
             log_name=f"preflight-debug-agent-{token}.log",
-            cwd=workspace.root,
+            cwd=effective_cwd,
             timeout_seconds=utility_timeout_seconds,
             termination_grace_seconds=termination_grace_seconds,
+            config_directory=config_directory,
         )
         _require_process_succeeded(
             agent_result,
@@ -1328,11 +1371,73 @@ def _fetch_raw_control_plane(
     return config, agents
 
 
+def _validated_control_plane_digest(
+    process_runner: ProcessRunner,
+    executable: Path,
+    *,
+    workspace: Workspace,
+    target_root: Path,
+    utility_timeout_seconds: float,
+    termination_grace_seconds: float,
+) -> str:
+    """Validate and digest every effective OpenCode context used by a run.
+
+    The workspace context remains authoritative for architect/reviewer. A
+    nested coder target gets a second independently validated context whose
+    OPENCODE_CONFIG_DIR points back to the workspace .opencode directory.
+    Combining both digests prevents preflight from validating one control
+    plane while the coder executes under another.
+    """
+
+    workspace_config, workspace_agents = _fetch_raw_control_plane(
+        process_runner,
+        executable,
+        workspace=workspace,
+        utility_timeout_seconds=utility_timeout_seconds,
+        termination_grace_seconds=termination_grace_seconds,
+    )
+    check_debug_config(workspace_config)
+    for role in _PRIMARY_ROLES:
+        check_debug_agent(role, workspace_agents[role])
+    workspace_digest = compute_control_plane_digest(
+        config=workspace_config, agents=workspace_agents
+    )
+
+    if target_root == workspace.root:
+        return workspace_digest
+    if not target_root.is_absolute():
+        raise ValueError("target_root must be absolute")
+
+    target_config, target_agents = _fetch_raw_control_plane(
+        process_runner,
+        executable,
+        workspace=workspace,
+        cwd=target_root,
+        config_directory=workspace.root / ".opencode",
+        utility_timeout_seconds=utility_timeout_seconds,
+        termination_grace_seconds=termination_grace_seconds,
+    )
+    check_debug_config(target_config)
+    for role in _PRIMARY_ROLES:
+        check_debug_agent(role, target_agents[role])
+    target_digest = compute_control_plane_digest(
+        config=target_config, agents=target_agents
+    )
+
+    canonical = json.dumps(
+        {"workspace": workspace_digest, "coder_target": target_digest},
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
+
+
 def run_preflight(
     process_runner: ProcessRunner,
     *,
     executable: Path,
     workspace: Workspace,
+    target_root: Path | None = None,
     utility_timeout_seconds: float,
     termination_grace_seconds: float,
 ) -> ControlPlaneEvidence:
@@ -1389,17 +1494,15 @@ def run_preflight(
     )
     check_run_help_capability(help_text)
 
-    config, agents = _fetch_raw_control_plane(
+    effective_target = workspace.root if target_root is None else target_root
+    digest = _validated_control_plane_digest(
         process_runner,
         executable,
         workspace=workspace,
+        target_root=effective_target,
         utility_timeout_seconds=utility_timeout_seconds,
         termination_grace_seconds=termination_grace_seconds,
     )
-    check_debug_config(config)
-    for role in _PRIMARY_ROLES:
-        check_debug_agent(role, agents[role])
-    digest = compute_control_plane_digest(config=config, agents=agents)
 
     return ControlPlaneEvidence(
         version=version, executable=executable, control_plane_digest=digest
@@ -1411,6 +1514,7 @@ def recheck_control_plane(
     *,
     executable: Path,
     workspace: Workspace,
+    target_root: Path | None = None,
     utility_timeout_seconds: float,
     termination_grace_seconds: float,
     expected_digest: str,
@@ -1424,11 +1528,13 @@ def recheck_control_plane(
     back to `PreflightError` (ADR-005, System Design SS18.2).
     """
 
+    effective_target = workspace.root if target_root is None else target_root
     try:
-        config, agents = _fetch_raw_control_plane(
+        digest = _validated_control_plane_digest(
             process_runner,
             executable,
             workspace=workspace,
+            target_root=effective_target,
             utility_timeout_seconds=utility_timeout_seconds,
             termination_grace_seconds=termination_grace_seconds,
         )
@@ -1439,7 +1545,6 @@ def recheck_control_plane(
             causes=(error,),
         ) from None
 
-    digest = compute_control_plane_digest(config=config, agents=agents)
     if digest != expected_digest:
         raise ProtocolError(
             "opencode.control_plane_drift",
