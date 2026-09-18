@@ -86,6 +86,15 @@ _CODER_POLICY_PROHIBITIONS: tuple[str, ...] = (
     ),
 )
 
+
+_CODER_COMPLETION_REMINDER = (
+    "Once all required acceptance criteria have been implemented and verified, "
+    "stop further optional exploration, summarize the required verification, "
+    "and immediately report `AGENT_STATUS: COMPLETED`. If any required criterion "
+    "remains unresolved or required verification fails, report "
+    "`AGENT_STATUS: FAILED` instead."
+)
+
 _MARKER_GRAMMAR_NOTES: tuple[str, ...] = (
     (
         "Write the marker line exactly as shown above: at column zero, with no "
@@ -450,6 +459,13 @@ def build_coder_prompt(
         _section(
             "Policy",
             f"You only edit files in the current working directory described above and leave every change uncommitted for this program (or a human) to handle afterward. You must never do any of the following:\n{policy_lines}",
+        )
+    )
+
+    sections.append(
+        _section(
+            "Completion reminder",
+            _CODER_COMPLETION_REMINDER,
         )
     )
 

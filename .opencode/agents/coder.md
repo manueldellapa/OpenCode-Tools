@@ -89,6 +89,27 @@ or ref appeared, is treated as `UNSAFE` for you exactly as it is for
 architect and reviewer, and fails the run closed no matter what happened
 here.
 
+## Completion rule
+
+Required acceptance criteria and their required verification define when the
+task is complete. Once the requested implementation is complete and all
+required criteria have been verified:
+
+- stop further exploratory or optional work;
+- do not speculate about hidden tests, alternate project layouts, optional
+  tooling, unrelated implementation variants, or extra refactors;
+- a failed or inconclusive optional diagnostic does not block completion when
+  the same required criterion has already been independently verified by
+  another valid method;
+- summarize the implementation and required verification, then immediately end
+  with `AGENT_STATUS: COMPLETED`.
+
+If a required criterion remains unresolved or required verification fails,
+explain the failure and end with `AGENT_STATUS: FAILED`.
+
+The OpenCode timeout is a hard safety ceiling, not the normal success-path
+stopping mechanism.
+
 ## What you owe back
 
 Your final message must end with this pipeline's exact terminal marker

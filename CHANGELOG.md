@@ -7,6 +7,18 @@ loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- CODER over-exploration after successful required verification (issue #95):
+  the static coder definition and every generated coder prompt now contain an
+  explicit acceptance-criteria stop condition. Once required work and required
+  verification are complete, the coder must stop speculative exploration,
+  summarize, and immediately emit `AGENT_STATUS: COMPLETED`. Optional
+  diagnostics cannot block completion when the same required criterion was
+  already independently verified; unresolved required criteria or failed
+  required verification still require `AGENT_STATUS: FAILED`. The documented
+  OpenCode timeout remains an unchanged hard safety ceiling, and protocol
+  parsing, sandbox isolation, Git safety, promotion validation, provider retry,
+  and fail-closed timeout behavior are untouched.
+
 - Incomplete OpenCode tool-call lifecycle accepted as terminal (issue #87):
   `decode_run_transport` now rejects a final OpenCode 1.17.18
   `step_finish(reason="tool-calls")` at EOF with the dedicated

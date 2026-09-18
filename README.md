@@ -110,6 +110,18 @@ root = ".opencode-tools"
 repository = "github.com/example/backend"
 ```
 
+
+`opencode_timeout_seconds` is a **hard safety ceiling**, not the expected way a
+successful CODER run ends. Once the requested implementation is complete and all
+required acceptance criteria have been verified, the CODER is expected to stop
+exploratory work, summarize the required verification, and emit
+`AGENT_STATUS: COMPLETED` immediately. It must not spend the remaining timeout
+budget speculating about hidden tests, alternate layouts, optional tooling, or
+unrelated variants. A failed or inconclusive optional diagnostic does not block
+completion when the same required criterion has already been independently
+verified by another valid method. Conversely, an unresolved required criterion
+or failed required verification still requires `AGENT_STATUS: FAILED`.
+
 Every field above is optional and shown at its own default; `[runtime]
 root` defaults to `.opencode-tools` relative to the workspace and may be
 relative or absolute. `[github.targets."<target>"]` is keyed by the
