@@ -345,6 +345,117 @@ def test_a_full_approved_pipeline_renders_exit_zero_and_one_final_status_line(
     assert "staged=0 unstaged=0 untracked=0" in captured.err
 
 
+def test_multi_repo_pipeline_runs_only_the_coder_in_the_git_target(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Regression for #88: a nested Git target is the coder OpenCode
+    directory, while architect/reviewer keep the workspace context and the
+    workspace-owned .opencode directory is explicitly pinned for the coder."""
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / ".opencode").mkdir()
+    target = workspace / "Backend"
+    _clean_repo(target)
+
+    runtime_root = tmp_path / "runtime"
+    config_path = tmp_path / "opencode-tools.toml"
+    _config_file(
+        config_path,
+        runtime_root=runtime_root,
+        target_workspace_relative="Backend",
+    )
+
+    monkeypatch.setenv("PATH", _shim_path(tmp_path / "bin"))
+    monkeypatch.delenv("OPENCODE_CONFIG_DIR", raising=False)
+    _set_opencode_debug_fixtures(monkeypatch)
+    monkeypatch.setenv(
+        "FAKE_OPENCODE_RUN_OUTPUT_FILES",
+        os.pathsep.join(
+            str(RUN_FIXTURES / name)
+            for name in (
+                "architect-ready-success.ndjson",
+                "coder-completed-success.ndjson",
+                "reviewer-approved-success.ndjson",
+            )
+        ),
+    )
+    monkeypatch.setenv(
+        "FAKE_OPENCODE_RUN_OUTPUT_INDEX_FILE", str(tmp_path / "run-output-index")
+    )
+    monkeypatch.setenv(
+        "FAKE_OPENCODE_EXPORT_FILES",
+        os.pathsep.join(
+            str(EXPORT_FIXTURES / name)
+            for name in (
+                "architect-correct-agent.json",
+                "coder-correct-agent.json",
+                "reviewer-correct-agent.json",
+            )
+        ),
+    )
+    monkeypatch.setenv(
+        "FAKE_OPENCODE_EXPORT_INDEX_FILE", str(tmp_path / "export-index")
+    )
+    context_log = tmp_path / "opencode-contexts.jsonl"
+    monkeypatch.setenv("FAKE_OPENCODE_CONTEXT_LOG_FILE", str(context_log))
+
+    exit_code = main(
+        [
+            "run",
+            "--workspace",
+            str(workspace),
+            "--target",
+            "Backend",
+            "--issue",
+            "42",
+            "--config",
+            str(config_path),
+        ]
+    )
+
+    assert exit_code == 0
+    run_json_paths = list(runtime_root.rglob("run.json"))
+    assert len(run_json_paths) == 1
+    record = json.loads(run_json_paths[0].read_text(encoding="utf-8"))
+    assert record["final_status"] == "APPROVED"
+    assert Path(record["workspace"]["root"]) == workspace.resolve()
+    assert Path(record["target"]["root"]) == target.resolve()
+
+    contexts = [
+        json.loads(line)
+        for line in context_log.read_text(encoding="utf-8").splitlines()
+    ]
+    run_contexts = [item for item in contexts if item["argv"][:2] == ["run", "--agent"]]
+    assert [item["argv"][2] for item in run_contexts] == [
+        "architect",
+        "coder",
+        "reviewer",
+    ]
+    assert run_contexts[0]["cwd"] == str(workspace.resolve())
+    assert run_contexts[0]["config_dir"] is None
+    assert run_contexts[1]["cwd"] == str(target.resolve())
+    assert run_contexts[1]["config_dir"] == str(workspace.resolve() / ".opencode")
+    assert run_contexts[2]["cwd"] == str(workspace.resolve())
+    assert run_contexts[2]["config_dir"] is None
+
+    assert (
+        Path(record["attempts"][0]["agent_result"]["process"]["cwd"])
+        == workspace.resolve()
+    )
+    assert (
+        Path(record["attempts"][1]["agent_result"]["process"]["cwd"])
+        == target.resolve()
+    )
+    assert (
+        Path(record["attempts"][2]["agent_result"]["process"]["cwd"])
+        == workspace.resolve()
+    )
+
+    captured = capsys.readouterr()
+    assert captured.out == "FINAL_STATUS: APPROVED\n"
+
+
 # --- AC-001: single positive issue accepted; batch/non-positive rejected ---
 
 

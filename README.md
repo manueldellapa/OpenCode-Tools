@@ -46,10 +46,12 @@ opencode-tools run --workspace <path> --target <path-or-.> --issue <N> [--config
 `python -m opencode_tools run ...` is equivalent (see `pyproject.toml`'s
 `[project.scripts]` entry and `src/opencode_tools/__main__.py`).
 
-- `--workspace`: the directory OpenCode runs in as its working context. Must
-  already exist.
+- `--workspace`: the shared OpenCode workspace. Architect and reviewer run
+  with this directory as their context; it also owns the project-local
+  `.opencode/` control plane. Must already exist.
 - `--target`: the Git repository the coder edits and the reviewer
-  inspects, given as `.` or a path relative to `--workspace`. After
+  inspects, given as `.` or a path relative to `--workspace`. The coder
+  runs with this resolved repository as its OpenCode `--dir`. After
   resolving symlinks it must stay inside the workspace and be the top level
   of a non-bare Git working tree, on an attached branch, with a clean index
   and working tree (no staged, unstaged, or non-ignored untracked changes) --
@@ -60,10 +62,14 @@ opencode-tools run --workspace <path> --target <path-or-.> --issue <N> [--config
   conventional `<workspace>/opencode-tools.toml` is used when present,
   otherwise built-in defaults apply.
 
-Workspace and target are deliberately distinct: OpenCode is always invoked
-with the workspace as its context directory, while every Git/diff operation
-names the target explicitly. In the common case they are the same
-directory (`--target .`); they can differ for a multi-repository workspace.
+Workspace and target are deliberately distinct. Architect and reviewer use
+the workspace as their OpenCode context, while the coder uses the resolved
+target so its shell/edit boundary matches the Git repository it may change.
+For a nested target, OpenCode Tools pins `OPENCODE_CONFIG_DIR` to the
+workspace-owned `.opencode/` directory and verifies that effective target
+control plane before the coder can run. Every Git/diff operation continues
+to name the target explicitly. In the common case (`--target .`) workspace
+and target are identical and behavior is unchanged.
 
 ## Configuration
 

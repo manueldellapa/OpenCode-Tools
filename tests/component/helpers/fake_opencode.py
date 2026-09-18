@@ -31,6 +31,12 @@ scenario:
 - `FAKE_OPENCODE_STDERR`: extra text written to stderr for any call.
 - `FAKE_OPENCODE_CALL_LOG_FILE`: path this process appends one line of
   space-joined argv to, so tests can assert call count/order/content.
+- `FAKE_OPENCODE_CONTEXT_LOG_FILE`: optional JSONL log containing argv,
+  cwd, and OPENCODE_CONFIG_DIR for assertions about role-specific context.
+- `FAKE_OPENCODE_TARGET_DEBUG_CONFIG_FILE` and
+  `FAKE_OPENCODE_TARGET_DEBUG_AGENT_<ROLE>_FILE`: optional overrides used
+  when OPENCODE_CONFIG_DIR is present, so tests can make the nested-target
+  control plane differ from the workspace control plane.
 - `FAKE_OPENCODE_SLEEP_SECONDS`: blocks for this many seconds before
   responding to any call, for exercising a deadline miss.
 
@@ -55,6 +61,7 @@ without disturbing any scenario that only ever sets the static ones:
 
 from __future__ import annotations
 
+import json
 import os
 import sys
 import time
@@ -69,6 +76,29 @@ def _log_call(argv: list[str]) -> None:
     if log_path:
         with open(log_path, "a", encoding="utf-8") as log_file:
             log_file.write(" ".join(argv) + "\n")
+
+    context_log_path = os.environ.get("FAKE_OPENCODE_CONTEXT_LOG_FILE")
+    if context_log_path:
+        with open(context_log_path, "a", encoding="utf-8") as context_log:
+            context_log.write(
+                json.dumps(
+                    {
+                        "argv": argv,
+                        "cwd": os.getcwd(),
+                        "config_dir": os.environ.get("OPENCODE_CONFIG_DIR"),
+                    },
+                    sort_keys=True,
+                )
+                + "\n"
+            )
+
+
+def _contextual_debug_file(base_env: str, *, target_env: str) -> str | None:
+    if os.environ.get("OPENCODE_CONFIG_DIR"):
+        target_file = os.environ.get(target_env)
+        if target_file:
+            return target_file
+    return os.environ.get(base_env)
 
 
 def _echo_file(path: str) -> None:
@@ -109,11 +139,18 @@ def main(argv: list[str]) -> int:
     elif argv[:2] == ["run", "--help"]:
         sys.stdout.write(os.environ.get("FAKE_OPENCODE_RUN_HELP", _DEFAULT_RUN_HELP))
     elif argv == ["debug", "config"]:
-        config_file = os.environ.get("FAKE_OPENCODE_DEBUG_CONFIG_FILE")
+        config_file = _contextual_debug_file(
+            "FAKE_OPENCODE_DEBUG_CONFIG_FILE",
+            target_env="FAKE_OPENCODE_TARGET_DEBUG_CONFIG_FILE",
+        )
         if config_file:
             _echo_file(config_file)
     elif len(argv) == 3 and argv[0] == "debug" and argv[1] == "agent":
-        agent_file = os.environ.get(f"FAKE_OPENCODE_DEBUG_AGENT_{argv[2].upper()}_FILE")
+        role = argv[2].upper()
+        agent_file = _contextual_debug_file(
+            f"FAKE_OPENCODE_DEBUG_AGENT_{role}_FILE",
+            target_env=f"FAKE_OPENCODE_TARGET_DEBUG_AGENT_{role}_FILE",
+        )
         if agent_file:
             _echo_file(agent_file)
     elif argv and argv[0] == "run":

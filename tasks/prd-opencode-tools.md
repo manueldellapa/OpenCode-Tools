@@ -309,7 +309,7 @@ Questi identificativi sono esempi operativi, non requisiti di prodotto. Devono v
 **Acceptance Criteria:**
 
 - [ ] Gli agenti sono definiti nel workspace come `.opencode/agents/architect.md`, `coder.md` e `reviewer.md` e sono invocabili come agenti primari.
-- [ ] Python invoca `opencode run --agent <ruolo> --format json --dir <workspace>` senza `--model`, `--share` o `--auto`.
+- [ ] Python invoca `opencode run --agent <ruolo> --format json --dir <contesto>` senza `--model`, `--share` o `--auto`: architect/reviewer usano il workspace, il coder usa il target; su target annidato il coder conserva la `.opencode/` del workspace tramite `OPENCODE_CONFIG_DIR`.
 - [ ] La configurazione agent contiene modello e permessi; la configurazione Python contiene solo parametri di orchestrazione.
 - [ ] Sostituire tutti e tre i model ID validi non richiede modifiche né ai moduli Python né al file TOML dell'orchestratore.
 - [ ] Un agent mancante, disabilitato o risolto in fallback a un ruolo diverso causa preflight o protocol error fail-closed.
@@ -324,7 +324,7 @@ Questi identificativi sono esempi operativi, non requisiti di prodotto. Devono v
 - **FR-002:** Ogni invocation deve gestire esattamente una issue; liste, range e batch devono essere rifiutati.
 - **FR-003:** Workspace e target devono essere risolti, canonicalizzati e conservati come concetti separati.
 - **FR-004:** In v0.1 il target deve essere `.` o un percorso relativo che, dopo la risoluzione dei symlink, resta dentro il workspace e coincide con il top-level di un working tree Git non bare.
-- **FR-005:** OpenCode deve essere eseguito con il workspace come directory di contesto; ogni operazione Git/diff deve indicare esplicitamente il target.
+- **FR-005:** Architect e reviewer devono essere eseguiti con il workspace come directory di contesto; il coder deve essere eseguito con il target come directory di contesto. Se il target è annidato, il control-plane `.opencode/` del workspace deve restare esplicitamente disponibile e verificato. Ogni operazione Git/diff deve indicare esplicitamente il target.
 - **FR-006:** La configurazione deve essere letta con `tomllib` e validata prima degli agenti. `--config` seleziona il file; se omesso si usa `<workspace>/opencode-tools.toml` quando presente, altrimenti default documentati. Override di singoli valori non sono richiesti in v0.1.
 - **FR-007:** Devono essere configurabili `max_review_cycles`, timeout OpenCode, timeout dei processi utility, termination grace, numero massimo di provider attempt, delay iniziale, moltiplicatore, delay massimo e `runtime_root`.
 - **FR-008:** I limiti devono essere finiti e positivi dove richiesto; valori o chiavi invalidi devono produrre un config error fail-closed.
@@ -592,7 +592,7 @@ Per ogni invocation in `ARCHITECT`, `CODER` o `REVIEWER`, un provider error retr
 ### 7.4 Processo e retry
 
 - Le invocazioni devono usare argomenti strutturati con `shell=False`, evitando interpolazione di issue text o path in una shell. Il comando registrato deve sostituire il prompt con un placeholder sanitizzato; il system design deve scegliere il canale meno esposto supportato da OpenCode per il contenuto privato.
-- Il comando concettuale è `opencode run --agent <role> --format json --dir <workspace> <prompt>`; il dettaglio dell'API subprocess e del trasporto prompt appartiene al system design.
+- Il comando concettuale è `opencode run --agent <role> --format json --dir <workspace|target> <prompt>`: architect/reviewer usano il workspace, coder il target; il dettaglio dell'API subprocess, del trasporto prompt e del pinning della config appartiene al system design.
 - stdout e stderr devono essere drenati senza deadlock e conservati nel log del singolo attempt.
 - La classificazione del singolo attempt deve essere deterministica: timeout; trusted provider error; exit code non-zero/process error; protocol parser; agent/review status. A livello pipeline non esiste un `primary_failure` che schiaccia le altre dimensioni: `trigger_outcome`, `git_safety_status` e `persistence_status` restano campi separati, mentre la timeline causale è ordinata per sequence number. Git safety o logging error forzano sempre il final failure.
 - Un riferimento a 429/502 o rate limiting in issue, assistant text o tool output non autorizza un retry. Solo canali di errore coperti da fixture per la versione OpenCode sono attendibili.
@@ -756,7 +756,7 @@ Queste domande non impediscono l'uso del PRD come fonte prodotto, ma alcune poss
 
 - **AC-001 — CLI:** il comando canonico avvia una issue valida e rifiuta batch o issue non positive.
 - **AC-002 — Config:** selezione `--config`, file convenzionale e default producono una configurazione effettiva deterministica; input invalidi non avviano agenti.
-- **AC-003 — Multi-repo:** in un fixture `workspace/Backend/.git`, OpenCode riceve il workspace e ogni comando Git/diff riceve `Backend`.
+- **AC-003 — Multi-repo:** in un fixture `workspace/Backend/.git`, architect/reviewer ricevono il workspace, il coder riceve `Backend` come `--dir` mantenendo verificabile la `.opencode/` del workspace, e ogni comando Git/diff riceve `Backend`.
 - **AC-004 — Path safety:** target outside-workspace, symlink escape e target non top-level vengono rifiutati.
 - **AC-005 — Dirty preflight:** staged, unstaged e untracked non ignorati causano fallimento prima di OpenCode.
 - **AC-006 — Git shape:** detached HEAD, unborn branch e repository bare vengono rifiutati.

@@ -47,6 +47,7 @@ from opencode_tools.domain import (
     PersistenceStatus,
     PipelinePhase,
     ProcessResult,
+    ProcessSpec,
     ProviderDiagnostic,
     ProviderRetryConfig,
     RepositoryIdentity,
@@ -785,12 +786,15 @@ _ARCHITECT_EXPORT_JSON = (
 
 def _agent_runner(
     scripts: list[tuple[bytes, ProcessResult]],
+    *,
+    target_root: Path = Path("/workspace"),
 ) -> tuple[_CliAgentRunner, _ScriptedProcessRunner]:
 
     process_runner = _ScriptedProcessRunner(scripts)
     runner = _CliAgentRunner(
         cast("ProcessRunner", process_runner),
         executable=Path("/usr/bin/opencode"),
+        target_root=target_root,
         opencode_timeout_seconds=30,
         utility_timeout_seconds=10,
         termination_grace_seconds=2,
@@ -836,12 +840,55 @@ def test_agent_runner_parses_a_successful_architect_response(tmp_path: Path) -> 
     assert result.provider_diagnostic is None
 
 
+def test_agent_runner_runs_coder_in_target_and_pins_workspace_config(
+    tmp_path: Path,
+) -> None:
+    rate_limit_bytes = (
+        Path(__file__).resolve().parents[1]
+        / "fixtures"
+        / "opencode"
+        / "1.17.18"
+        / "provider"
+        / "http-429-rate-limit.ndjson"
+    ).read_bytes()
+    workspace = Workspace(root=tmp_path / "workspace")
+    target_root = workspace.root / "Backend"
+    runner, process_runner = _agent_runner(
+        [
+            (
+                rate_limit_bytes,
+                _process_result(
+                    stdout_bytes=rate_limit_bytes, outcome=RunOutcome.SUCCEEDED
+                ),
+            )
+        ],
+        target_root=target_root,
+    )
+
+    runner.run(
+        AgentRole.CODER,
+        "prompt",
+        workspace,
+        review_cycle=1,
+        provider_attempt=1,
+        sink=_RecordingSink(path=Path("coder.log")),
+    )
+
+    spec = cast("ProcessSpec", process_runner.specs[0])
+    assert spec.cwd == target_root
+    assert spec.argv[-2:] == ("--dir", str(target_root))
+    assert spec.environment_overrides["OPENCODE_CONFIG_DIR"] == str(
+        workspace.root / ".opencode"
+    )
+
+
 def test_agent_runner_raises_when_issue_locator_is_not_bound(tmp_path: Path) -> None:
 
     process_runner = _ScriptedProcessRunner([])
     runner = _CliAgentRunner(
         cast("ProcessRunner", process_runner),
         executable=Path("/usr/bin/opencode"),
+        target_root=tmp_path,
         opencode_timeout_seconds=30,
         utility_timeout_seconds=10,
         termination_grace_seconds=2,
