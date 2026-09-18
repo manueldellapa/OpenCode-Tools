@@ -170,6 +170,28 @@ structurally faithful to the real capture, was added; no existing
 fixture's bytes changed, and `compatibility_status` remains
 `"supported"`.
 
+**Transport: non-terminal tool-call EOF is rejected before protocol parsing
+(issue #87), 2026-09-18.** A real OpenCode `1.17.18` coder invocation
+exited with status `0` even though its final lifecycle shape was
+`step_start -> tool_use(status=error) -> text(" ", completed) ->
+step_finish(reason="tool-calls") -> EOF`. The issue #85 lifecycle rule
+correctly matched the completed text's `messageID` to the final
+`step_finish`, but it did not yet distinguish a non-terminal tool-call
+conclusion from a genuine terminal assistant response; the whitespace-only
+text therefore reached `protocol.py` and failed later as
+`protocol.marker_missing`. `decode_run_transport` now excludes completed
+text whose value is empty after `.strip()`, invalidates an earlier
+candidate for the same `messageID` if a later completed write is blank,
+and rejects a final canonical `reason="tool-calls"` conclusion with
+`opencode.transport_incomplete_tool_call_lifecycle`. The check is applied
+at EOF only to the final lifecycle conclusion: ordinary multi-step streams
+with intermediate `tool-calls` conclusions followed by a later terminal
+`step_finish(reason="stop")` continue to decode successfully. The new
+`run/coder-incomplete-tool-call-lifecycle.ndjson` fixture is sanitized
+from the observed structure and records this negative compatibility case;
+no existing fixture bytes changed and `compatibility_status` remains
+`"supported"`.
+
 ### Platform baseline
 
 Per ADR-009, only macOS and Linux on a local POSIX filesystem are supported,
