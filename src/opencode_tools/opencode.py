@@ -62,6 +62,7 @@ def _environment_overrides(*, config_directory: Path | None = None) -> dict[str,
         overrides["OPENCODE_CONFIG_DIR"] = str(config_directory)
     return overrides
 
+
 _PRIMARY_ROLES: tuple[AgentRole, ...] = (
     AgentRole.ARCHITECT,
     AgentRole.CODER,
@@ -418,9 +419,7 @@ def build_run_spec(
         stdin=prompt,
         timeout_seconds=timeout_seconds,
         termination_grace_seconds=termination_grace_seconds,
-        environment_overrides=_environment_overrides(
-            config_directory=config_directory
-        ),
+        environment_overrides=_environment_overrides(config_directory=config_directory),
     )
 
 
@@ -911,9 +910,7 @@ def _run_utility(
         stdin=None,
         timeout_seconds=timeout_seconds,
         termination_grace_seconds=termination_grace_seconds,
-        environment_overrides=_environment_overrides(
-            config_directory=config_directory
-        ),
+        environment_overrides=_environment_overrides(config_directory=config_directory),
     )
     sink = _BoundedCapturingSink(
         path=Path(log_name), max_bytes=_UTILITY_OUTPUT_LIMIT_BYTES
