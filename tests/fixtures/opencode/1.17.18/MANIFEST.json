@@ -86,6 +86,14 @@
         "affected_fixtures": [
           "run/coder-intermediate-then-terminal-text.ndjson"
         ]
+      },
+      {
+        "date": "2026-09-18",
+        "authored_for": "OpenCode-Tools GitHub issue #87",
+        "reason": "A real OpenCode 1.17.18 coder run exited 0 after step_start -> failed tool_use -> completed whitespace-only text -> step_finish(reason='tool-calls') -> EOF. The transport decoder previously accepted the blank text because its messageID matched the final step_finish, then application-protocol parsing failed later as protocol.marker_missing. decode_run_transport now excludes completed text whose value is blank after strip(), preserves last-write-wins by invalidating an earlier candidate for the same messageID when a later completed write is blank, and treats a final canonical reason='tool-calls' lifecycle conclusion as explicitly non-terminal with opencode.transport_incomplete_tool_call_lifecycle. Intermediate tool-calls conclusions followed by a later genuine terminal step remain valid. One sanitized negative run fixture was added; no existing fixture bytes changed.",
+        "affected_fixtures": [
+          "run/coder-incomplete-tool-call-lifecycle.ndjson"
+        ]
       }
     ]
   },
@@ -121,6 +129,14 @@
       "role": "coder",
       "sha256": "02d80447f4251e44697b138a796edf9055662e8ec443bf03914b1a171296dbe1",
       "description": "Sanitized, structurally faithful reproduction of a genuine OpenCode 1.17.18 coder session (issue #85, House-Hold-Hub/Backend#1) that completes two distinct messageID text groups: an intermediate completed text (msg_1) followed by further step_start/tool_use/step_finish activity on a second message (msg_2) that never completes text, then a third message (msg_3) whose completed text carries the canonical AGENT_STATUS: COMPLETED marker and whose step_finish is the last event in the stream. Only msg_3's text must be returned as the terminal assistant text."
+    },
+    {
+      "path": "run/coder-incomplete-tool-call-lifecycle.ndjson",
+      "category": "run-transcript",
+      "kind": "negative",
+      "role": "coder",
+      "sha256": "5c3ebd370ecd6f2ecef75d8237038b483a5958c87d8ef738f955bdbd84b204d0",
+      "description": "Sanitized OpenCode 1.17.18 regression fixture for issue #87: a coder step starts, a tool_use ends in status=error, a completed text contains only whitespace, and the final step_finish carries reason='tool-calls' before EOF. The decoder must reject the stream at the transport layer with opencode.transport_incomplete_tool_call_lifecycle; the whitespace-only text must never become terminal assistant text."
     },
     {
       "path": "run/coder-failed.ndjson",
