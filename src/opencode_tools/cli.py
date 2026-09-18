@@ -655,7 +655,9 @@ class _CliAgentRunner:
             capture = opencode_adapter.open_run_capture_sink(
                 f"{role.value.lower()}-{cycle_component}-{provider_attempt}-capture"
             )
-            process_result = self._process_runner.run(spec, sink=_TeeSink(sink, capture))
+            process_result = self._process_runner.run(
+                spec, sink=_TeeSink(sink, capture)
+            )
 
             stdout_bytes = capture.bytes_for("stdout")
             stdout_text = _decode_utf8_lenient(stdout_bytes)
@@ -680,9 +682,7 @@ class _CliAgentRunner:
                         transport.terminal_text,
                         issue_locator=self._issue_locator,
                     )
-                    verified_agent = self._verify_identity(
-                        role, workspace, session_id
-                    )
+                    verified_agent = self._verify_identity(role, workspace, session_id)
                     if verified_agent is None:
                         terminal_response = None
 
@@ -711,10 +711,7 @@ class _CliAgentRunner:
                 except coder_sandbox.CoderSandboxError as error:
                     sink.write(
                         "stderr",
-                        (
-                            "coder sandbox promotion blocked: "
-                            f"{error}\n"
-                        ).encode(),
+                        (f"coder sandbox promotion blocked: {error}\n").encode(),
                         self._clock.now(),
                     )
                     terminal_response = None
@@ -723,9 +720,7 @@ class _CliAgentRunner:
             provider_error = provider_diagnostic is not None
             process_error = process_result.outcome in _PROCESS_ERROR_LIKE_OUTCOMES
             higher_precedence_signal = timed_out or provider_error or process_error
-            protocol_error = (
-                not higher_precedence_signal and terminal_response is None
-            )
+            protocol_error = not higher_precedence_signal and terminal_response is None
             agent_reported_failure = (
                 not higher_precedence_signal
                 and terminal_response is not None
