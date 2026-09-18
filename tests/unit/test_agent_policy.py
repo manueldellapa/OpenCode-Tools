@@ -206,7 +206,9 @@ def test_agent_definition_permission_matches_the_reviewed_baseline(
 
 
 @pytest.mark.parametrize("token", _ROLE_TOKENS)
-def test_agent_definition_uses_role_invariants_input_output_sections(token: str) -> None:
+def test_agent_definition_uses_role_invariants_input_output_sections(
+    token: str,
+) -> None:
     _, body = _load_agent_definition(token)
     for heading in ("## Role", "## Invariants", "## Input", "## Output"):
         assert heading in body
