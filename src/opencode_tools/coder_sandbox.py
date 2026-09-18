@@ -389,22 +389,29 @@ def promote_coder_changes(
             "The coder sandbox Git top-level changed unexpectedly."
         )
 
-    _, head_raw = _run_git(
-        process_runner,
-        git_executable=git_executable,
-        cwd=sandbox.root,
-        argv_tail=(
-            "-C",
-            str(sandbox.root),
-            "rev-parse",
-            "--verify",
-            "HEAD^{commit}",
-        ),
-        timeout_seconds=utility_timeout_seconds,
-        termination_grace_seconds=termination_grace_seconds,
-        log_name="coder-sandbox-verify-head.log",
-    )
-    if _single_line(head_raw, field_name="HEAD") != sandbox.baseline_head:
+    try:
+        _, head_raw = _run_git(
+            process_runner,
+            git_executable=git_executable,
+            cwd=sandbox.root,
+            argv_tail=(
+                "-C",
+                str(sandbox.root),
+                "rev-parse",
+                "--verify",
+                "HEAD^{commit}",
+            ),
+            timeout_seconds=utility_timeout_seconds,
+            termination_grace_seconds=termination_grace_seconds,
+            log_name="coder-sandbox-verify-head.log",
+        )
+        sandbox_head = _single_line(head_raw, field_name="HEAD")
+    except CoderSandboxError as error:
+        raise CoderSandboxError(
+            "The coder sandbox HEAD is missing or invalid; no changes were promoted.",
+            process_result=error.process_result,
+        ) from None
+    if sandbox_head != sandbox.baseline_head:
         raise CoderSandboxError(
             "The coder changed sandbox HEAD; no changes were promoted."
         )
