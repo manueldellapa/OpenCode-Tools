@@ -154,8 +154,7 @@ def test_nested_target_preflight_validates_the_actual_coder_context(
     assert len(target_debug) == 4
     assert all(item["config_dir"] is None for item in workspace_debug)
     assert all(
-        item["config_dir"] == str(workspace_root / ".opencode")
-        for item in target_debug
+        item["config_dir"] == str(workspace_root / ".opencode") for item in target_debug
     )
 
 
