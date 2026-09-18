@@ -45,7 +45,14 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Protocol, cast, runtime_checkable
 
-from opencode_tools import __version__, coder_sandbox, git_safety, github, locking, runlog
+from opencode_tools import (
+    __version__,
+    coder_sandbox,
+    git_safety,
+    github,
+    locking,
+    runlog,
+)
 from opencode_tools import opencode as opencode_adapter
 from opencode_tools.config import (
     build_run_request,
@@ -561,7 +568,7 @@ class _CliAgentRunner:
         timestamp = self._clock.now()
         sink.write(
             "stderr",
-            f"coder sandbox failure: {message}\n".encode("utf-8"),
+            f"coder sandbox failure: {message}\n".encode(),
             timestamp,
         )
         empty_sha = hashlib.sha256(b"").hexdigest()
@@ -707,7 +714,7 @@ class _CliAgentRunner:
                         (
                             "coder sandbox promotion blocked: "
                             f"{error}\n"
-                        ).encode("utf-8"),
+                        ).encode(),
                         self._clock.now(),
                     )
                     terminal_response = None
