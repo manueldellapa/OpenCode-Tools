@@ -446,10 +446,7 @@ def test_multi_repo_pipeline_runs_coder_in_disposable_sandbox(
         Path(record["attempts"][0]["agent_result"]["process"]["cwd"])
         == workspace.resolve()
     )
-    assert (
-        Path(record["attempts"][1]["agent_result"]["process"]["cwd"])
-        == coder_cwd
-    )
+    assert Path(record["attempts"][1]["agent_result"]["process"]["cwd"]) == coder_cwd
     assert (
         Path(record["attempts"][2]["agent_result"]["process"]["cwd"])
         == workspace.resolve()
