@@ -426,9 +426,7 @@ def test_multi_repo_pipeline_runs_only_the_coder_in_the_git_target(
         json.loads(line)
         for line in context_log.read_text(encoding="utf-8").splitlines()
     ]
-    run_contexts = [
-        item for item in contexts if item["argv"][:2] == ["run", "--agent"]
-    ]
+    run_contexts = [item for item in contexts if item["argv"][:2] == ["run", "--agent"]]
     assert [item["argv"][2] for item in run_contexts] == [
         "architect",
         "coder",
@@ -441,9 +439,18 @@ def test_multi_repo_pipeline_runs_only_the_coder_in_the_git_target(
     assert run_contexts[2]["cwd"] == str(workspace.resolve())
     assert run_contexts[2]["config_dir"] is None
 
-    assert Path(record["attempts"][0]["agent_result"]["process"]["cwd"]) == workspace.resolve()
-    assert Path(record["attempts"][1]["agent_result"]["process"]["cwd"]) == target.resolve()
-    assert Path(record["attempts"][2]["agent_result"]["process"]["cwd"]) == workspace.resolve()
+    assert (
+        Path(record["attempts"][0]["agent_result"]["process"]["cwd"])
+        == workspace.resolve()
+    )
+    assert (
+        Path(record["attempts"][1]["agent_result"]["process"]["cwd"])
+        == target.resolve()
+    )
+    assert (
+        Path(record["attempts"][2]["agent_result"]["process"]["cwd"])
+        == workspace.resolve()
+    )
 
     captured = capsys.readouterr()
     assert captured.out == "FINAL_STATUS: APPROVED\n"
