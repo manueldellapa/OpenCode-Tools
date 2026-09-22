@@ -202,9 +202,7 @@ def test_coder_prompt_has_concise_completion_reminder() -> None:
         "\n\nWhen you are done", 1
     )[0]
 
-    assert (
-        "current tree already satisfies the required acceptance criteria" in reminder
-    )
+    assert "current tree already satisfies the required acceptance criteria" in reminder
     assert "make changes only for a concrete gap" in reminder
     assert "with or without changes" in reminder
     assert "stop optional exploration" in reminder
