@@ -22,6 +22,12 @@
       "git merge *": "deny",
       "git rebase": "deny",
       "git rebase *": "deny",
+      "git cherry-pick": "deny",
+      "git cherry-pick *": "deny",
+      "git revert": "deny",
+      "git revert *": "deny",
+      "git am": "deny",
+      "git am *": "deny",
       "git reset": "deny",
       "git reset *": "deny",
       "git clean": "deny",
@@ -85,7 +91,8 @@ directly or indirectly:
 - no branch creation, rename, or deletion with `git branch`,
   `git checkout -b`, `git switch -c`, or equivalents;
 - no `git push`, including force push;
-- no `git merge`, `git rebase`, or `git reset`;
+- no `git merge`, `git rebase`, `git cherry-pick`, `git revert`, `git am`,
+  or `git reset`;
 - no `git clean` or `git stash`;
 - no `git restore`, including path-level working-tree restoration;
 - no destructive `git checkout` or `git switch` that discards changes or
