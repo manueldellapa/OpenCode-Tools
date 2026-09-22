@@ -243,6 +243,25 @@ def test_architect_and_reviewer_bodies_state_they_are_read_only(token: str) -> N
     assert "must not edit" in lowered
 
 
+def test_architect_body_has_stop_and_already_satisfied_handoff_contract() -> None:
+    _, body = _load_agent_definition("architect")
+    lowered = " ".join(body.lower().split())
+
+    assert "enough evidence" in lowered
+    assert "concrete, safe coder handoff" in lowered
+    assert "stop optional repository exploration" in lowered
+    assert "speculative context" in lowered
+    assert "already appear to satisfy the issue" in lowered
+    assert "do not claim that the issue is complete" in lowered
+    assert "verify the acceptance criteria first" in lowered
+    assert "avoid changes unless" in lowered
+    assert "concrete gap" in lowered
+    assert "branch ancestry" in lowered
+    assert "inspect remotes" in lowered
+    assert "compare commits" in lowered
+    assert "git remains forbidden" in lowered
+
+
 def test_reviewer_body_states_it_never_fetches_anything_itself() -> None:
     _, body = _load_agent_definition("reviewer")
     lowered = body.lower()
