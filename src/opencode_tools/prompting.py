@@ -424,8 +424,8 @@ def build_coder_prompt(
             "the following as the final line of your response:",
             (
                 (
-                    "  AGENT_STATUS: COMPLETED   (you made your intended "
-                    "changes; the body may be empty)"
+                    "  AGENT_STATUS: COMPLETED   (required criteria are verified, "
+                    "with or without changes; the body may be empty)"
                 ),
                 (
                     "  AGENT_STATUS: FAILED      (you could not; requires a "
