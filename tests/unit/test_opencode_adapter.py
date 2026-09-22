@@ -597,11 +597,21 @@ def test_check_debug_agent_rejects_a_malformed_permission_rule_entry() -> None:
     assert exc_info.value.code == "opencode.debug_agent_invalid"
 
 
-def test_check_debug_agent_rejects_coder_restore_being_reallowed_late() -> None:
+@pytest.mark.parametrize(
+    "late_allow_pattern",
+    (
+        "git restore README.md",
+        "git add -A",
+        "git cherry-pick deadbeef",
+    ),
+)
+def test_check_debug_agent_rejects_narrow_late_coder_overrides(
+    late_allow_pattern: str,
+) -> None:
     agent = _fixture_json("debug/agent-coder-baseline.json")
     permission = cast(list[dict[str, object]], agent["permission"])
     permission.append(
-        {"permission": "bash", "action": "allow", "pattern": "git restore *"}
+        {"permission": "bash", "action": "allow", "pattern": late_allow_pattern}
     )
 
     with pytest.raises(PreflightError) as exc_info:
