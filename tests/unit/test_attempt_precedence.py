@@ -260,6 +260,7 @@ def _agent_result(
     terminal_response: ParsedAgentResponse | None = None,
     provider_diagnostic: ProviderDiagnostic | None = None,
     outcome: RunOutcome = RunOutcome.SUCCEEDED,
+    identity_verification_error_code: str | None = None,
 ) -> AgentResult:
     return AgentResult(
         role=role,
@@ -269,9 +270,14 @@ def _agent_result(
         process=process if process is not None else _agent_process_result(),
         terminal_response=terminal_response,
         session_id="session-001",
-        verified_agent=role.value.lower(),
+        verified_agent=(
+            None
+            if identity_verification_error_code is not None
+            else role.value.lower()
+        ),
         provider_diagnostic=provider_diagnostic,
         outcome=outcome,
+        identity_verification_error_code=identity_verification_error_code,
     )
 
 
@@ -2024,6 +2030,48 @@ def test_run_provider_attempts_retries_a_trusted_error_then_recovers() -> None:
     assert first_persisted_attempt.agent_result.provider_diagnostic.signature == (
         diagnostic.signature
     )
+
+
+def test_run_provider_attempts_does_not_retry_identity_verification_failure() -> None:
+    sleeper = RecordingSleeper()
+    orchestrator, _run_store, agent_runner, _git_safety, _opencode_preflight = (
+        _orchestrator(
+            call_log=[],
+            sink=RecordingAttemptLogSink(),
+            agent_result=_agent_result(
+                role=AgentRole.CODER,
+                review_cycle=1,
+                provider_attempt=1,
+                terminal_response=None,
+                outcome=RunOutcome.PROTOCOL_ERROR,
+                identity_verification_error_code="opencode.export_call_failed",
+            ),
+            git_results=_safe_pair_unchanged(),
+            clock=SteppingClock(start=NOW),
+            sleeper=sleeper,
+        )
+    )
+
+    results = orchestrator.run_provider_attempts(
+        role=AgentRole.CODER,
+        review_cycle=1,
+        prompt="Implement the fix.",
+        workspace=_workspace(),
+    )
+
+    assert len(results) == 1
+    assert len(agent_runner.calls) == 1
+    assert sleeper.calls == []
+    assert results[0].agent_result is not None
+    assert results[0].agent_result.provider_diagnostic is None
+    assert (
+        results[0].agent_result.identity_verification_error_code
+        == "opencode.export_call_failed"
+    )
+    assert results[0].precedence is not None
+    assert results[0].precedence.outcome is RunOutcome.PROTOCOL_ERROR
+    assert results[0].retry_decision is not None
+    assert results[0].retry_decision.should_retry is False
 
 
 def test_run_provider_attempts_does_not_retry_an_untrusted_lookalike_diagnostic() -> (
