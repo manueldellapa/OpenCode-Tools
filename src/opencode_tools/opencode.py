@@ -95,19 +95,20 @@ FORBIDDEN_RUN_FLAGS: tuple[str, ...] = (
     "--attach",
 )
 
-# The reviewed, exact-match permission baseline for each primary role: only
-# the coder may edit or run bash against the target; the architect and
-# reviewer never edit and never fetch a URL themselves. Anything else --
-# including a more permissive "ask" level a non-interactive run could never
-# answer -- fails closed rather than being ranked on a permissiveness scale
-# (ADR-005, ADR-010). The architect's `bash` is deliberately absent here --
-# it is not a flat allow/deny, see `_ARCHITECT_BASH_PERMISSION_CONFIG` below.
+# The reviewed, exact-match permission baseline for each primary role.
+# Architect and reviewer never edit; only the coder may edit the disposable
+# target clone. Anything more permissive -- including an "ask" level a
+# non-interactive run could never answer -- fails closed rather than being
+# ranked on a permissiveness scale (ADR-005, ADR-010).
+#
+# Architect and coder `bash` are deliberately absent here because they use
+# ordered command-pattern policies rather than one flat allow/deny value; see
+# `_ARCHITECT_BASH_PERMISSION_CONFIG` and `_CODER_BASH_PERMISSION_CONFIG`.
 _PERMISSION_BASELINE: dict[AgentRole, dict[str, str]] = {
     AgentRole.ARCHITECT: {"edit": "deny", "webfetch": "deny"},
-    AgentRole.CODER: {"edit": "allow", "bash": "allow", "webfetch": "deny"},
+    AgentRole.CODER: {"edit": "allow", "webfetch": "deny"},
     AgentRole.REVIEWER: {"edit": "deny", "bash": "deny", "webfetch": "deny"},
 }
-
 # The architect's bash access is least-privilege, not merely denied (System
 # Design SS9.3; ADR-007/FR-017: Python never reads or embeds the issue
 # title/body itself -- `build_architect_prompt` instructs the architect to
@@ -148,6 +149,103 @@ _ARCHITECT_BASH_MUST_DENY: tuple[str, ...] = (
     "git push",
     "rm -rf /",
     "echo hello",
+)
+
+# The coder keeps general shell access for implementation and verification, but
+# canonical Git/GitHub mutation command families are denied at the OpenCode
+# permission boundary. The catch-all allow MUST stay first: OpenCode resolves
+# matching rules last-match-wins, so the narrower deny rules below override it
+# while unrelated build/test/lint commands remain usable. Read-only Git commands
+# such as status/diff/log/show do not match any deny rule and therefore stay
+# allowed. GitHub issue/PR command families are denied conservatively, then a
+# small read-only subcommand set is re-allowed after the broad deny.
+#
+# This object is `.opencode/agents/coder.md`'s frontmatter "bash" value
+# verbatim. It is command-shape defense in depth, not an OS sandbox: wrappers,
+# aliases, alternate binary spellings and other indirection are outside what
+# these simple patterns can prove (GitHub issue #102; ADR-010).
+_CODER_BASH_PERMISSION_CONFIG: dict[str, str] = {
+    "*": "allow",
+    "git add": "deny",
+    "git add *": "deny",
+    "git commit": "deny",
+    "git commit *": "deny",
+    "git tag": "deny",
+    "git tag *": "deny",
+    "git branch": "deny",
+    "git branch *": "deny",
+    "git push": "deny",
+    "git push *": "deny",
+    "git merge": "deny",
+    "git merge *": "deny",
+    "git rebase": "deny",
+    "git rebase *": "deny",
+    "git reset": "deny",
+    "git reset *": "deny",
+    "git clean": "deny",
+    "git clean *": "deny",
+    "git stash": "deny",
+    "git stash *": "deny",
+    "git restore": "deny",
+    "git restore *": "deny",
+    "git checkout": "deny",
+    "git checkout *": "deny",
+    "git switch": "deny",
+    "git switch *": "deny",
+    "gh issue": "deny",
+    "gh issue *": "deny",
+    "gh issue list": "allow",
+    "gh issue list *": "allow",
+    "gh issue status": "allow",
+    "gh issue status *": "allow",
+    "gh issue view": "allow",
+    "gh issue view *": "allow",
+    "gh pr": "deny",
+    "gh pr *": "deny",
+    "gh pr checks": "allow",
+    "gh pr checks *": "allow",
+    "gh pr diff": "allow",
+    "gh pr diff *": "allow",
+    "gh pr list": "allow",
+    "gh pr list *": "allow",
+    "gh pr status": "allow",
+    "gh pr status *": "allow",
+    "gh pr view": "allow",
+    "gh pr view *": "allow",
+    "gh api": "deny",
+    "gh api *": "deny",
+}
+
+_CODER_BASH_MUST_ALLOW: tuple[str, ...] = (
+    "git status --short",
+    "git diff --stat",
+    "git log -1 --oneline",
+    "git show HEAD",
+    "python -m pytest",
+    "ruff check .",
+    "mypy --strict src tests",
+    "gh issue view 102 --repo octocat/hello-world",
+    "gh pr diff 99 --repo octocat/hello-world",
+)
+_CODER_BASH_MUST_DENY: tuple[str, ...] = (
+    "git add .",
+    "git commit -m x",
+    "git tag -d v1.0.0",
+    "git branch -D temporary",
+    "git push origin HEAD",
+    "git merge main",
+    "git rebase main",
+    "git reset --hard HEAD",
+    "git clean -fd",
+    "git stash push",
+    "git restore .opencode/agents/architect.md",
+    "git checkout -- README.md",
+    "git switch main",
+    "gh issue edit 102 --repo octocat/hello-world --title x",
+    "gh issue close 102 --repo octocat/hello-world",
+    "gh pr create --title x --body y",
+    "gh pr merge 99 --merge",
+    "gh api repos/octocat/hello-world/issues/102 -f title=x",
 )
 
 # Versioned defensive buffer for preflight utility output (System Design
@@ -1056,6 +1154,8 @@ def check_debug_agent(role: AgentRole, agent: dict[str, object]) -> None:
         )
     if role is AgentRole.ARCHITECT:
         _check_architect_bash_policy(permission)
+    elif role is AgentRole.CODER:
+        _check_coder_bash_policy(permission)
 
 
 def _resolve_bash_action(bash_rules: list[tuple[str, str]], command: str) -> str | None:
@@ -1070,25 +1170,16 @@ def _resolve_bash_action(bash_rules: list[tuple[str, str]], command: str) -> str
     return effective
 
 
-def _check_architect_bash_policy(rules: list[object]) -> None:
-    """Prove the architect's *effective* bash policy is exactly least-
-    privilege: the single `gh issue view` command `build_architect_prompt`
-    instructs it to run is allowed, and every other representative command
-    -- another `gh issue`/`gh pr` mutation, a Git mutation, an arbitrary
-    shell command -- resolves to denied. Simulated by pattern rather than
-    read off a fixed rule shape, because a machine's own global OpenCode
-    config can legitimately prepend unrelated rules that a literal
-    rule-list comparison would trip over (System Design SS9.3;
-    ADR-007/FR-017).
-    """
+def _bash_rules_for(role: AgentRole, rules: list[object]) -> list[tuple[str, str]]:
+    """Extract validated bash/wildcard rules from a resolved agent policy."""
 
     bash_rules: list[tuple[str, str]] = []
     for rule in rules:
         if not isinstance(rule, dict):
             raise PreflightError(
                 "opencode.debug_agent_invalid",
-                "opencode debug agent architect has a permission rule that "
-                "is not an object.",
+                f"opencode debug agent {_ROLE_TOKENS[role]} has a permission "
+                "rule that is not an object.",
             )
         name = rule.get("permission")
         action = rule.get("action")
@@ -1100,12 +1191,18 @@ def _check_architect_bash_policy(rules: list[object]) -> None:
         ):
             raise PreflightError(
                 "opencode.debug_agent_invalid",
-                "opencode debug agent architect has a permission rule with "
-                "a non-string permission, action, or pattern.",
+                f"opencode debug agent {_ROLE_TOKENS[role]} has a permission "
+                "rule with a non-string permission, action, or pattern.",
             )
         if name in ("bash", "*"):
             bash_rules.append((action, pattern))
+    return bash_rules
 
+
+def _check_architect_bash_policy(rules: list[object]) -> None:
+    """Prove the architect's effective bash policy is exactly least privilege."""
+
+    bash_rules = _bash_rules_for(AgentRole.ARCHITECT, rules)
     for command in _ARCHITECT_BASH_MUST_ALLOW:
         if _resolve_bash_action(bash_rules, command) != "allow":
             raise PreflightError(
@@ -1121,6 +1218,31 @@ def _check_architect_bash_policy(rules: list[object]) -> None:
                 f"allows more than {_ARCHITECT_BASH_ALLOWED_PATTERN!r}.",
             )
 
+
+def _check_coder_bash_policy(rules: list[object]) -> None:
+    """Verify representative allow/deny behavior of the CODER command policy.
+
+    The check resolves commands through the ordered effective rule list returned
+    by `opencode debug agent coder`. This catches shadowing from merged
+    machine-local rules and ordering drift; checking frontmatter literals alone
+    would not prove the policy OpenCode will evaluate.
+    """
+
+    bash_rules = _bash_rules_for(AgentRole.CODER, rules)
+    for command in _CODER_BASH_MUST_ALLOW:
+        if _resolve_bash_action(bash_rules, command) != "allow":
+            raise PreflightError(
+                "opencode.debug_agent_rejected",
+                "opencode debug agent coder blocks a required read-only Git "
+                "or implementation/verification command.",
+            )
+    for command in _CODER_BASH_MUST_DENY:
+        if _resolve_bash_action(bash_rules, command) != "deny":
+            raise PreflightError(
+                "opencode.debug_agent_rejected",
+                "opencode debug agent coder's effective bash policy allows a "
+                "reviewed Git/GitHub mutation command.",
+            )
 
 def _effective_permission_action(
     role: AgentRole, rules: list[object], permission_name: str
