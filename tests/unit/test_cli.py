@@ -839,6 +839,101 @@ def test_agent_runner_parses_a_successful_architect_response(tmp_path: Path) -> 
     assert result.session_id == "ses_architect_ready"
     assert result.verified_agent == "architect"
     assert result.provider_diagnostic is None
+    assert result.identity_verification_error_code is None
+
+
+def test_agent_runner_preserves_export_call_failure_code(tmp_path: Path) -> None:
+    runner, process_runner = _agent_runner(
+        [
+            (
+                _ARCHITECT_READY_NDJSON,
+                _process_result(
+                    stdout_bytes=_ARCHITECT_READY_NDJSON,
+                    outcome=RunOutcome.SUCCEEDED,
+                ),
+            ),
+            (
+                b"",
+                _process_result(stdout_bytes=b"", outcome=RunOutcome.PROCESS_ERROR),
+            ),
+        ]
+    )
+
+    result = runner.run(
+        AgentRole.ARCHITECT,
+        "prompt",
+        Workspace(root=tmp_path),
+        review_cycle=None,
+        provider_attempt=1,
+        sink=_RecordingSink(path=Path("architect.log")),
+    )
+
+    assert result.outcome is RunOutcome.PROTOCOL_ERROR
+    assert result.terminal_response is None
+    assert result.session_id == "ses_architect_ready"
+    assert result.verified_agent is None
+    assert result.provider_diagnostic is None
+    assert result.identity_verification_error_code == "opencode.export_call_failed"
+    assert len(process_runner.specs) == 2
+
+
+@pytest.mark.parametrize(
+    ("export_bytes", "expected_code"),
+    [
+        (
+            b'{"sessionID":"ses_architect_ready"}',
+            "opencode.export_invalid_schema",
+        ),
+        (
+            b'{"messages":[{"info":{"role":"assistant"}}]}',
+            "opencode.export_agent_missing",
+        ),
+        (
+            b'{"messages":[{"info":{"role":"assistant","agent":"coder"}}]}',
+            "opencode.export_agent_mismatch",
+        ),
+    ],
+)
+def test_agent_runner_preserves_identity_verification_failure_code(
+    tmp_path: Path,
+    export_bytes: bytes,
+    expected_code: str,
+) -> None:
+    runner, process_runner = _agent_runner(
+        [
+            (
+                _ARCHITECT_READY_NDJSON,
+                _process_result(
+                    stdout_bytes=_ARCHITECT_READY_NDJSON,
+                    outcome=RunOutcome.SUCCEEDED,
+                ),
+            ),
+            (
+                export_bytes,
+                _process_result(
+                    stdout_bytes=export_bytes,
+                    outcome=RunOutcome.SUCCEEDED,
+                ),
+            ),
+        ]
+    )
+
+    result = runner.run(
+        AgentRole.ARCHITECT,
+        "prompt",
+        Workspace(root=tmp_path),
+        review_cycle=None,
+        provider_attempt=1,
+        sink=_RecordingSink(path=Path("architect.log")),
+    )
+
+    assert result.outcome is RunOutcome.PROTOCOL_ERROR
+    assert result.terminal_response is None
+    assert result.session_id == "ses_architect_ready"
+    assert result.verified_agent is None
+    assert result.provider_diagnostic is None
+    assert result.identity_verification_error_code == expected_code
+    assert len(process_runner.specs) == 2
 
 
 def test_agent_runner_builds_direct_coder_spec_when_sandbox_is_disabled(
