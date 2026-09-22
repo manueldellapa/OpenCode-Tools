@@ -709,6 +709,10 @@ class ProcessResult:
         _require_int(self.stderr_byte_count, "stderr_byte_count", minimum=0)
         _require_non_empty(self.stderr_sha256, "stderr_sha256")
         _require_exact_enum(self.outcome, RunOutcome, "outcome")
+        _require_optional_non_empty(
+            self.identity_verification_error_code,
+            "identity_verification_error_code",
+        )
         if self.outcome not in _PROCESS_RESULT_OUTCOMES:
             raise ValueError("outcome is not a process-level outcome")
         if self.timed_out != (self.outcome is RunOutcome.TIMEOUT):
@@ -830,6 +834,7 @@ class AgentResult:
     verified_agent: str | None
     provider_diagnostic: ProviderDiagnostic | None
     outcome: RunOutcome
+    identity_verification_error_code: str | None = None
 
     def __post_init__(self) -> None:
         _require_exact_enum(self.role, AgentRole, "role")
