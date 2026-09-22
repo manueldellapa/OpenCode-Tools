@@ -53,7 +53,9 @@ from opencode_tools.errors import ConfigError, PreflightError
 from opencode_tools.git_safety import ALLOWED_GIT_ARGV_TAILS
 from opencode_tools.opencode import (
     _ARCHITECT_BASH_PERMISSION_CONFIG,  # ground truth, never hand-copied
+    _CODER_BASH_PERMISSION_CONFIG,  # ground truth, never hand-copied
     _PERMISSION_BASELINE,  # ground truth for permission, never hand-copied
+    _resolve_bash_action,
     FORBIDDEN_RUN_FLAGS,
     check_debug_agent,
     check_debug_config,
@@ -197,6 +199,8 @@ def test_agent_definition_permission_matches_the_reviewed_baseline(
     expected: dict[str, object] = dict(_PERMISSION_BASELINE[role])
     if role is AgentRole.ARCHITECT:
         expected["bash"] = _ARCHITECT_BASH_PERMISSION_CONFIG
+    elif role is AgentRole.CODER:
+        expected["bash"] = _CODER_BASH_PERMISSION_CONFIG
     assert front_matter["permission"] == expected
 
 
@@ -362,6 +366,11 @@ def test_coder_body_forbids_stash() -> None:
     assert "stash" in body.lower(), "coder.md must forbid stash"
 
 
+def test_coder_body_forbids_restore() -> None:
+    _, body = _load_agent_definition("coder")
+    assert "git restore" in body.lower(), "coder.md must forbid git restore"
+
+
 def test_coder_body_forbids_destructive_checkout_or_switch() -> None:
     lowered = _load_agent_definition("coder")[1].lower()
     assert "checkout" in lowered, "coder.md must forbid destructive checkout"
@@ -426,6 +435,10 @@ def test_ac_024_forbidden_action_policy_and_command_inventory() -> None:
     assert _PERMISSION_BASELINE[AgentRole.ARCHITECT]["edit"] == "deny"
     assert _ARCHITECT_BASH_PERMISSION_CONFIG["*"] == "deny"
     assert "bash" not in _PERMISSION_BASELINE[AgentRole.ARCHITECT]
+    assert _PERMISSION_BASELINE[AgentRole.CODER]["edit"] == "allow"
+    assert _CODER_BASH_PERMISSION_CONFIG["*"] == "allow"
+    assert _CODER_BASH_PERMISSION_CONFIG["git restore *"] == "deny"
+    assert "bash" not in _PERMISSION_BASELINE[AgentRole.CODER]
     assert _PERMISSION_BASELINE[AgentRole.REVIEWER]["edit"] == "deny"
     assert _PERMISSION_BASELINE[AgentRole.REVIEWER]["bash"] == "deny"
     for role_permission in _PERMISSION_BASELINE.values():
@@ -498,6 +511,87 @@ def test_agent_definition_round_trips_through_the_real_debug_agent_check(
 
     check_debug_agent(role, synthetic)  # must not raise
 
+
+def _synthetic_effective_bash_action(token: str, command: str) -> str | None:
+    synthetic = _synthetic_debug_agent_response(token)
+    permission = cast(list[dict[str, object]], synthetic["permission"])
+    rules = [
+        (cast(str, rule["action"]), cast(str, rule["pattern"]))
+        for rule in permission
+        if rule["permission"] in ("bash", "*")
+    ]
+    return _resolve_bash_action(rules, command)
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "git add .",
+        "git commit -m x",
+        "git tag -d v1.0.0",
+        "git branch -D temporary",
+        "git push origin HEAD",
+        "git merge main",
+        "git rebase main",
+        "git reset --hard HEAD",
+        "git clean -fd",
+        "git stash push",
+        "git restore .opencode/agents/architect.md",
+        "git checkout -- README.md",
+        "git switch main",
+        "gh issue edit 102 --repo octocat/hello-world --title x",
+        "gh issue close 102 --repo octocat/hello-world",
+        "gh pr create --title x --body y",
+        "gh pr merge 99 --merge",
+        "gh api repos/octocat/hello-world/issues/102 -f title=x",
+    ],
+)
+def test_coder_effective_bash_policy_denies_reviewed_mutations(command: str) -> None:
+    assert _synthetic_effective_bash_action("coder", command) == "deny"
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "git status --short",
+        "git diff --stat",
+        "git log -1 --oneline",
+        "git show HEAD",
+        "python -m pytest",
+        "ruff check .",
+        "mypy --strict src tests",
+        "gh issue view 102 --repo octocat/hello-world",
+        "gh pr diff 99 --repo octocat/hello-world",
+    ],
+)
+def test_coder_effective_bash_policy_keeps_required_commands_available(
+    command: str,
+) -> None:
+    assert _synthetic_effective_bash_action("coder", command) == "allow"
+
+
+def test_coder_effective_policy_rejects_a_late_restore_override() -> None:
+    synthetic = _synthetic_debug_agent_response("coder")
+    permission = cast(list[dict[str, object]], synthetic["permission"])
+    permission.append(
+        {"permission": "bash", "action": "allow", "pattern": "git restore *"}
+    )
+
+    with pytest.raises(PreflightError) as exc_info:
+        check_debug_agent(AgentRole.CODER, synthetic)
+    assert exc_info.value.code == "opencode.debug_agent_rejected"
+
+
+def test_coder_effective_policy_rejects_required_read_only_git_being_blocked() -> None:
+    synthetic = _synthetic_debug_agent_response("coder")
+    permission = cast(list[dict[str, object]], synthetic["permission"])
+    permission.append(
+        {"permission": "bash", "action": "deny", "pattern": "git status *"}
+    )
+
+    with pytest.raises(PreflightError) as exc_info:
+        check_debug_agent(AgentRole.CODER, synthetic)
+    assert exc_info.value.code == "opencode.debug_agent_rejected"
 
 def test_a_more_permissive_synthetic_permission_than_declared_is_rejected() -> None:
     """Proves the round-trip is a real check, not a tautology: mutating the
