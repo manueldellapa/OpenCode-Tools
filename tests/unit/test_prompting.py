@@ -108,6 +108,26 @@ def test_architect_prompt_golden_shape() -> None:
     assert "the exact, real issue title you discovered" in prompt
 
 
+def test_architect_runtime_prompt_does_not_duplicate_static_stopping_policy() -> None:
+    prompt = build_architect_prompt(
+        issue_locator=LOCATOR,
+        workspace_root=WORKSPACE_ROOT,
+        target_root=TARGET_ROOT,
+    )
+    lowered = prompt.lower()
+
+    for stable_policy_detail in (
+        "stop optional repository exploration",
+        "already appear to satisfy the issue",
+        "verify the acceptance criteria first",
+        "concrete gap",
+        "branch ancestry",
+        "inspect remotes",
+        "compare commits",
+    ):
+        assert stable_policy_detail not in lowered
+
+
 def test_architect_prompt_rejects_wrong_types() -> None:
     with pytest.raises(TypeError, match="issue_locator"):
         build_architect_prompt(
