@@ -1240,8 +1240,7 @@ def _check_coder_bash_policy(rules: list[object]) -> None:
 
     bash_rules = _bash_rules_for(AgentRole.CODER, rules)
     reviewed_suffix = tuple(
-        (action, pattern)
-        for pattern, action in _CODER_BASH_PERMISSION_CONFIG.items()
+        (action, pattern) for pattern, action in _CODER_BASH_PERMISSION_CONFIG.items()
     )
     if (
         len(bash_rules) < len(reviewed_suffix)
