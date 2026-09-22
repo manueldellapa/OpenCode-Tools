@@ -107,9 +107,11 @@ def _synthetic_debug_agent_response(token: str) -> dict[str, object]:
     The two shapes are not the same, confirmed live during the M15-03
     qualification: `.opencode/agents/*.md` declares `tools.ask` and a
     `permission` dict (OpenCode's documented config-time names) whose
-    values are flat strings for every kind except the architect's `bash`,
-    a nested pattern-keyed object (least-privilege: deny by default, allow
-    only `gh issue view *`) -- but a real `debug agent` response reports
+    values are flat strings except for the architect and coder `bash`
+    policies, which are nested pattern-keyed objects. The architect denies
+    by default and allows only `gh issue view *`; the coder allows ordinary
+    implementation commands but overlays reviewed Git/GitHub mutation denies.
+    A real `debug agent` response reports
     the resolved tool under `tools.question` instead, and always expands
     `permission` into an ordered `{permission, action, pattern}` rule list
     resolved last-match-wins (https://opencode.ai/docs/permissions/), one
@@ -189,9 +191,9 @@ def test_agent_definition_permission_matches_the_reviewed_baseline(
 ) -> None:
     """Permission must match `opencode.py`'s own ground truth exactly,
     imported directly here so the two cannot silently drift apart. The
-    architect's `bash` is not in `_PERMISSION_BASELINE` at all -- it is a
-    nested least-privilege object from `_ARCHITECT_BASH_PERMISSION_CONFIG`,
-    layered in separately (see that constant's docstring).
+    architect and coder `bash` policies are not in `_PERMISSION_BASELINE`
+    at all -- both are ordered pattern maps owned by their dedicated
+    `_..._BASH_PERMISSION_CONFIG` constants and layered in separately.
     """
 
     role = _ROLE_BY_TOKEN[token]
@@ -495,6 +497,15 @@ def test_ac_024_forbidden_action_policy_and_command_inventory() -> None:
     assert "threat model cooperativo" in lowered_adr
     assert "non è una sandbox os generale" in lowered_adr
 
+    security_doc = (REPO_ROOT / "docs" / "security-and-privacy.md").read_text(
+        encoding="utf-8"
+    )
+    lowered_security = security_doc.lower()
+    assert "git restore" in lowered_security
+    assert "command-shape guard" in lowered_security
+    assert "sh -c" in lowered_security
+    assert "os-level containment" in lowered_security
+
 
 # =============================================================================
 # Compatibility with the real, already-shipped `debug agent` / `debug
@@ -592,6 +603,7 @@ def test_coder_effective_policy_rejects_required_read_only_git_being_blocked() -
     with pytest.raises(PreflightError) as exc_info:
         check_debug_agent(AgentRole.CODER, synthetic)
     assert exc_info.value.code == "opencode.debug_agent_rejected"
+
 
 def test_a_more_permissive_synthetic_permission_than_declared_is_rejected() -> None:
     """Proves the round-trip is a real check, not a tautology: mutating the
