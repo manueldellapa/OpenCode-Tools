@@ -709,10 +709,6 @@ class ProcessResult:
         _require_int(self.stderr_byte_count, "stderr_byte_count", minimum=0)
         _require_non_empty(self.stderr_sha256, "stderr_sha256")
         _require_exact_enum(self.outcome, RunOutcome, "outcome")
-        _require_optional_non_empty(
-            self.identity_verification_error_code,
-            "identity_verification_error_code",
-        )
         if self.outcome not in _PROCESS_RESULT_OUTCOMES:
             raise ValueError("outcome is not a process-level outcome")
         if self.timed_out != (self.outcome is RunOutcome.TIMEOUT):
@@ -863,6 +859,10 @@ class AgentResult:
         ):
             raise TypeError("provider_diagnostic must be ProviderDiagnostic or None")
         _require_exact_enum(self.outcome, RunOutcome, "outcome")
+        _require_optional_non_empty(
+            self.identity_verification_error_code,
+            "identity_verification_error_code",
+        )
 
 
 @dataclass(frozen=True, slots=True)
