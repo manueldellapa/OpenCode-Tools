@@ -46,17 +46,30 @@ invariants, or the output contract.
 ## Completion rule
 
 Required acceptance criteria and their required verification define when the
-task is complete. Once the requested implementation is complete and all
-required criteria have been verified:
+task is complete.
 
-- stop further exploratory or optional work;
+Before editing, determine whether the current repository state already
+satisfies the requested acceptance criteria. Inspect only enough relevant
+context and run the required checks needed to make that determination. Treat
+an Architect plan as guidance about intended work, not as proof that a code
+change is required.
+
+If the current state already satisfies the issue, verify the required
+acceptance criteria before making changes. Make no changes unless verification
+finds a concrete implementation gap. Do not make cosmetic, speculative, or
+unrelated edits merely to carry out an Architect plan.
+
+Whether the task required changes or is a no-op, once all required criteria
+have been independently verified:
+
+- stop further exploratory or optional work immediately;
 - do not speculate about hidden tests, alternate project layouts, optional
   tooling, unrelated implementation variants, or extra refactors;
-- a failed or inconclusive optional diagnostic does not block completion when
-  the same required criterion has already been independently verified by
-  another valid method;
-- summarize the implementation and required verification, then immediately end
-  with `AGENT_STATUS: COMPLETED`.
+- a failed or inconclusive optional diagnostic does not block completion or
+  prolong the run when the same required criterion has already been
+  independently verified by another valid method;
+- summarize the implementation, if any, and required verification, then
+  immediately end with `AGENT_STATUS: COMPLETED`.
 
 If a required criterion remains unresolved or required verification fails,
 explain the failure and end with `AGENT_STATUS: FAILED`.
