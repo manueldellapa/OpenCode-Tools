@@ -5,64 +5,54 @@ loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.1.2] - 2026-09-22
+
+### Security
+
+- Protected the real target repository's Git metadata from destructive CODER
+  commands (issue #90, PR #91). CODER execution now happens in a disposable
+  sandbox and changes are promoted back only after the attempt succeeds and
+  passes the existing fail-closed Git safety checks. A failed, timed-out, or
+  unsafe attempt cannot replace or reinitialize the target's real `.git`
+  metadata.
+- Aligned the effective CODER command policy with the documented no-Git-mutation
+  contract (issue #102, PR #106), denying canonical Git working-tree/history
+  mutation commands even though general implementation shell access remains
+  available.
+
 ### Fixed
 
-- CODER over-exploration after successful required verification (issue #95):
-  the static coder definition and every generated coder prompt now contain an
-  explicit acceptance-criteria stop condition. Once required work and required
-  verification are complete, the coder must stop speculative exploration,
-  summarize, and immediately emit `AGENT_STATUS: COMPLETED`. Optional
-  diagnostics cannot block completion when the same required criterion was
-  already independently verified; unresolved required criteria or failed
-  required verification still require `AGENT_STATUS: FAILED`. The documented
-  OpenCode timeout remains an unchanged hard safety ceiling, and protocol
-  parsing, sandbox isolation, Git safety, promotion validation, provider retry,
-  and fail-closed timeout behavior are untouched.
+- Corrected CODER context for nested targets (issue #88, PR #89): the CODER now
+  runs with the resolved target as its OpenCode working directory while the
+  workspace-owned control plane remains authoritative.
+- Accepted structurally valid intermediate completed-text events from OpenCode
+  1.17.18 instead of misclassifying them as multiple terminal responses
+  (issue #85, PR #86), while preserving fail-closed lifecycle validation.
+- Rejected an incomplete final OpenCode tool-call lifecycle as terminal
+  (issue #87, PR #96), including blank/invalidated terminal text and malformed
+  or trailing lifecycle activity.
+- Added deterministic CODER completion discipline after all required acceptance
+  criteria are implemented and verified (issue #95, PR #97), preventing
+  optional exploration from consuming the remaining timeout budget.
+- Added a fast no-op path for already-satisfied issues (issue #101, PR #105):
+  the CODER verifies the acceptance criteria first and avoids speculative or
+  formatting-only edits when no concrete gap exists.
+- Preserved trusted diagnostics when post-run agent identity verification fails
+  (issue #100, PR #104), so the resulting protocol failure remains
+  reconstructible instead of collapsing to an opaque `PROTOCOL_ERROR`.
+- Added matching ARCHITECT stopping discipline for already-satisfied work
+  (issue #103, PR #107): once enough evidence exists for a safe handoff, the
+  architect stops optional exploration and directs the CODER to verify before
+  changing anything.
 
-- Incomplete OpenCode tool-call lifecycle accepted as terminal (issue #87):
-  `decode_run_transport` now rejects a final OpenCode 1.17.18
-  `step_finish(reason="tool-calls")` at EOF with the dedicated
-  `opencode.transport_incomplete_tool_call_lifecycle` diagnostic instead
-  of trusting an associated completed text and falling through later to
-  `protocol.marker_missing`. Completed text that is empty after
-  `.strip()` is no longer a terminal candidate; a later blank completed
-  write for the same `messageID` also invalidates any earlier candidate,
-  preserving last-write-wins semantics. Intermediate `tool-calls` steps
-  followed by a genuine terminal response remain valid.
+### Changed
 
-- Intermediate completed text rejected as ambiguous (issue #85): a real
-  OpenCode `1.17.18` coder invocation can complete more than one
-  message's text in a single session -- an intermediate completed text
-  followed by further tool/lifecycle activity, then a later, structurally
-  terminal completed text carrying the canonical `AGENT_STATUS: COMPLETED`
-  marker. `decode_run_transport` previously treated any more than one
-  completed `messageID` as unconditionally ambiguous
-  (`opencode.transport_multiple_terminal_candidates`), so a valid coder
-  run could never reach the reviewer phase even though OpenCode exited
-  successfully and produced the requested changes. It now derives
-  terminality from verified `step_finish` lifecycle structure whenever the
-  stream carries at least one such event: the completed group whose
-  `messageID` matches the last `step_finish` event before the stream ends
-  is terminal, and every other completed group is excluded as intermediate
-  text -- this now applies even to a lone completed candidate, so one
-  followed by unresolved `step_finish` activity for a different message is
-  no longer trusted just because no second candidate exists. Streams that
-  still cannot be resolved this way continue to fail closed with the same
-  error code. A `step_finish` event whose own `messageID` is missing,
-  `null`, empty, or not a string also fails closed immediately
-  (`opencode.transport_invalid_event`) rather than being silently skipped
-  as if it carried no lifecycle information, since that field now decides
-  terminality. The chosen `step_finish` must also genuinely be the
-  stream's last word: any recognized message-lifecycle event observed
-  after it -- including trailing activity that never gets its own
-  `step_finish` at all, e.g. a truncated capture -- disqualifies it too,
-  closing a gap where a single, otherwise-clean completed candidate could
-  still be trusted even though later, unconcluded activity followed it.
-  `step_finish`'s `part.type` is now validated too, the same way a `text`
-  part's `part.type` already was: it must equal the real `1.17.18`
-  `"step-finish"` value exactly, so a missing, wrongly-typed, or lookalike
-  value (e.g. the sibling `"step-start"`) fails closed instead of that
-  event's `messageID` being trusted for terminality anyway.
+- Simplified and deduplicated agent prompt contracts (issue #98, PR #99),
+  keeping stable role policy in the static agent definitions while generated
+  runtime prompts carry only run-specific context.
+- Added a GitHub Actions pull-request quality gate (issue #83, PR #84) using
+  Python 3.13 and the repository's canonical pytest, Ruff, formatting, and
+  strict mypy checks.
 
 ## [0.1.1] - 2026-09-17
 
