@@ -203,13 +203,15 @@ def test_coder_prompt_has_concise_completion_reminder() -> None:
     )[0]
 
     assert (
-        "all required acceptance criteria have been implemented and verified"
-        in reminder
+        "current tree already satisfies the required acceptance criteria" in reminder
     )
-    assert "stop further optional exploration" in reminder
-    assert "`AGENT_STATUS: COMPLETED`" in reminder
+    assert "make changes only for a concrete gap" in reminder
+    assert "with or without changes" in reminder
+    assert "stop optional exploration" in reminder
+    assert "immediately report `AGENT_STATUS: COMPLETED`" in reminder
     assert "required verification fails" in reminder
     assert "`AGENT_STATUS: FAILED` instead" in reminder
+    assert "have been implemented and verified" not in reminder
 
 
 def test_coder_prompt_completion_reminder_stays_concise() -> None:
@@ -230,6 +232,9 @@ def test_coder_prompt_completion_reminder_stays_concise() -> None:
         "optional tooling",
         "unrelated implementation variants",
         "optional diagnostic",
+        "cosmetic",
+        "speculative",
+        "architect plan",
         "hard safety ceiling",
     ):
         assert static_policy_detail not in reminder

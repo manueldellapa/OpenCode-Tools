@@ -68,11 +68,11 @@ _DELIMITER_CLOSE = "=====END UNTRUSTED {label}====="
 _GITHUB_COM_HOST = "github.com"
 
 _CODER_COMPLETION_REMINDER = (
-    "Once all required acceptance criteria have been implemented and verified, "
-    "stop further optional exploration, summarize the required verification, "
-    "and immediately report `AGENT_STATUS: COMPLETED`. If any required criterion "
-    "remains unresolved or required verification fails, report "
-    "`AGENT_STATUS: FAILED` instead."
+    "First check whether the current tree already satisfies the required acceptance "
+    "criteria; make changes only for a concrete gap. Once all required criteria "
+    "are verified, with or without changes, stop optional exploration and immediately "
+    "report `AGENT_STATUS: COMPLETED`. If any required criterion remains unresolved "
+    "or required verification fails, report `AGENT_STATUS: FAILED` instead."
 )
 
 _MARKER_GRAMMAR_NOTES: tuple[str, ...] = (

@@ -297,6 +297,26 @@ def test_coder_body_has_full_completion_contract() -> None:
     assert "not the normal success-path stopping mechanism" in lowered
 
 
+def test_coder_body_has_already_satisfied_no_op_contract() -> None:
+    _, body = _load_agent_definition("coder")
+    lowered = " ".join(body.lower().split())
+
+    assert (
+        "before editing, determine whether the current repository state already "
+        "satisfies" in lowered
+    )
+    assert "verify the required acceptance criteria before making changes" in lowered
+    assert (
+        "make no changes unless verification finds a concrete implementation gap"
+        in lowered
+    )
+    assert "cosmetic, speculative, or unrelated edits" in lowered
+    assert "architect plan" in lowered
+    assert "whether the task required changes or is a no-op" in lowered
+    assert "stop further exploratory or optional work immediately" in lowered
+    assert "does not block completion or prolong the run" in lowered
+
+
 # One assertion per FR-021 forbidden-action item, each with its own failure
 # message, so a future regression names exactly which item went missing
 # instead of failing one giant regex.

@@ -802,6 +802,121 @@ def test_the_nominal_path_invokes_architect_coder_and_reviewer_in_canonical_orde
     assert len(result.reviewer_cycles[0]) == 1
 
 
+def test_already_satisfied_issue_accepts_zero_change_coder_completion_without_retry(
+    tmp_path: Path,
+) -> None:
+    """A completed coder no-op is a valid success path.
+
+    The fake coder represents the policy decision for an issue whose required
+    acceptance criteria are already satisfied: it reports COMPLETED without
+    touching the target. The deterministic orchestration contract must accept
+    that unchanged Git state, avoid another coder attempt, and proceed directly
+    to review instead of requiring a mutation as evidence of progress.
+    """
+
+    workspace, target = _workspace_and_target(tmp_path)
+    unchanged_state = _git_state(target_root=target.root, fingerprint="fp-0")
+    issue_ref = _issue_ref()
+
+    architect_response = ParsedAgentResponse(
+        role=AgentRole.ARCHITECT,
+        body=(
+            "The current tree may already satisfy the issue; verify the required "
+            "acceptance criteria and change only concrete gaps."
+        ),
+        agent_status=AgentStatus.READY,
+        issue_ref=issue_ref,
+    )
+    coder_response = ParsedAgentResponse(
+        role=AgentRole.CODER,
+        body="Verified all required acceptance criteria; no changes were necessary.",
+        agent_status=AgentStatus.COMPLETED,
+    )
+    reviewer_response = ParsedAgentResponse(
+        role=AgentRole.REVIEWER,
+        body="",
+        review_status=ReviewStatus.APPROVED,
+    )
+    agent_runner = SequencedAgentRunner(
+        [
+            _agent_result(
+                role=AgentRole.ARCHITECT,
+                review_cycle=None,
+                workspace_root=workspace.root,
+                terminal_response=architect_response,
+            ),
+            _agent_result(
+                role=AgentRole.CODER,
+                review_cycle=1,
+                workspace_root=workspace.root,
+                terminal_response=coder_response,
+            ),
+            _agent_result(
+                role=AgentRole.REVIEWER,
+                review_cycle=1,
+                workspace_root=workspace.root,
+                terminal_response=reviewer_response,
+            ),
+        ]
+    )
+    git_safety = SequencedGitSafetyPort(
+        [
+            _git_check(
+                target_root=target.root,
+                sequence=sequence,
+                purpose=purpose,
+                state=unchanged_state,
+            )
+            for sequence, purpose in enumerate(
+                (
+                    "ARCHITECT:0:1:before",
+                    "ARCHITECT:0:1:after",
+                    "CODER:1:1:before",
+                    "CODER:1:1:after",
+                    "REVIEWER:1:1:before",
+                    "REVIEWER:1:1:after",
+                )
+            )
+        ]
+    )
+    run_store = SequencedRunStorePort()
+    orchestrator = _orchestrator(
+        workspace=workspace,
+        target=target,
+        agent_runner=agent_runner,
+        git_safety=git_safety,
+        run_store=run_store,
+        git_baseline=unchanged_state,
+    )
+
+    result = run_issue_pipeline(
+        orchestrator=orchestrator,
+        issue_locator=_issue_locator(),
+        workspace=workspace,
+        target=target,
+        max_review_cycles=MAX_REVIEW_CYCLES,
+    )
+
+    assert [call[0] for call in agent_runner.calls] == [
+        AgentRole.ARCHITECT,
+        AgentRole.CODER,
+        AgentRole.REVIEWER,
+    ]
+    assert len(result.coder_cycles) == 1
+    assert len(result.coder_cycles[0]) == 1
+    coder_attempt = result.coder_cycles[0][0]
+    assert coder_attempt.git_before is not None
+    assert coder_attempt.git_after is not None
+    assert coder_attempt.git_before.state == unchanged_state
+    assert coder_attempt.git_after.state == unchanged_state
+    assert coder_attempt.retry_decision is not None
+    assert coder_attempt.retry_decision.should_retry is False
+    assert len(result.reviewer_cycles) == 1
+    assert len(result.reviewer_cycles[0]) == 1
+    assert result.state == PipelineState(phase=PipelinePhase.POSTFLIGHT)
+    assert result.action is PipelineAction.ENTER_POSTFLIGHT
+
+
 def test_coder_is_not_invoked_when_the_architect_reports_failed(
     tmp_path: Path,
 ) -> None:
