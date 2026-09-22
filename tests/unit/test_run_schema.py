@@ -340,6 +340,31 @@ def test_serialize_run_record_represents_every_canonical_group() -> None:
     assert parsed["termination_confirmed"] is True
 
 
+def test_serialize_run_record_preserves_identity_verification_error_code() -> None:
+    record = _full_run_record()
+    attempt = record.attempts[0]
+    failed_agent_result = replace(
+        attempt.agent_result,
+        terminal_response=None,
+        verified_agent=None,
+        outcome=RunOutcome.PROTOCOL_ERROR,
+        identity_verification_error_code="opencode.export_invalid_schema",
+    )
+    failed_attempt = replace(attempt, agent_result=failed_agent_result)
+    parsed = json.loads(
+        serialize_run_record(replace(record, attempts=(failed_attempt,)))
+    )
+
+    persisted_result = parsed["attempts"][0]["agent_result"]
+    assert (
+        persisted_result["identity_verification_error_code"]
+        == "opencode.export_invalid_schema"
+    )
+    assert persisted_result["terminal_response"] is None
+    assert persisted_result["verified_agent"] is None
+    assert persisted_result["provider_diagnostic"] is None
+
+
 def test_serialize_run_record_keeps_the_status_dimensions_distinct() -> None:
     parsed = json.loads(serialize_run_record(_full_run_record()))
 

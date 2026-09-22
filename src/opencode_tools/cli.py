@@ -540,7 +540,16 @@ class _CliAgentRunner:
 
     def _verify_identity(
         self, role: AgentRole, workspace: Workspace, session_id: str
-    ) -> str | None:
+    ) -> tuple[str | None, str | None]:
+        """Return verified agent plus a sanitized failure code, fail closed.
+
+        The export itself remains in-memory only.  On verification failure we
+        retain only the stable internal ProtocolError code so run evidence can
+        distinguish call, schema, and identity failures without persisting the
+        sanitized session export or reclassifying the failure as provider
+        retryable.
+        """
+
         try:
             evidence = opencode_adapter.run_export_and_verify_identity(
                 self._process_runner,
@@ -551,9 +560,9 @@ class _CliAgentRunner:
                 utility_timeout_seconds=self._utility_timeout_seconds,
                 termination_grace_seconds=self._termination_grace_seconds,
             )
-        except ProtocolError:
-            return None
-        return evidence.verified_agent
+        except ProtocolError as error:
+            return None, error.code
+        return evidence.verified_agent, None
 
     def _sandbox_failure_result(
         self,
@@ -670,6 +679,7 @@ class _CliAgentRunner:
             session_id: str | None = None
             terminal_response: ParsedAgentResponse | None = None
             verified_agent: str | None = None
+            identity_verification_error_code: str | None = None
 
             if provider_diagnostic is None and not process_result.timed_out:
                 transport = self._decode_transport(
@@ -682,8 +692,11 @@ class _CliAgentRunner:
                         transport.terminal_text,
                         issue_locator=self._issue_locator,
                     )
-                    verified_agent = self._verify_identity(role, workspace, session_id)
-                    if verified_agent is None:
+                    (
+                        verified_agent,
+                        identity_verification_error_code,
+                    ) = self._verify_identity(role, workspace, session_id)
+                    if identity_verification_error_code is not None:
                         terminal_response = None
 
             if (
@@ -751,6 +764,7 @@ class _CliAgentRunner:
                 verified_agent=verified_agent,
                 provider_diagnostic=provider_diagnostic,
                 outcome=precedence.outcome,
+                identity_verification_error_code=identity_verification_error_code,
             )
         finally:
             if sandbox is not None:

@@ -830,6 +830,7 @@ class AgentResult:
     verified_agent: str | None
     provider_diagnostic: ProviderDiagnostic | None
     outcome: RunOutcome
+    identity_verification_error_code: str | None = None
 
     def __post_init__(self) -> None:
         _require_exact_enum(self.role, AgentRole, "role")
@@ -858,6 +859,10 @@ class AgentResult:
         ):
             raise TypeError("provider_diagnostic must be ProviderDiagnostic or None")
         _require_exact_enum(self.outcome, RunOutcome, "outcome")
+        _require_optional_non_empty(
+            self.identity_verification_error_code,
+            "identity_verification_error_code",
+        )
 
 
 @dataclass(frozen=True, slots=True)
