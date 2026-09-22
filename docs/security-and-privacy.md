@@ -48,9 +48,15 @@ model.
   message of the trusted NDJSON transport; a marker quoted inside the issue,
   a prompt, tool output, or stderr is never accepted (agent protocol v1).
 - The effective per-role permission matrix is verified before any role
-  runs: architect and reviewer are read-only, the coder may edit the
-  target's working tree only, and `ask`, `task`, Git mutation, and sharing
-  are all denied for every role.
+  runs: architect and reviewer are read-only; the coder may edit its
+  disposable target clone and use Bash for implementation/verification, but
+  direct canonical Git mutation families (including `git restore`) and
+  GitHub issue/PR mutation families are denied by ordered Bash rules. The
+  preflight validates representative commands against the resolved
+  `opencode debug agent coder` rule order, not only the frontmatter text.
+  Read-only `git status`/`diff`/`log`/`show` and ordinary test/lint/
+  type-check commands remain allowed. `ask`, `task`, and sharing remain
+  denied for the non-interactive roles as applicable.
 - `--auto`, `--share`, and `--model` are never passed to `opencode`, and an
   OpenCode configuration with automatic sharing enabled is rejected before
   any role runs.
@@ -73,6 +79,20 @@ model.
 - Runs on the same target are serialized by a per-target lock (below); an
   unconfirmed termination quarantines the target rather than releasing it
   silently.
+
+The CODER Bash deny rules are deliberately a **command-shape guard**, not a
+semantic shell sandbox. They cover the reviewed direct command forms that
+OpenCode's permission matcher can express reliably. Indirection or alternate
+spellings -- for example `sh -c 'git restore ...'`, `env git ...`, an
+absolute/renamed Git binary, aliases/functions, Git global options placed
+before the subcommand, a project script that invokes Git, or a raw HTTP
+client calling GitHub -- can fall outside those string patterns. Compound
+shell syntax is also only as strong as the command resources OpenCode
+extracts for permission evaluation. These limitations are why the permission
+policy remains defense in depth: the cooperative CODER contract, the
+independent disposable clone, control-plane checks, Git postflight and
+promotion validation remain separate layers. None of this is presented as
+OS-level containment against a hostile same-user process.
 
 Python never mutates GitHub or the real target's history/refs. Trusted
 internal Git mutation is now intentionally used **inside the disposable

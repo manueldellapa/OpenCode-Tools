@@ -37,6 +37,7 @@ from opencode_tools.domain import (
 )
 from opencode_tools.errors import PreflightError, ProtocolError
 from opencode_tools.opencode import (
+    _CODER_BASH_PERMISSION_CONFIG,
     CANDIDATE_OPENCODE_VERSION,
     FORBIDDEN_RUN_FLAGS,
     MAX_NDJSON_LINES,
@@ -543,7 +544,10 @@ def test_check_debug_agent_ignores_unrelated_and_machine_specific_rules() -> Non
             {"permission": "plan_enter", "action": "deny", "pattern": "*"},
             {"permission": "read", "action": "allow", "pattern": "*"},
             {"permission": "edit", "action": "allow", "pattern": "*"},
-            {"permission": "bash", "action": "allow", "pattern": "*"},
+            *[
+                {"permission": "bash", "action": action, "pattern": pattern}
+                for pattern, action in _CODER_BASH_PERMISSION_CONFIG.items()
+            ],
             {"permission": "plan_exit", "action": "deny", "pattern": "*"},
             {"permission": "webfetch", "action": "deny", "pattern": "*"},
             {
@@ -591,6 +595,28 @@ def test_check_debug_agent_rejects_a_malformed_permission_rule_entry() -> None:
     with pytest.raises(PreflightError) as exc_info:
         check_debug_agent(AgentRole.ARCHITECT, agent)
     assert exc_info.value.code == "opencode.debug_agent_invalid"
+
+
+@pytest.mark.parametrize(
+    "late_allow_pattern",
+    (
+        "git restore README.md",
+        "git add -A",
+        "git cherry-pick deadbeef",
+    ),
+)
+def test_check_debug_agent_rejects_narrow_late_coder_overrides(
+    late_allow_pattern: str,
+) -> None:
+    agent = _fixture_json("debug/agent-coder-baseline.json")
+    permission = cast(list[dict[str, object]], agent["permission"])
+    permission.append(
+        {"permission": "bash", "action": "allow", "pattern": late_allow_pattern}
+    )
+
+    with pytest.raises(PreflightError) as exc_info:
+        check_debug_agent(AgentRole.CODER, agent)
+    assert exc_info.value.code == "opencode.debug_agent_rejected"
 
 
 # --- check_debug_agent: the architect's least-privilege bash policy ----------

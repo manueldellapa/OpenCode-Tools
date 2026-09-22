@@ -53,8 +53,10 @@ from opencode_tools.errors import ConfigError, PreflightError
 from opencode_tools.git_safety import ALLOWED_GIT_ARGV_TAILS
 from opencode_tools.opencode import (
     _ARCHITECT_BASH_PERMISSION_CONFIG,  # ground truth, never hand-copied
+    _CODER_BASH_PERMISSION_CONFIG,  # ground truth, never hand-copied
     _PERMISSION_BASELINE,  # ground truth for permission, never hand-copied
     FORBIDDEN_RUN_FLAGS,
+    _resolve_bash_action,
     check_debug_agent,
     check_debug_config,
     check_no_forbidden_flags,
@@ -105,9 +107,11 @@ def _synthetic_debug_agent_response(token: str) -> dict[str, object]:
     The two shapes are not the same, confirmed live during the M15-03
     qualification: `.opencode/agents/*.md` declares `tools.ask` and a
     `permission` dict (OpenCode's documented config-time names) whose
-    values are flat strings for every kind except the architect's `bash`,
-    a nested pattern-keyed object (least-privilege: deny by default, allow
-    only `gh issue view *`) -- but a real `debug agent` response reports
+    values are flat strings except for the architect and coder `bash`
+    policies, which are nested pattern-keyed objects. The architect denies
+    by default and allows only `gh issue view *`; the coder allows ordinary
+    implementation commands but overlays reviewed Git/GitHub mutation denies.
+    A real `debug agent` response reports
     the resolved tool under `tools.question` instead, and always expands
     `permission` into an ordered `{permission, action, pattern}` rule list
     resolved last-match-wins (https://opencode.ai/docs/permissions/), one
@@ -187,9 +191,9 @@ def test_agent_definition_permission_matches_the_reviewed_baseline(
 ) -> None:
     """Permission must match `opencode.py`'s own ground truth exactly,
     imported directly here so the two cannot silently drift apart. The
-    architect's `bash` is not in `_PERMISSION_BASELINE` at all -- it is a
-    nested least-privilege object from `_ARCHITECT_BASH_PERMISSION_CONFIG`,
-    layered in separately (see that constant's docstring).
+    architect and coder `bash` policies are not in `_PERMISSION_BASELINE`
+    at all -- both are ordered pattern maps owned by their dedicated
+    `_..._BASH_PERMISSION_CONFIG` constants and layered in separately.
     """
 
     role = _ROLE_BY_TOKEN[token]
@@ -197,6 +201,8 @@ def test_agent_definition_permission_matches_the_reviewed_baseline(
     expected: dict[str, object] = dict(_PERMISSION_BASELINE[role])
     if role is AgentRole.ARCHITECT:
         expected["bash"] = _ARCHITECT_BASH_PERMISSION_CONFIG
+    elif role is AgentRole.CODER:
+        expected["bash"] = _CODER_BASH_PERMISSION_CONFIG
     assert front_matter["permission"] == expected
 
 
@@ -382,6 +388,17 @@ def test_coder_body_forbids_stash() -> None:
     assert "stash" in body.lower(), "coder.md must forbid stash"
 
 
+def test_coder_body_forbids_restore() -> None:
+    _, body = _load_agent_definition("coder")
+    assert "git restore" in body.lower(), "coder.md must forbid git restore"
+
+
+def test_coder_body_forbids_direct_history_mutation_commands() -> None:
+    lowered = _load_agent_definition("coder")[1].lower()
+    for command in ("git cherry-pick", "git revert", "git am"):
+        assert command in lowered, f"coder.md must forbid {command}"
+
+
 def test_coder_body_forbids_destructive_checkout_or_switch() -> None:
     lowered = _load_agent_definition("coder")[1].lower()
     assert "checkout" in lowered, "coder.md must forbid destructive checkout"
@@ -446,6 +463,10 @@ def test_ac_024_forbidden_action_policy_and_command_inventory() -> None:
     assert _PERMISSION_BASELINE[AgentRole.ARCHITECT]["edit"] == "deny"
     assert _ARCHITECT_BASH_PERMISSION_CONFIG["*"] == "deny"
     assert "bash" not in _PERMISSION_BASELINE[AgentRole.ARCHITECT]
+    assert _PERMISSION_BASELINE[AgentRole.CODER]["edit"] == "allow"
+    assert _CODER_BASH_PERMISSION_CONFIG["*"] == "allow"
+    assert _CODER_BASH_PERMISSION_CONFIG["git restore *"] == "deny"
+    assert "bash" not in _PERMISSION_BASELINE[AgentRole.CODER]
     assert _PERMISSION_BASELINE[AgentRole.REVIEWER]["edit"] == "deny"
     assert _PERMISSION_BASELINE[AgentRole.REVIEWER]["bash"] == "deny"
     for role_permission in _PERMISSION_BASELINE.values():
@@ -502,6 +523,15 @@ def test_ac_024_forbidden_action_policy_and_command_inventory() -> None:
     assert "threat model cooperativo" in lowered_adr
     assert "non è una sandbox os generale" in lowered_adr
 
+    security_doc = (REPO_ROOT / "docs" / "security-and-privacy.md").read_text(
+        encoding="utf-8"
+    )
+    lowered_security = security_doc.lower()
+    assert "git restore" in lowered_security
+    assert "command-shape guard" in lowered_security
+    assert "sh -c" in lowered_security
+    assert "os-level containment" in lowered_security
+
 
 # =============================================================================
 # Compatibility with the real, already-shipped `debug agent` / `debug
@@ -517,6 +547,101 @@ def test_agent_definition_round_trips_through_the_real_debug_agent_check(
     synthetic = _synthetic_debug_agent_response(token)
 
     check_debug_agent(role, synthetic)  # must not raise
+
+
+def _synthetic_effective_bash_action(token: str, command: str) -> str | None:
+    synthetic = _synthetic_debug_agent_response(token)
+    permission = cast(list[dict[str, object]], synthetic["permission"])
+    rules = [
+        (cast(str, rule["action"]), cast(str, rule["pattern"]))
+        for rule in permission
+        if rule["permission"] in ("bash", "*")
+    ]
+    return _resolve_bash_action(rules, command)
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "git add .",
+        "git commit -m x",
+        "git tag -d v1.0.0",
+        "git branch -D temporary",
+        "git push origin HEAD",
+        "git merge main",
+        "git rebase main",
+        "git cherry-pick deadbeef",
+        "git revert deadbeef",
+        "git am patch.mbox",
+        "git reset --hard HEAD",
+        "git clean -fd",
+        "git stash push",
+        "git restore .opencode/agents/architect.md",
+        "git checkout -- README.md",
+        "git switch main",
+        "gh issue edit 102 --repo octocat/hello-world --title x",
+        "gh issue close 102 --repo octocat/hello-world",
+        "gh pr create --title x --body y",
+        "gh pr merge 99 --merge",
+        "gh api repos/octocat/hello-world/issues/102 -f title=x",
+    ],
+)
+def test_coder_effective_bash_policy_denies_reviewed_mutations(command: str) -> None:
+    assert _synthetic_effective_bash_action("coder", command) == "deny"
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "git status --short",
+        "git diff --stat",
+        "git log -1 --oneline",
+        "git show HEAD",
+        "python -m pytest",
+        "ruff check .",
+        "mypy --strict src tests",
+        "gh issue view 102 --repo octocat/hello-world",
+        "gh pr diff 99 --repo octocat/hello-world",
+    ],
+)
+def test_coder_effective_bash_policy_keeps_required_commands_available(
+    command: str,
+) -> None:
+    assert _synthetic_effective_bash_action("coder", command) == "allow"
+
+
+@pytest.mark.parametrize(
+    "late_allow_pattern",
+    (
+        "git restore README.md",
+        "git add -A",
+        "git cherry-pick deadbeef",
+    ),
+)
+def test_coder_effective_policy_rejects_narrow_late_overrides(
+    late_allow_pattern: str,
+) -> None:
+    synthetic = _synthetic_debug_agent_response("coder")
+    permission = cast(list[dict[str, object]], synthetic["permission"])
+    permission.append(
+        {"permission": "bash", "action": "allow", "pattern": late_allow_pattern}
+    )
+
+    with pytest.raises(PreflightError) as exc_info:
+        check_debug_agent(AgentRole.CODER, synthetic)
+    assert exc_info.value.code == "opencode.debug_agent_rejected"
+
+
+def test_coder_effective_policy_rejects_required_read_only_git_being_blocked() -> None:
+    synthetic = _synthetic_debug_agent_response("coder")
+    permission = cast(list[dict[str, object]], synthetic["permission"])
+    permission.append(
+        {"permission": "bash", "action": "deny", "pattern": "git status *"}
+    )
+
+    with pytest.raises(PreflightError) as exc_info:
+        check_debug_agent(AgentRole.CODER, synthetic)
+    assert exc_info.value.code == "opencode.debug_agent_rejected"
 
 
 def test_a_more_permissive_synthetic_permission_than_declared_is_rejected() -> None:
