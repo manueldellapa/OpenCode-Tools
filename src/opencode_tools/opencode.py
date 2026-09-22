@@ -1244,6 +1244,7 @@ def _check_coder_bash_policy(rules: list[object]) -> None:
                 "reviewed Git/GitHub mutation command.",
             )
 
+
 def _effective_permission_action(
     role: AgentRole, rules: list[object], permission_name: str
 ) -> str | None:
