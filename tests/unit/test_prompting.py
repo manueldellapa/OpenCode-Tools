@@ -186,6 +186,8 @@ def test_coder_prompt_contains_run_context_and_final_marker_instruction() -> Non
     assert "This is review cycle 1 of at most 3." in prompt
     assert "untrusted task data" in prompt
     assert "AGENT_STATUS: COMPLETED" in prompt
+    assert "required criteria are verified, with or without changes" in prompt
+    assert "you made your intended changes" not in prompt
     assert "AGENT_STATUS: FAILED" in prompt
     assert "REVIEW_STATUS" not in prompt
 
