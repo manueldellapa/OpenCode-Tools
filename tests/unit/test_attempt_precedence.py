@@ -271,9 +271,7 @@ def _agent_result(
         terminal_response=terminal_response,
         session_id="session-001",
         verified_agent=(
-            None
-            if identity_verification_error_code is not None
-            else role.value.lower()
+            None if identity_verification_error_code is not None else role.value.lower()
         ),
         provider_diagnostic=provider_diagnostic,
         outcome=outcome,
