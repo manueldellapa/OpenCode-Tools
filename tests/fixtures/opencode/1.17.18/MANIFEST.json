@@ -94,6 +94,14 @@
         "affected_fixtures": [
           "run/coder-incomplete-tool-call-lifecycle.ndjson"
         ]
+      },
+      {
+        "date": "2026-09-22",
+        "authored_for": "OpenCode-Tools GitHub issue #102",
+        "reason": "The CODER previously exposed bash as a flat allow, so its prompt-level Git/GitHub mutation prohibitions were cooperative only. The coder baseline now models the ordered OpenCode 1.17.18 bash rule list used by the project-local agent: unrelated implementation/test commands remain allowed, canonical Git mutation families are denied, GitHub issue/PR families are denied with explicit read-only inspection exceptions, and raw `gh api` is conservatively denied. Preflight validates representative commands against the effective resolved rule order rather than trusting config literals alone.",
+        "affected_fixtures": [
+          "debug/agent-coder-baseline.json"
+        ]
       }
     ]
   },
@@ -359,8 +367,8 @@
       "category": "debug-agent",
       "kind": "positive",
       "role": "coder",
-      "sha256": "27d13b8095ce3d9d226ad274887c4b72b6892e6a1f4b8b4524e37f2c471fb8a9",
-      "description": "opencode debug agent coder output: primary mode, question/task tools both false, edit/bash permission allowed for the target as an ordered rule list (M15-03-corrected, see agent-architect-baseline.json's note)."
+      "sha256": "c1d2bb833d5761978ea8fdd6096d709eb178f1eeac48204c2052a625d18db8fc",
+      "description": "opencode debug agent coder output: primary mode, question/task tools both false, edit allowed, and ordered bash command policy that keeps normal implementation/read-only Git inspection available while denying the reviewed Git/GitHub mutation command families (issue #102; response shape remains M15-03-corrected)."
     },
     {
       "path": "debug/agent-reviewer-baseline.json",
