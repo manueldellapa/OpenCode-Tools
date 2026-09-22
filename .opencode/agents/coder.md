@@ -4,7 +4,61 @@
   "mode": "primary",
   "model": "openrouter/nvidia/nemotron-3-ultra-550b-a55b:free",
   "tools": { "ask": false, "task": false },
-  "permission": { "edit": "allow", "bash": "allow", "webfetch": "deny" }
+  "permission": {
+    "edit": "allow",
+    "bash": {
+      "*": "allow",
+      "git add": "deny",
+      "git add *": "deny",
+      "git commit": "deny",
+      "git commit *": "deny",
+      "git tag": "deny",
+      "git tag *": "deny",
+      "git branch": "deny",
+      "git branch *": "deny",
+      "git push": "deny",
+      "git push *": "deny",
+      "git merge": "deny",
+      "git merge *": "deny",
+      "git rebase": "deny",
+      "git rebase *": "deny",
+      "git reset": "deny",
+      "git reset *": "deny",
+      "git clean": "deny",
+      "git clean *": "deny",
+      "git stash": "deny",
+      "git stash *": "deny",
+      "git restore": "deny",
+      "git restore *": "deny",
+      "git checkout": "deny",
+      "git checkout *": "deny",
+      "git switch": "deny",
+      "git switch *": "deny",
+      "gh issue": "deny",
+      "gh issue *": "deny",
+      "gh issue list": "allow",
+      "gh issue list *": "allow",
+      "gh issue status": "allow",
+      "gh issue status *": "allow",
+      "gh issue view": "allow",
+      "gh issue view *": "allow",
+      "gh pr": "deny",
+      "gh pr *": "deny",
+      "gh pr checks": "allow",
+      "gh pr checks *": "allow",
+      "gh pr diff": "allow",
+      "gh pr diff *": "allow",
+      "gh pr list": "allow",
+      "gh pr list *": "allow",
+      "gh pr status": "allow",
+      "gh pr status *": "allow",
+      "gh pr view": "allow",
+      "gh pr view *": "allow",
+      "gh api": "deny",
+      "gh api *": "deny"
+    },
+    "webfetch": "deny"
+  }
 }
 ---
 
@@ -33,6 +87,7 @@ directly or indirectly:
 - no `git push`, including force push;
 - no `git merge`, `git rebase`, or `git reset`;
 - no `git clean` or `git stash`;
+- no `git restore`, including path-level working-tree restoration;
 - no destructive `git checkout` or `git switch` that discards changes or
   moves HEAD;
 - no `gh issue` or `gh pr` mutation and no equivalent raw GitHub API
