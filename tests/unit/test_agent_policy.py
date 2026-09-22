@@ -55,8 +55,8 @@ from opencode_tools.opencode import (
     _ARCHITECT_BASH_PERMISSION_CONFIG,  # ground truth, never hand-copied
     _CODER_BASH_PERMISSION_CONFIG,  # ground truth, never hand-copied
     _PERMISSION_BASELINE,  # ground truth for permission, never hand-copied
-    _resolve_bash_action,
     FORBIDDEN_RUN_FLAGS,
+    _resolve_bash_action,
     check_debug_agent,
     check_debug_config,
     check_no_forbidden_flags,
