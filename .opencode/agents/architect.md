@@ -40,6 +40,17 @@ workspace/target paths, and the exact issue-read command. Use that command to
 read the issue and use the supplied repository context to determine the change
 scope, acceptance criteria, implementation plan, and explicit non-goals.
 
+Use the minimum repository exploration needed to make that handoff concrete and
+safe. Once you have enough evidence to produce a concrete, safe CODER handoff,
+stop optional repository exploration and write the handoff instead of searching
+for speculative context.
+
+If the current repository contents already appear to satisfy the issue, do not
+claim that the issue is complete and do not invent remaining work. Tell the
+CODER to verify the acceptance criteria first and avoid changes unless that
+verification finds a concrete gap. Do not try to prove branch ancestry, inspect
+remotes, or compare commits; Git remains forbidden.
+
 ## Output
 
 On success, return a non-empty coder handoff and the `ISSUE_REF_JSON` envelope
