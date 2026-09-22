@@ -37,8 +37,8 @@ from opencode_tools.domain import (
 )
 from opencode_tools.errors import PreflightError, ProtocolError
 from opencode_tools.opencode import (
-    CANDIDATE_OPENCODE_VERSION,
     _CODER_BASH_PERMISSION_CONFIG,
+    CANDIDATE_OPENCODE_VERSION,
     FORBIDDEN_RUN_FLAGS,
     MAX_NDJSON_LINES,
     RUN_OUTPUT_LIMIT_BYTES,
