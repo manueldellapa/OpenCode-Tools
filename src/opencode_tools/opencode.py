@@ -180,6 +180,12 @@ _CODER_BASH_PERMISSION_CONFIG: dict[str, str] = {
     "git merge *": "deny",
     "git rebase": "deny",
     "git rebase *": "deny",
+    "git cherry-pick": "deny",
+    "git cherry-pick *": "deny",
+    "git revert": "deny",
+    "git revert *": "deny",
+    "git am": "deny",
+    "git am *": "deny",
     "git reset": "deny",
     "git reset *": "deny",
     "git clean": "deny",
@@ -235,6 +241,9 @@ _CODER_BASH_MUST_DENY: tuple[str, ...] = (
     "git push origin HEAD",
     "git merge main",
     "git rebase main",
+    "git cherry-pick deadbeef",
+    "git revert deadbeef",
+    "git am patch.mbox",
     "git reset --hard HEAD",
     "git clean -fd",
     "git stash push",
@@ -1220,15 +1229,31 @@ def _check_architect_bash_policy(rules: list[object]) -> None:
 
 
 def _check_coder_bash_policy(rules: list[object]) -> None:
-    """Verify representative allow/deny behavior of the CODER command policy.
+    """Verify the CODER's final ordered command policy and effective behavior.
 
-    The check resolves commands through the ordered effective rule list returned
-    by `opencode debug agent coder`. This catches shadowing from merged
-    machine-local rules and ordering drift; checking frontmatter literals alone
-    would not prove the policy OpenCode will evaluate.
+    OpenCode resolves matching permission rules last-match-wins. Machine-local
+    rules may legitimately precede the project policy, but the reviewed CODER
+    bash policy must be the final bash/wildcard suffix so no later, narrower
+    allow can reopen any denied Git/GitHub mutation family. Representative
+    allow/deny probes then verify the resulting behavior as a second check.
     """
 
     bash_rules = _bash_rules_for(AgentRole.CODER, rules)
+    reviewed_suffix = tuple(
+        (action, pattern)
+        for pattern, action in _CODER_BASH_PERMISSION_CONFIG.items()
+    )
+    if (
+        len(bash_rules) < len(reviewed_suffix)
+        or tuple(bash_rules[-len(reviewed_suffix) :]) != reviewed_suffix
+    ):
+        raise PreflightError(
+            "opencode.debug_agent_rejected",
+            "opencode debug agent coder does not end with the reviewed bash "
+            "command-policy suffix; a later rule could override a denied "
+            "Git/GitHub mutation family.",
+        )
+
     for command in _CODER_BASH_MUST_ALLOW:
         if _resolve_bash_action(bash_rules, command) != "allow":
             raise PreflightError(
