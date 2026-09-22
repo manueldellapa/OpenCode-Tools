@@ -373,6 +373,12 @@ def test_coder_body_forbids_restore() -> None:
     assert "git restore" in body.lower(), "coder.md must forbid git restore"
 
 
+def test_coder_body_forbids_direct_history_mutation_commands() -> None:
+    lowered = _load_agent_definition("coder")[1].lower()
+    for command in ("git cherry-pick", "git revert", "git am"):
+        assert command in lowered, f"coder.md must forbid {command}"
+
+
 def test_coder_body_forbids_destructive_checkout_or_switch() -> None:
     lowered = _load_agent_definition("coder")[1].lower()
     assert "checkout" in lowered, "coder.md must forbid destructive checkout"
@@ -544,6 +550,9 @@ def _synthetic_effective_bash_action(token: str, command: str) -> str | None:
         "git push origin HEAD",
         "git merge main",
         "git rebase main",
+        "git cherry-pick deadbeef",
+        "git revert deadbeef",
+        "git am patch.mbox",
         "git reset --hard HEAD",
         "git clean -fd",
         "git stash push",
@@ -581,11 +590,21 @@ def test_coder_effective_bash_policy_keeps_required_commands_available(
     assert _synthetic_effective_bash_action("coder", command) == "allow"
 
 
-def test_coder_effective_policy_rejects_a_late_restore_override() -> None:
+@pytest.mark.parametrize(
+    "late_allow_pattern",
+    (
+        "git restore README.md",
+        "git add -A",
+        "git cherry-pick deadbeef",
+    ),
+)
+def test_coder_effective_policy_rejects_narrow_late_overrides(
+    late_allow_pattern: str,
+) -> None:
     synthetic = _synthetic_debug_agent_response("coder")
     permission = cast(list[dict[str, object]], synthetic["permission"])
     permission.append(
-        {"permission": "bash", "action": "allow", "pattern": "git restore *"}
+        {"permission": "bash", "action": "allow", "pattern": late_allow_pattern}
     )
 
     with pytest.raises(PreflightError) as exc_info:
