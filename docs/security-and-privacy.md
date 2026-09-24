@@ -74,8 +74,14 @@ model.
   index, and runs OpenCode only inside that disposable clone.
 - Before promotion, the sandbox `.git`, top-level and baseline `HEAD`
   must still be valid and the real target fingerprint must match the
-  pre-attempt snapshot. Only the sandbox working-tree delta is then applied
-  to the real target.
+  pre-attempt snapshot. `.gitattributes`, `.git/config`, and
+  `.git/info/attributes` must also still be byte-identical to their state
+  right after the sandbox was created, and the promotion diff runs with
+  `--no-ext-diff --no-textconv` -- otherwise a coder-declared Git clean
+  filter or textconv/external-diff driver could run an arbitrary command as
+  the orchestrator's own trusted `git add`/`git diff` invocation, rather
+  than through the coder's own sandboxed process (issue #110). Only the
+  sandbox working-tree delta is then applied to the real target.
 - Runs on the same target are serialized by a per-target lock (below); an
   unconfirmed termination quarantines the target rather than releasing it
   silently.

@@ -9,6 +9,17 @@ The clone uses its own object database (no hard links) and has every remote
 removed before OpenCode sees it.  Deleting or reinitializing the sandbox
 `.git` therefore cannot destroy the real target's refs, objects, reflog,
 index, config, or hooks (GitHub issue #90).
+
+Promotion stages and diffs the sandbox with trusted, Python-issued `git add`/
+`git diff` commands.  Both can invoke attacker-controlled commands -- a clean
+filter via `.gitattributes` + `.git/config`, or a textconv/external diff
+driver -- if the coder-writable sandbox declares them, which would execute
+inside this orchestrator process rather than the coder's own sandboxed one.
+`promote_coder_changes` therefore refuses to stage or diff anything unless
+`.gitattributes`, `.git/config`, and `.git/info/attributes` are still
+byte-identical to the pristine state captured right after the sandbox was
+created, and disables textconv/external-diff for the diff itself
+(GitHub issue #110).
 """
 
 from __future__ import annotations
@@ -87,6 +98,9 @@ class CoderSandbox:
     root: Path
     baseline_head: str
     target_state: GitState
+    gitattributes_baseline: bytes | None
+    git_config_baseline: bytes
+    git_info_attributes_baseline: bytes | None
 
     def __post_init__(self) -> None:
         if not self.container_root.is_absolute():
@@ -97,6 +111,16 @@ class CoderSandbox:
             raise ValueError("baseline_head must not be empty")
         if not isinstance(self.target_state, GitState):
             raise TypeError("target_state must be GitState")
+        if self.gitattributes_baseline is not None and not isinstance(
+            self.gitattributes_baseline, bytes
+        ):
+            raise TypeError("gitattributes_baseline must be bytes or None")
+        if not isinstance(self.git_config_baseline, bytes):
+            raise TypeError("git_config_baseline must be bytes")
+        if self.git_info_attributes_baseline is not None and not isinstance(
+            self.git_info_attributes_baseline, bytes
+        ):
+            raise TypeError("git_info_attributes_baseline must be bytes or None")
 
 
 def _run_git(
@@ -135,6 +159,13 @@ def _run_git(
             process_result=result,
         )
     return result, sink.stdout
+
+
+def _read_file_bytes_or_none(path: Path) -> bytes | None:
+    try:
+        return path.read_bytes()
+    except FileNotFoundError:
+        return None
 
 
 def _single_line(payload: bytes, *, field_name: str) -> str:
@@ -341,6 +372,13 @@ def prepare_coder_sandbox(
             root=sandbox_root,
             baseline_head=baseline_head,
             target_state=capture.state,
+            gitattributes_baseline=_read_file_bytes_or_none(
+                sandbox_root / ".gitattributes"
+            ),
+            git_config_baseline=(git_dir / "config").read_bytes(),
+            git_info_attributes_baseline=_read_file_bytes_or_none(
+                git_dir / "info" / "attributes"
+            ),
         )
     except Exception:
         shutil.rmtree(container_root, ignore_errors=True)
@@ -430,6 +468,36 @@ def promote_coder_changes(
             "The real target changed while the coder was running; sandbox changes were not promoted."
         )
 
+    # `git add`/`git diff` below can invoke a clean filter or a
+    # textconv/external-diff driver declared in .gitattributes + .git/config
+    # or .git/info/attributes, running arbitrary commands as this trusted
+    # orchestrator process rather than the coder's own sandbox (GH #110).
+    # Refuse to stage or diff anything unless these files are still exactly
+    # what they were right after the sandbox was created.
+    if (
+        _read_file_bytes_or_none(sandbox.root / ".gitattributes")
+        != sandbox.gitattributes_baseline
+    ):
+        raise CoderSandboxError(
+            "The coder changed .gitattributes; sandbox changes were not promoted."
+        )
+    git_config_path = git_dir / "config"
+    if (
+        git_config_path.is_symlink()
+        or git_config_path.read_bytes() != sandbox.git_config_baseline
+    ):
+        raise CoderSandboxError(
+            "The coder changed the sandbox's local Git configuration; sandbox changes were not promoted."
+        )
+    git_info_attributes_path = git_dir / "info" / "attributes"
+    if git_info_attributes_path.is_symlink() or (
+        _read_file_bytes_or_none(git_info_attributes_path)
+        != sandbox.git_info_attributes_baseline
+    ):
+        raise CoderSandboxError(
+            "The coder added Git attribute overrides outside version control; sandbox changes were not promoted."
+        )
+
     _run_git(
         process_runner,
         git_executable=git_executable,
@@ -447,6 +515,8 @@ def promote_coder_changes(
             "-C",
             str(sandbox.root),
             "diff",
+            "--no-ext-diff",
+            "--no-textconv",
             "--cached",
             "--binary",
             "--full-index",

@@ -170,3 +170,107 @@ def test_target_drift_blocks_sandbox_promotion(tmp_path: Path) -> None:
         cleanup_coder_sandbox(sandbox)
 
     assert (root / "README.md").read_text(encoding="utf-8") == "external change\n"
+
+
+def test_promotion_refuses_and_never_runs_a_coder_planted_clean_filter(
+    tmp_path: Path,
+) -> None:
+    """GH #110: a coder-declared clean filter must never execute during promotion."""
+
+    root, target = _repository(tmp_path)
+    marker = tmp_path / "pwned-marker"
+
+    git, clock, runner, sandbox = _prepare(target)
+    try:
+        (sandbox.root / "README.md").write_text("coder change\n", encoding="utf-8")
+        (sandbox.root / ".gitattributes").write_text(
+            "* filter=evil\n", encoding="utf-8"
+        )
+        _git(
+            [
+                "config",
+                "--local",
+                "filter.evil.clean",
+                f"touch {marker} && cat",
+            ],
+            cwd=sandbox.root,
+        )
+
+        with pytest.raises(CoderSandboxError, match="gitattributes"):
+            promote_coder_changes(
+                runner,
+                git_executable=git,
+                target=target,
+                sandbox=sandbox,
+                clock=clock,
+                utility_timeout_seconds=10,
+                termination_grace_seconds=1,
+            )
+    finally:
+        cleanup_coder_sandbox(sandbox)
+
+    assert not marker.exists()
+    assert (root / "README.md").read_text(encoding="utf-8") == "before\n"
+
+
+def test_promotion_refuses_a_coder_planted_git_config_change_alone(
+    tmp_path: Path,
+) -> None:
+    """GH #110: a config-only driver (e.g. diff.external) must also block promotion."""
+
+    root, target = _repository(tmp_path)
+    marker = tmp_path / "pwned-marker-config-only"
+
+    git, clock, runner, sandbox = _prepare(target)
+    try:
+        (sandbox.root / "README.md").write_text("coder change\n", encoding="utf-8")
+        _git(
+            ["config", "--local", "diff.external", f"sh -c 'touch {marker}'"],
+            cwd=sandbox.root,
+        )
+
+        with pytest.raises(CoderSandboxError, match="Git configuration"):
+            promote_coder_changes(
+                runner,
+                git_executable=git,
+                target=target,
+                sandbox=sandbox,
+                clock=clock,
+                utility_timeout_seconds=10,
+                termination_grace_seconds=1,
+            )
+    finally:
+        cleanup_coder_sandbox(sandbox)
+
+    assert not marker.exists()
+    assert (root / "README.md").read_text(encoding="utf-8") == "before\n"
+
+
+def test_promotion_refuses_a_coder_planted_local_info_attributes(
+    tmp_path: Path,
+) -> None:
+    """GH #110: an untracked .git/info/attributes override must also block promotion."""
+
+    root, target = _repository(tmp_path)
+
+    git, clock, runner, sandbox = _prepare(target)
+    try:
+        (sandbox.root / "README.md").write_text("coder change\n", encoding="utf-8")
+        (sandbox.root / ".git" / "info" / "attributes").write_text(
+            "* filter=evil\n", encoding="utf-8"
+        )
+
+        with pytest.raises(CoderSandboxError, match="attribute overrides"):
+            promote_coder_changes(
+                runner,
+                git_executable=git,
+                target=target,
+                sandbox=sandbox,
+                clock=clock,
+                utility_timeout_seconds=10,
+                termination_grace_seconds=1,
+            )
+    finally:
+        cleanup_coder_sandbox(sandbox)
+
+    assert (root / "README.md").read_text(encoding="utf-8") == "before\n"

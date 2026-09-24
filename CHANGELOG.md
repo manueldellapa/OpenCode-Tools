@@ -5,6 +5,18 @@ loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Security
+
+- Closed a Git clean-filter/textconv remote command execution path in coder
+  sandbox promotion (issue #110): a coder-writable `.gitattributes`,
+  `.git/config`, or `.git/info/attributes` could previously make the
+  orchestrator's own trusted `git add`/`git diff` invocations run an
+  arbitrary command as the operator's user, before the coder's changes were
+  even promoted. `promote_coder_changes` now refuses to stage or diff
+  anything unless those three files are still byte-identical to the state
+  captured right after the sandbox was created, and passes
+  `--no-ext-diff --no-textconv` to the diff itself as defense in depth.
+
 ## [0.1.2] - 2026-09-22
 
 ### Security
