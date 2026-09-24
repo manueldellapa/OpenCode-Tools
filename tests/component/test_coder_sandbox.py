@@ -603,3 +603,80 @@ def test_promotion_handles_filenames_with_newline_tab_and_space(
     assert (root / "README.md").read_text(encoding="utf-8") == "also modified\n"
     for name in tricky_names:
         assert (root / name).read_text(encoding="utf-8") == f"content: {name!r}\n"
+
+
+def test_promotion_preserves_checkout_normalized_files_left_untouched(
+    tmp_path: Path,
+) -> None:
+    """GH #110 P1 review: a file only affected by checkout-time EOL
+    normalization (e.g. `eol=crlf`) must keep its exact baseline blob when
+    the coder never actually touches it -- not be "promoted" back to its
+    raw, CRLF-converted checkout form."""
+
+    root = tmp_path / "target"
+    root.mkdir()
+    _git(["init", "--quiet", "--initial-branch=main"], cwd=root)
+    (root / ".gitattributes").write_text("*.txt text eol=crlf\n", encoding="utf-8")
+    (root / "file.txt").write_bytes(b"line1\nline2\n")
+    _git(["add", "-A"], cwd=root)
+    _git(["commit", "--quiet", "-m", "initial"], cwd=root)
+    git_dir = Path(_git(["rev-parse", "--absolute-git-dir"], cwd=root))
+    target = TargetRepository(
+        root=root.resolve(),
+        workspace_relative=Path("."),
+        git_common_dir=git_dir.resolve(),
+    )
+    original_bytes = (root / "file.txt").read_bytes()
+
+    git, clock, runner, sandbox = _prepare(target)
+    try:
+        # Confirm the sandbox checkout actually materialized CRLF, so this
+        # test exercises real checkout normalization, not a no-op.
+        assert b"\r\n" in (sandbox.root / "file.txt").read_bytes()
+
+        (sandbox.root / "NEW.txt").write_text("new\n", encoding="utf-8")
+
+        promote_coder_changes(
+            runner,
+            git_executable=git,
+            target=target,
+            sandbox=sandbox,
+            clock=clock,
+            utility_timeout_seconds=10,
+            termination_grace_seconds=1,
+        )
+    finally:
+        cleanup_coder_sandbox(sandbox)
+
+    assert (root / "file.txt").read_bytes() == original_bytes
+    assert (root / "NEW.txt").read_text(encoding="utf-8") == "new\n"
+
+
+def test_promotion_refuses_an_unreadable_candidate_file(tmp_path: Path) -> None:
+    """GH #110 P2 review: a coder-unreadable file (e.g. `chmod 000`) must
+    raise CoderSandboxError, not a raw PermissionError."""
+
+    root, target = _repository(tmp_path)
+
+    git, clock, runner, sandbox = _prepare(target)
+    secret = sandbox.root / "secret.txt"
+    try:
+        secret.write_text("top secret\n", encoding="utf-8")
+        secret.chmod(0o000)
+
+        with pytest.raises(CoderSandboxError, match="could not be read"):
+            promote_coder_changes(
+                runner,
+                git_executable=git,
+                target=target,
+                sandbox=sandbox,
+                clock=clock,
+                utility_timeout_seconds=10,
+                termination_grace_seconds=1,
+            )
+    finally:
+        secret.chmod(0o644)
+        cleanup_coder_sandbox(sandbox)
+
+    assert (root / "README.md").read_text(encoding="utf-8") == "before\n"
+    assert not (root / "secret.txt").exists()
