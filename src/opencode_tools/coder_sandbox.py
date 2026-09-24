@@ -10,15 +10,20 @@ removed before OpenCode sees it.  Deleting or reinitializing the sandbox
 `.git` therefore cannot destroy the real target's refs, objects, reflog,
 index, config, or hooks (GitHub issue #90).
 
-Promotion stages and diffs the sandbox with trusted, Python-issued `git add`/
-`git diff` commands.  Both can invoke attacker-controlled commands -- a clean
-filter via `.gitattributes` + `.git/config`, or a textconv/external diff
-driver -- if the coder-writable sandbox declares them, which would execute
-inside this orchestrator process rather than the coder's own sandboxed one.
-`promote_coder_changes` therefore refuses to stage or diff anything unless
-`.gitattributes`, `.git/config`, and `.git/info/attributes` are still
-byte-identical to the pristine state captured right after the sandbox was
-created, and disables textconv/external-diff for the diff itself
+Promotion never runs `git add`.  Staging by path applies whatever clean
+filter `.gitattributes` selects for that path -- and Git looks for
+`.gitattributes` in *every* directory of the tree, not only the root, with
+the filter command itself coming from `.git/config` (local, or the
+machine's global/system config). None of that is something the coder-
+writable sandbox lets this trusted process enumerate up front. Instead,
+`promote_coder_changes` hashes every entry directly with
+`git hash-object --no-filters` -- Git's own documented way to compute a
+blob exactly as `add` would while skipping the filter entirely -- assembles
+those blobs into a throwaway index, and diffs that against the baseline
+commit with `--no-ext-diff --no-textconv` as well, so no attribute or
+filter lookup is ever consulted for the promoted content. The earlier
+`.gitattributes`/`.git/config`/`.git/info/attributes` byte-identity checks
+against the sandbox's pristine baseline remain as defense in depth
 (GitHub issue #110).
 """
 
@@ -424,6 +429,169 @@ def prepare_coder_sandbox(
         raise
 
 
+def _scan_sandbox_tree(sandbox_root: Path) -> tuple[list[Path], list[Path]]:
+    """Classify every entry under the sandbox root, excluding `.git`.
+
+    Returns (regular_files, symlinks). Anything else -- a FIFO, socket, or
+    device the coder planted -- is never a legitimate source change, so it
+    fails closed immediately rather than being silently skipped or read.
+    """
+    regular_files: list[Path] = []
+    symlinks: list[Path] = []
+    stack: list[Path] = [sandbox_root]
+    while stack:
+        current = stack.pop()
+        with os.scandir(current) as scanned:
+            for entry in scanned:
+                if current == sandbox_root and entry.name == ".git":
+                    continue
+                if entry.is_symlink():
+                    symlinks.append(Path(entry.path))
+                elif entry.is_dir(follow_symlinks=False):
+                    stack.append(Path(entry.path))
+                elif entry.is_file(follow_symlinks=False):
+                    regular_files.append(Path(entry.path))
+                else:
+                    raise CoderSandboxError(
+                        f"{entry.path} is an unsupported file type; "
+                        "sandbox changes were not promoted."
+                    )
+    return regular_files, symlinks
+
+
+def _build_promotion_patch(
+    process_runner: ProcessRunner,
+    *,
+    git_executable: Path,
+    sandbox: CoderSandbox,
+    utility_timeout_seconds: float,
+    termination_grace_seconds: float,
+) -> bytes:
+    """Build the promotion patch without ever staging through `git add`.
+
+    Every tracked-shape entry is hashed with `git hash-object --no-filters`
+    (never following the clean-filter/attribute machinery), assembled into
+    a throwaway index at a private `GIT_INDEX_FILE`, and diffed against the
+    sandbox's baseline commit -- see the module docstring.
+    """
+    regular_files, symlinks = _scan_sandbox_tree(sandbox.root)
+    index_entries: list[str] = []
+
+    if regular_files:
+        stdin_paths = ("\n".join(str(path) for path in regular_files) + "\n").encode(
+            "utf-8"
+        )
+        _, hashes_raw = _run_git(
+            process_runner,
+            git_executable=git_executable,
+            cwd=sandbox.root,
+            argv_tail=(
+                "-C",
+                str(sandbox.root),
+                "hash-object",
+                "--no-filters",
+                "-w",
+                "-t",
+                "blob",
+                "--stdin-paths",
+            ),
+            timeout_seconds=utility_timeout_seconds,
+            termination_grace_seconds=termination_grace_seconds,
+            stdin=stdin_paths,
+            log_name="coder-sandbox-promote-hash-object-files.log",
+        )
+        hashes = hashes_raw.decode("utf-8").split()
+        if len(hashes) != len(regular_files):
+            raise CoderSandboxError(
+                "git hash-object returned an unexpected number of blob hashes; "
+                "sandbox changes were not promoted."
+            )
+        for path, sha in zip(regular_files, hashes, strict=True):
+            mode = "100755" if os.lstat(path).st_mode & 0o111 else "100644"
+            rel_path = path.relative_to(sandbox.root).as_posix()
+            index_entries.append(f"{mode} {sha} 0\t{rel_path}\n")
+
+    for path in symlinks:
+        target_bytes = os.readlink(path).encode("utf-8")
+        _, sha_raw = _run_git(
+            process_runner,
+            git_executable=git_executable,
+            cwd=sandbox.root,
+            argv_tail=(
+                "-C",
+                str(sandbox.root),
+                "hash-object",
+                "--no-filters",
+                "-w",
+                "-t",
+                "blob",
+                "--stdin",
+            ),
+            timeout_seconds=utility_timeout_seconds,
+            termination_grace_seconds=termination_grace_seconds,
+            stdin=target_bytes,
+            log_name="coder-sandbox-promote-hash-object-symlink.log",
+        )
+        sha = _single_line(sha_raw, field_name="symlink blob hash")
+        rel_path = path.relative_to(sandbox.root).as_posix()
+        index_entries.append(f"120000 {sha} 0\t{rel_path}\n")
+
+    promote_index = sandbox.container_root / "promote.index"
+    index_env = {"GIT_INDEX_FILE": str(promote_index)}
+
+    _run_git(
+        process_runner,
+        git_executable=git_executable,
+        cwd=sandbox.root,
+        argv_tail=("-C", str(sandbox.root), "read-tree", "--empty"),
+        timeout_seconds=utility_timeout_seconds,
+        termination_grace_seconds=termination_grace_seconds,
+        environment_overrides=index_env,
+        log_name="coder-sandbox-promote-read-tree-empty.log",
+    )
+    if index_entries:
+        _run_git(
+            process_runner,
+            git_executable=git_executable,
+            cwd=sandbox.root,
+            argv_tail=(
+                "-C",
+                str(sandbox.root),
+                "update-index",
+                "--add",
+                "--index-info",
+            ),
+            timeout_seconds=utility_timeout_seconds,
+            termination_grace_seconds=termination_grace_seconds,
+            stdin="".join(index_entries).encode("utf-8"),
+            environment_overrides=index_env,
+            log_name="coder-sandbox-promote-update-index.log",
+        )
+
+    _, patch = _run_git(
+        process_runner,
+        git_executable=git_executable,
+        cwd=sandbox.root,
+        argv_tail=(
+            "-C",
+            str(sandbox.root),
+            "diff",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--cached",
+            "--binary",
+            "--full-index",
+            sandbox.baseline_head,
+            "--",
+        ),
+        timeout_seconds=utility_timeout_seconds,
+        termination_grace_seconds=termination_grace_seconds,
+        environment_overrides=index_env,
+        log_name="coder-sandbox-promote-diff.log",
+    )
+    return patch
+
+
 def promote_coder_changes(
     process_runner: ProcessRunner,
     *,
@@ -507,12 +675,13 @@ def promote_coder_changes(
             "The real target changed while the coder was running; sandbox changes were not promoted."
         )
 
-    # `git add`/`git diff` below can invoke a clean filter or a
-    # textconv/external-diff driver declared in .gitattributes + .git/config
-    # or .git/info/attributes, running arbitrary commands as this trusted
-    # orchestrator process rather than the coder's own sandbox (GH #110).
-    # Refuse to stage or diff anything unless these files are still exactly
-    # what they were right after the sandbox was created.
+    # Defense in depth (GH #110): a clean filter or textconv/external-diff
+    # driver declared anywhere the coder can reach -- root or nested
+    # .gitattributes, .git/config -- would run as this trusted orchestrator
+    # process, not the coder's own sandbox. The patch built below never
+    # stages by path, so none of this is actually consulted for content;
+    # still refuse promotion if the sandbox's own integrity files were
+    # touched, since that is itself a sign of tampering worth failing on.
     if (
         _read_integrity_file_or_none(sandbox.root / ".gitattributes")
         != sandbox.gitattributes_baseline
@@ -533,34 +702,12 @@ def promote_coder_changes(
             "The coder added Git attribute overrides outside version control; sandbox changes were not promoted."
         )
 
-    _run_git(
+    patch = _build_promotion_patch(
         process_runner,
         git_executable=git_executable,
-        cwd=sandbox.root,
-        argv_tail=("-C", str(sandbox.root), "add", "-A", "--"),
-        timeout_seconds=utility_timeout_seconds,
+        sandbox=sandbox,
+        utility_timeout_seconds=utility_timeout_seconds,
         termination_grace_seconds=termination_grace_seconds,
-        log_name="coder-sandbox-promote-add.log",
-    )
-    _, patch = _run_git(
-        process_runner,
-        git_executable=git_executable,
-        cwd=sandbox.root,
-        argv_tail=(
-            "-C",
-            str(sandbox.root),
-            "diff",
-            "--no-ext-diff",
-            "--no-textconv",
-            "--cached",
-            "--binary",
-            "--full-index",
-            "HEAD",
-            "--",
-        ),
-        timeout_seconds=utility_timeout_seconds,
-        termination_grace_seconds=termination_grace_seconds,
-        log_name="coder-sandbox-promote-diff.log",
     )
     if not patch:
         return

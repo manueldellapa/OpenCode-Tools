@@ -18,8 +18,21 @@ from opencode_tools.coder_sandbox import (
     prepare_coder_sandbox,
     promote_coder_changes,
 )
-from opencode_tools.domain import TargetRepository
+from opencode_tools.domain import ProcessResult, ProcessSpec, TargetRepository
+from opencode_tools.ports import AttemptLogSink
 from opencode_tools.process import SubprocessRunner
+
+
+class _RecordingProcessRunner:
+    """Wraps a real ProcessRunner and records every spec's argv."""
+
+    def __init__(self, inner: SubprocessRunner) -> None:
+        self._inner = inner
+        self.recorded_argv: list[tuple[str, ...]] = []
+
+    def run(self, spec: ProcessSpec, *, sink: AttemptLogSink) -> ProcessResult:
+        self.recorded_argv.append(spec.argv)
+        return self._inner.run(spec, sink=sink)
 
 
 class RealClock:
@@ -358,3 +371,162 @@ def test_promotion_refuses_git_info_attributes_replaced_with_a_fifo(
         cleanup_coder_sandbox(sandbox)
 
     assert (root / "README.md").read_text(encoding="utf-8") == "before\n"
+
+
+def test_promotion_never_invokes_git_add(tmp_path: Path) -> None:
+    """GH #110 P1 review: the promotion path must never stage by path at all."""
+
+    root, target = _repository(tmp_path)
+
+    git, clock, runner, sandbox = _prepare(target)
+    recorder = _RecordingProcessRunner(runner)
+    try:
+        (sandbox.root / "README.md").write_text("coder change\n", encoding="utf-8")
+        (sandbox.root / "REMOVE.txt").unlink()
+        (sandbox.root / "NEW.txt").write_text("new\n", encoding="utf-8")
+
+        promote_coder_changes(
+            recorder,
+            git_executable=git,
+            target=target,
+            sandbox=sandbox,
+            clock=clock,
+            utility_timeout_seconds=10,
+            termination_grace_seconds=1,
+        )
+    finally:
+        cleanup_coder_sandbox(sandbox)
+
+    assert recorder.recorded_argv, "expected at least one git invocation"
+    for argv in recorder.recorded_argv:
+        assert "add" not in argv, f"promotion invoked a staging command: {argv}"
+    assert (root / "README.md").read_text(encoding="utf-8") == "coder change\n"
+    assert not (root / "REMOVE.txt").exists()
+    assert (root / "NEW.txt").read_text(encoding="utf-8") == "new\n"
+
+
+def test_promotion_ignores_a_nested_gitattributes_clean_filter(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """GH #110 P1: a clean filter reachable only via a NESTED .gitattributes,
+    with the filter driver itself only defined in global/system config (so
+    neither the root .gitattributes nor the sandbox's local .git/config
+    baseline ever changes), must still never execute."""
+
+    root, target = _repository(tmp_path)
+    marker = tmp_path / "pwned-marker-nested"
+    global_gitconfig = tmp_path / "fake-global-gitconfig"
+    global_gitconfig.write_text(
+        f'[filter "evil"]\n\tclean = touch {marker} && cat\n', encoding="utf-8"
+    )
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(global_gitconfig))
+
+    git, clock, runner, sandbox = _prepare(target)
+    try:
+        nested = sandbox.root / "subdir"
+        nested.mkdir()
+        (nested / ".gitattributes").write_text("* filter=evil\n", encoding="utf-8")
+        (nested / "payload.txt").write_text("nested coder change\n", encoding="utf-8")
+
+        # Neither integrity baseline changed -- the root .gitattributes and
+        # the sandbox's local .git/config are untouched by this attack.
+        promote_coder_changes(
+            runner,
+            git_executable=git,
+            target=target,
+            sandbox=sandbox,
+            clock=clock,
+            utility_timeout_seconds=10,
+            termination_grace_seconds=1,
+        )
+    finally:
+        cleanup_coder_sandbox(sandbox)
+
+    assert not marker.exists()
+    assert (root / "subdir" / "payload.txt").read_text(
+        encoding="utf-8"
+    ) == "nested coder change\n"
+    assert (root / "subdir" / ".gitattributes").read_text(
+        encoding="utf-8"
+    ) == "* filter=evil\n"
+
+
+def test_promotion_ignores_diff_external_and_textconv(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """GH #110 P1: neither a global diff.external nor a nested-attribute
+    textconv driver may run while building the promotion patch."""
+
+    root, target = _repository(tmp_path)
+    marker = tmp_path / "pwned-marker-diff"
+    global_gitconfig = tmp_path / "fake-global-gitconfig-diff"
+    global_gitconfig.write_text(
+        f"[diff]\n\texternal = sh -c 'touch {marker}'\n"
+        f"[diff \"evil\"]\n\ttextconv = sh -c 'touch {marker}; cat'\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(global_gitconfig))
+
+    git, clock, runner, sandbox = _prepare(target)
+    try:
+        nested = sandbox.root / "subdir"
+        nested.mkdir()
+        (nested / ".gitattributes").write_text("* diff=evil\n", encoding="utf-8")
+        (sandbox.root / "README.md").write_text("coder change\n", encoding="utf-8")
+        (nested / "payload.txt").write_text("nested payload\n", encoding="utf-8")
+
+        promote_coder_changes(
+            runner,
+            git_executable=git,
+            target=target,
+            sandbox=sandbox,
+            clock=clock,
+            utility_timeout_seconds=10,
+            termination_grace_seconds=1,
+        )
+    finally:
+        cleanup_coder_sandbox(sandbox)
+
+    assert not marker.exists()
+    assert (root / "README.md").read_text(encoding="utf-8") == "coder change\n"
+    assert (root / "subdir" / "payload.txt").read_text(
+        encoding="utf-8"
+    ) == "nested payload\n"
+
+
+def test_promotion_handles_add_modify_delete_binary_and_executable_mode(
+    tmp_path: Path,
+) -> None:
+    """GH #110 P1: the plumbing-based patch must still cover the full shape
+    of a legitimate change set, not only plain text modifications."""
+
+    root, target = _repository(tmp_path)
+    binary_payload = bytes(range(256)) * 4
+
+    git, clock, runner, sandbox = _prepare(target)
+    try:
+        (sandbox.root / "README.md").write_text("modified\n", encoding="utf-8")
+        (sandbox.root / "REMOVE.txt").unlink()
+        (sandbox.root / "asset.bin").write_bytes(binary_payload)
+        script = sandbox.root / "run.sh"
+        script.write_text("#!/bin/sh\necho hi\n", encoding="utf-8")
+        script.chmod(0o755)
+
+        promote_coder_changes(
+            runner,
+            git_executable=git,
+            target=target,
+            sandbox=sandbox,
+            clock=clock,
+            utility_timeout_seconds=10,
+            termination_grace_seconds=1,
+        )
+    finally:
+        cleanup_coder_sandbox(sandbox)
+
+    assert (root / "README.md").read_text(encoding="utf-8") == "modified\n"
+    assert not (root / "REMOVE.txt").exists()
+    assert (root / "asset.bin").read_bytes() == binary_payload
+    promoted_script = root / "run.sh"
+    assert promoted_script.read_text(encoding="utf-8") == "#!/bin/sh\necho hi\n"
+    assert promoted_script.stat().st_mode & 0o111, "executable bit was not promoted"
