@@ -274,3 +274,87 @@ def test_promotion_refuses_a_coder_planted_local_info_attributes(
         cleanup_coder_sandbox(sandbox)
 
     assert (root / "README.md").read_text(encoding="utf-8") == "before\n"
+
+
+def test_promotion_refuses_a_missing_git_config_as_a_sandbox_error(
+    tmp_path: Path,
+) -> None:
+    """GH #110 review: a missing .git/config must raise CoderSandboxError, not FileNotFoundError."""
+
+    root, target = _repository(tmp_path)
+
+    git, clock, runner, sandbox = _prepare(target)
+    try:
+        (sandbox.root / "README.md").write_text("coder change\n", encoding="utf-8")
+        (sandbox.root / ".git" / "config").unlink()
+
+        with pytest.raises(CoderSandboxError, match="Git configuration"):
+            promote_coder_changes(
+                runner,
+                git_executable=git,
+                target=target,
+                sandbox=sandbox,
+                clock=clock,
+                utility_timeout_seconds=10,
+                termination_grace_seconds=1,
+            )
+    finally:
+        cleanup_coder_sandbox(sandbox)
+
+    assert (root / "README.md").read_text(encoding="utf-8") == "before\n"
+
+
+def test_promotion_refuses_gitattributes_replaced_with_a_symlink(
+    tmp_path: Path,
+) -> None:
+    """GH #110 review: an integrity file must never be read through a symlink."""
+
+    root, target = _repository(tmp_path)
+
+    git, clock, runner, sandbox = _prepare(target)
+    try:
+        (sandbox.root / "README.md").write_text("coder change\n", encoding="utf-8")
+        os.symlink(sandbox.root / "README.md", sandbox.root / ".gitattributes")
+
+        with pytest.raises(CoderSandboxError, match="non-symlinked"):
+            promote_coder_changes(
+                runner,
+                git_executable=git,
+                target=target,
+                sandbox=sandbox,
+                clock=clock,
+                utility_timeout_seconds=10,
+                termination_grace_seconds=1,
+            )
+    finally:
+        cleanup_coder_sandbox(sandbox)
+
+    assert (root / "README.md").read_text(encoding="utf-8") == "before\n"
+
+
+def test_promotion_refuses_git_info_attributes_replaced_with_a_fifo(
+    tmp_path: Path,
+) -> None:
+    """GH #110 review: a non-regular file (e.g. a FIFO) must be rejected, never read."""
+
+    root, target = _repository(tmp_path)
+
+    git, clock, runner, sandbox = _prepare(target)
+    try:
+        (sandbox.root / "README.md").write_text("coder change\n", encoding="utf-8")
+        os.mkfifo(sandbox.root / ".git" / "info" / "attributes")
+
+        with pytest.raises(CoderSandboxError, match="not a regular file"):
+            promote_coder_changes(
+                runner,
+                git_executable=git,
+                target=target,
+                sandbox=sandbox,
+                clock=clock,
+                utility_timeout_seconds=10,
+                termination_grace_seconds=1,
+            )
+    finally:
+        cleanup_coder_sandbox(sandbox)
+
+    assert (root / "README.md").read_text(encoding="utf-8") == "before\n"

@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import stat
 import tempfile
 from dataclasses import dataclass
 from datetime import datetime
@@ -43,6 +44,7 @@ from opencode_tools.domain import (
 from opencode_tools.ports import Clock, LogChannel, ProcessRunner
 
 _MAX_CAPTURE_BYTES = 64 * 1024 * 1024
+_MAX_INTEGRITY_FILE_BYTES = 1024 * 1024
 _SANDBOX_COMMIT_MESSAGE = "OpenCode-Tools coder sandbox baseline"
 _SANDBOX_AUTHOR_NAME = "OpenCode-Tools"
 _SANDBOX_AUTHOR_EMAIL = "opencode-tools@localhost"
@@ -161,11 +163,42 @@ def _run_git(
     return result, sink.stdout
 
 
-def _read_file_bytes_or_none(path: Path) -> bytes | None:
+def _read_integrity_file_or_none(path: Path) -> bytes | None:
+    """Read one of the sandbox's Git integrity-sensitive files.
+
+    Used for `.gitattributes`, `.git/config`, and `.git/info/attributes`,
+    each of which is coder-writable and must be compared byte-for-byte
+    against its pristine baseline before `git add`/`git diff` ever touch the
+    sandbox (GH #110). Fails closed rather than reading through a symlink,
+    accepting a non-regular file (a FIFO would hang a plain read), or
+    reading past a bound -- any of those is itself a sign of tampering, not
+    a legitimate state, given a plain `git clone` never produces one.
+    """
     try:
-        return path.read_bytes()
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     except FileNotFoundError:
         return None
+    except OSError as error:
+        raise CoderSandboxError(
+            f"{path} could not be safely read as a regular, non-symlinked file; "
+            "sandbox changes were not promoted."
+        ) from error
+    try:
+        file_stat = os.fstat(fd)
+        if not stat.S_ISREG(file_stat.st_mode):
+            raise CoderSandboxError(
+                f"{path} is unexpectedly not a regular file; "
+                "sandbox changes were not promoted."
+            )
+        data = os.read(fd, _MAX_INTEGRITY_FILE_BYTES + 1)
+        if len(data) > _MAX_INTEGRITY_FILE_BYTES:
+            raise CoderSandboxError(
+                f"{path} unexpectedly exceeds the bounded read size; "
+                "sandbox changes were not promoted."
+            )
+        return data
+    finally:
+        os.close(fd)
 
 
 def _single_line(payload: bytes, *, field_name: str) -> str:
@@ -367,16 +400,22 @@ def prepare_coder_sandbox(
         )
         baseline_head = _single_line(baseline_head_raw, field_name="baseline HEAD")
 
+        git_config_baseline = _read_integrity_file_or_none(git_dir / "config")
+        if git_config_baseline is None:
+            raise CoderSandboxError(
+                "The coder sandbox's .git/config is missing right after creation."
+            )
+
         return CoderSandbox(
             container_root=container_root,
             root=sandbox_root,
             baseline_head=baseline_head,
             target_state=capture.state,
-            gitattributes_baseline=_read_file_bytes_or_none(
+            gitattributes_baseline=_read_integrity_file_or_none(
                 sandbox_root / ".gitattributes"
             ),
-            git_config_baseline=(git_dir / "config").read_bytes(),
-            git_info_attributes_baseline=_read_file_bytes_or_none(
+            git_config_baseline=git_config_baseline,
+            git_info_attributes_baseline=_read_integrity_file_or_none(
                 git_dir / "info" / "attributes"
             ),
         )
@@ -475,23 +514,19 @@ def promote_coder_changes(
     # Refuse to stage or diff anything unless these files are still exactly
     # what they were right after the sandbox was created.
     if (
-        _read_file_bytes_or_none(sandbox.root / ".gitattributes")
+        _read_integrity_file_or_none(sandbox.root / ".gitattributes")
         != sandbox.gitattributes_baseline
     ):
         raise CoderSandboxError(
             "The coder changed .gitattributes; sandbox changes were not promoted."
         )
-    git_config_path = git_dir / "config"
-    if (
-        git_config_path.is_symlink()
-        or git_config_path.read_bytes() != sandbox.git_config_baseline
-    ):
+    current_git_config = _read_integrity_file_or_none(git_dir / "config")
+    if current_git_config is None or current_git_config != sandbox.git_config_baseline:
         raise CoderSandboxError(
             "The coder changed the sandbox's local Git configuration; sandbox changes were not promoted."
         )
-    git_info_attributes_path = git_dir / "info" / "attributes"
-    if git_info_attributes_path.is_symlink() or (
-        _read_file_bytes_or_none(git_info_attributes_path)
+    if (
+        _read_integrity_file_or_none(git_dir / "info" / "attributes")
         != sandbox.git_info_attributes_baseline
     ):
         raise CoderSandboxError(
