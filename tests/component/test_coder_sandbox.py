@@ -530,3 +530,76 @@ def test_promotion_handles_add_modify_delete_binary_and_executable_mode(
     promoted_script = root / "run.sh"
     assert promoted_script.read_text(encoding="utf-8") == "#!/bin/sh\necho hi\n"
     assert promoted_script.stat().st_mode & 0o111, "executable bit was not promoted"
+
+
+def test_promotion_excludes_gitignored_untracked_files(tmp_path: Path) -> None:
+    """GH #110 P1 review: ignored untracked files/directories must never be
+    promoted, matching what `git add -A` itself would have excluded."""
+
+    root, target = _repository(tmp_path)
+
+    git, clock, runner, sandbox = _prepare(target)
+    try:
+        (sandbox.root / ".gitignore").write_text(
+            "ignored.txt\nbuild/\n", encoding="utf-8"
+        )
+        (sandbox.root / "ignored.txt").write_text(
+            "should not be promoted\n", encoding="utf-8"
+        )
+        build_dir = sandbox.root / "build"
+        build_dir.mkdir()
+        (build_dir / "artifact.bin").write_bytes(b"\x00\x01\x02\x03")
+        (sandbox.root / "NEW.txt").write_text("legitimate change\n", encoding="utf-8")
+
+        promote_coder_changes(
+            runner,
+            git_executable=git,
+            target=target,
+            sandbox=sandbox,
+            clock=clock,
+            utility_timeout_seconds=10,
+            termination_grace_seconds=1,
+        )
+    finally:
+        cleanup_coder_sandbox(sandbox)
+
+    assert (root / ".gitignore").read_text(encoding="utf-8") == "ignored.txt\nbuild/\n"
+    assert (root / "NEW.txt").read_text(encoding="utf-8") == "legitimate change\n"
+    assert not (root / "ignored.txt").exists()
+    assert not (root / "build").exists()
+
+
+def test_promotion_handles_filenames_with_newline_tab_and_space(
+    tmp_path: Path,
+) -> None:
+    """GH #110 P2 review: a filename containing a literal newline, tab, or
+    space must not corrupt promotion or fail an unrelated change."""
+
+    root, target = _repository(tmp_path)
+    tricky_names = [
+        "file\nwith\nnewline.txt",
+        "file\twith\ttab.txt",
+        "file with space.txt",
+    ]
+
+    git, clock, runner, sandbox = _prepare(target)
+    try:
+        for name in tricky_names:
+            (sandbox.root / name).write_text(f"content: {name!r}\n", encoding="utf-8")
+        (sandbox.root / "README.md").write_text("also modified\n", encoding="utf-8")
+
+        promote_coder_changes(
+            runner,
+            git_executable=git,
+            target=target,
+            sandbox=sandbox,
+            clock=clock,
+            utility_timeout_seconds=10,
+            termination_grace_seconds=1,
+        )
+    finally:
+        cleanup_coder_sandbox(sandbox)
+
+    assert (root / "README.md").read_text(encoding="utf-8") == "also modified\n"
+    for name in tricky_names:
+        assert (root / name).read_text(encoding="utf-8") == f"content: {name!r}\n"

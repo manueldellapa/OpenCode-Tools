@@ -16,12 +16,17 @@ filter `.gitattributes` selects for that path -- and Git looks for
 the filter command itself coming from `.git/config` (local, or the
 machine's global/system config). None of that is something the coder-
 writable sandbox lets this trusted process enumerate up front. Instead,
-`promote_coder_changes` hashes every entry directly with
-`git hash-object --no-filters` -- Git's own documented way to compute a
-blob exactly as `add` would while skipping the filter entirely -- assembles
-those blobs into a throwaway index, and diffs that against the baseline
-commit with `--no-ext-diff --no-textconv` as well, so no attribute or
-filter lookup is ever consulted for the promoted content. The earlier
+`promote_coder_changes` builds the candidate path set the same way
+`git add -A` would -- tracked files plus non-ignored untracked ones, via
+`git ls-files --cached --others --exclude-standard`, so ignored artifacts
+a coder's own tooling produced are never promoted -- then hashes each one
+directly with `git hash-object --no-filters` (Git's own documented way to
+compute a blob exactly as `add` would while skipping the filter entirely),
+assembles those blobs into a throwaway index, and diffs that against the
+baseline commit with `--no-ext-diff --no-textconv` as well. Every path
+list involved is NUL-delimited (`-z` / `--index-info` with `-z`), since a
+Git filename may contain a literal newline or tab. No attribute or filter
+lookup is ever consulted for the promoted content. The earlier
 `.gitattributes`/`.git/config`/`.git/info/attributes` byte-identity checks
 against the sandbox's pristine baseline remain as defense in depth
 (GitHub issue #110).
@@ -429,36 +434,6 @@ def prepare_coder_sandbox(
         raise
 
 
-def _scan_sandbox_tree(sandbox_root: Path) -> tuple[list[Path], list[Path]]:
-    """Classify every entry under the sandbox root, excluding `.git`.
-
-    Returns (regular_files, symlinks). Anything else -- a FIFO, socket, or
-    device the coder planted -- is never a legitimate source change, so it
-    fails closed immediately rather than being silently skipped or read.
-    """
-    regular_files: list[Path] = []
-    symlinks: list[Path] = []
-    stack: list[Path] = [sandbox_root]
-    while stack:
-        current = stack.pop()
-        with os.scandir(current) as scanned:
-            for entry in scanned:
-                if current == sandbox_root and entry.name == ".git":
-                    continue
-                if entry.is_symlink():
-                    symlinks.append(Path(entry.path))
-                elif entry.is_dir(follow_symlinks=False):
-                    stack.append(Path(entry.path))
-                elif entry.is_file(follow_symlinks=False):
-                    regular_files.append(Path(entry.path))
-                else:
-                    raise CoderSandboxError(
-                        f"{entry.path} is an unsupported file type; "
-                        "sandbox changes were not promoted."
-                    )
-    return regular_files, symlinks
-
-
 def _build_promotion_patch(
     process_runner: ProcessRunner,
     *,
@@ -469,50 +444,62 @@ def _build_promotion_patch(
 ) -> bytes:
     """Build the promotion patch without ever staging through `git add`.
 
-    Every tracked-shape entry is hashed with `git hash-object --no-filters`
-    (never following the clean-filter/attribute machinery), assembled into
-    a throwaway index at a private `GIT_INDEX_FILE`, and diffed against the
-    sandbox's baseline commit -- see the module docstring.
+    The candidate path set is exactly what `git add -A` would have
+    considered -- tracked files plus non-ignored untracked ones, via
+    `git ls-files --cached --others --exclude-standard` -- so ignored
+    artifacts a coder's own tooling produced (build output, dependency
+    installs, caches) are never promoted. Every candidate is then hashed
+    directly with `git hash-object --no-filters` (never through the
+    clean-filter/attribute machinery) and assembled into a throwaway index
+    at a private `GIT_INDEX_FILE`. Every path list here is NUL-delimited
+    (`-z`), since Git filenames may contain a literal newline, tab, or any
+    other byte but NUL.
     """
-    regular_files, symlinks = _scan_sandbox_tree(sandbox.root)
-    index_entries: list[str] = []
+    _, candidates_raw = _run_git(
+        process_runner,
+        git_executable=git_executable,
+        cwd=sandbox.root,
+        argv_tail=(
+            "-C",
+            str(sandbox.root),
+            "ls-files",
+            "-z",
+            "--cached",
+            "--others",
+            "--exclude-standard",
+        ),
+        timeout_seconds=utility_timeout_seconds,
+        termination_grace_seconds=termination_grace_seconds,
+        log_name="coder-sandbox-promote-ls-files.log",
+    )
+    candidate_paths = sorted(
+        {os.fsdecode(entry) for entry in candidates_raw.split(b"\x00") if entry}
+    )
 
-    if regular_files:
-        stdin_paths = ("\n".join(str(path) for path in regular_files) + "\n").encode(
-            "utf-8"
-        )
-        _, hashes_raw = _run_git(
-            process_runner,
-            git_executable=git_executable,
-            cwd=sandbox.root,
-            argv_tail=(
-                "-C",
-                str(sandbox.root),
-                "hash-object",
-                "--no-filters",
-                "-w",
-                "-t",
-                "blob",
-                "--stdin-paths",
-            ),
-            timeout_seconds=utility_timeout_seconds,
-            termination_grace_seconds=termination_grace_seconds,
-            stdin=stdin_paths,
-            log_name="coder-sandbox-promote-hash-object-files.log",
-        )
-        hashes = hashes_raw.decode("utf-8").split()
-        if len(hashes) != len(regular_files):
+    index_entries: list[bytes] = []
+    for rel_path in candidate_paths:
+        entry_path = sandbox.root / rel_path
+        try:
+            entry_lstat = os.lstat(entry_path)
+        except FileNotFoundError:
+            continue  # tracked at baseline, deleted by the coder
+
+        if stat.S_ISLNK(entry_lstat.st_mode):
+            content = os.readlink(os.fsencode(entry_path))
+            mode = "120000"
+        elif stat.S_ISREG(entry_lstat.st_mode):
+            content = entry_path.read_bytes()
+            mode = "100755" if entry_lstat.st_mode & 0o111 else "100644"
+        elif stat.S_ISDIR(entry_lstat.st_mode):
+            # A previously-tracked file path is now a directory; any new,
+            # non-ignored content underneath was separately listed above.
+            continue
+        else:
             raise CoderSandboxError(
-                "git hash-object returned an unexpected number of blob hashes; "
+                f"{entry_path} is an unsupported file type; "
                 "sandbox changes were not promoted."
             )
-        for path, sha in zip(regular_files, hashes, strict=True):
-            mode = "100755" if os.lstat(path).st_mode & 0o111 else "100644"
-            rel_path = path.relative_to(sandbox.root).as_posix()
-            index_entries.append(f"{mode} {sha} 0\t{rel_path}\n")
 
-    for path in symlinks:
-        target_bytes = os.readlink(path).encode("utf-8")
         _, sha_raw = _run_git(
             process_runner,
             git_executable=git_executable,
@@ -529,12 +516,13 @@ def _build_promotion_patch(
             ),
             timeout_seconds=utility_timeout_seconds,
             termination_grace_seconds=termination_grace_seconds,
-            stdin=target_bytes,
-            log_name="coder-sandbox-promote-hash-object-symlink.log",
+            stdin=content,
+            log_name="coder-sandbox-promote-hash-object.log",
         )
-        sha = _single_line(sha_raw, field_name="symlink blob hash")
-        rel_path = path.relative_to(sandbox.root).as_posix()
-        index_entries.append(f"120000 {sha} 0\t{rel_path}\n")
+        sha = _single_line(sha_raw, field_name="blob hash")
+        index_entries.append(
+            f"{mode} {sha} 0\t".encode() + os.fsencode(rel_path) + b"\x00"
+        )
 
     promote_index = sandbox.container_root / "promote.index"
     index_env = {"GIT_INDEX_FILE": str(promote_index)}
@@ -558,12 +546,13 @@ def _build_promotion_patch(
                 "-C",
                 str(sandbox.root),
                 "update-index",
+                "-z",
                 "--add",
                 "--index-info",
             ),
             timeout_seconds=utility_timeout_seconds,
             termination_grace_seconds=termination_grace_seconds,
-            stdin="".join(index_entries).encode("utf-8"),
+            stdin=b"".join(index_entries),
             environment_overrides=index_env,
             log_name="coder-sandbox-promote-update-index.log",
         )
