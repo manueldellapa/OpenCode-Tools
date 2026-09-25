@@ -753,8 +753,27 @@ def test_run_honors_a_signal_delivered_the_instant_popen_returns(
 
     real_popen = subprocess.Popen
 
-    def _popen_then_self_signal(*args: object, **kwargs: object) -> subprocess.Popen:
-        process = real_popen(*args, **kwargs)
+    def _popen_then_self_signal(
+        args: tuple[str, ...],
+        *,
+        cwd: Path,
+        stdin: int,
+        stdout: int,
+        stderr: int,
+        env: dict[str, str],
+        shell: bool,
+        start_new_session: bool,
+    ) -> subprocess.Popen[bytes]:
+        process = real_popen(
+            args,
+            cwd=cwd,
+            stdin=stdin,
+            stdout=stdout,
+            stderr=stderr,
+            env=env,
+            shell=shell,
+            start_new_session=start_new_session,
+        )
         os.kill(os.getpid(), signal.SIGTERM)
         return process
 
