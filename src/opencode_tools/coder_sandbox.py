@@ -9,16 +9,109 @@ The clone uses its own object database (no hard links) and has every remote
 removed before OpenCode sees it.  Deleting or reinitializing the sandbox
 `.git` therefore cannot destroy the real target's refs, objects, reflog,
 index, config, or hooks (GitHub issue #90).
+
+Promotion never runs `git add`.  Staging by path applies whatever clean
+filter `.gitattributes` selects for that path -- and Git looks for
+`.gitattributes` in *every* directory of the tree, not only the root, with
+the filter command itself coming from `.git/config` (local, or the
+machine's global/system config). None of that is something the coder-
+writable sandbox lets this trusted process enumerate up front. Instead,
+`promote_coder_changes` seeds a throwaway index directly from the
+sandbox's baseline commit, builds the candidate path set the same way
+`git add -A` would -- tracked files plus non-ignored untracked ones, via
+`git ls-files --cached --others --exclude-standard`, so ignored artifacts
+a coder's own tooling produced are never promoted -- and, for each
+candidate, fingerprints its *raw* on-disk bytes in-process (SHA-256 over
+mode + content, read in bounded chunks so a single huge candidate can
+never be pulled whole into this process's memory; no subprocess per
+file). A path whose fingerprint still matches the fingerprint captured
+right after the sandbox was created (before the coder ever ran) is left
+untouched in the index, so a file only affected by checkout-time
+normalization (e.g. an `eol=crlf` `.gitattributes` rule) keeps its exact,
+correctly normalized baseline blob rather than being "promoted" back to
+its raw checkout form -- and, because most files in a real change set are
+untouched, `git hash-object --no-filters` (Git's own documented way to
+compute a blob exactly as `add` would while skipping the filter entirely)
+only ever runs for the paths actually proven to be new or changed, and
+does so by *path* for a regular file (Git streams it directly; this
+process never buffers a changed file's content either) -- only a
+symlink's small, bounded target is ever passed through this process
+itself, via `--stdin`. Only paths proven new or changed, or ones missing
+from this run's candidates but present at baseline, update or remove an
+index entry, which is then diffed against the baseline commit with
+`--no-ext-diff --no-textconv` as well. Every path list involved is
+NUL-delimited (`-z` / `--index-info` with `-z`), since a Git filename may
+contain a literal newline or tab, and every candidate read/stat/readlink
+failure other than "does not exist" (including a directory replaced by a
+file, or vice versa) fails closed as `CoderSandboxError`. No attribute or
+filter lookup is ever consulted for the promoted content. A baseline
+gitlink (mode `160000`, a submodule reference) is a tree/index concept
+with no regular working-tree representation of its own -- `prepare_coder_sandbox`
+clones with `--no-recurse-submodules`, so its path is an empty directory
+or entirely absent -- and is therefore never run through the file
+classifier at all: it is preserved exactly as `read-tree` already seeded
+it, and promotion fails closed instead if the sandbox's own index ever
+disagrees with the baseline about a gitlink's pointer (this PR does not
+support promoting an intentional submodule pointer change). Likewise, a
+candidate is never read through a *symlinked ancestor*: `lstat`/`open`
+only refuse to follow a symlink at a path's own final component, not at
+any directory component leading to it, so if the coder replaces a
+tracked directory with a symlink (to anywhere, including outside the
+sandbox entirely), naively reading an old cached path beneath it would
+silently read -- and promote -- whatever is actually at the symlink's
+target instead. Every ancestor component of every candidate is checked
+with non-following `lstat` first; a candidate with any current symlinked
+ancestor is treated as removed rather than ever opened. Every candidate
+is first classified (mode, size, and a symlink's target, via `lstat`/
+`readlink` only -- never a regular file's content) before any content is
+ever fingerprinted. A path proven brand new (absent from the pristine
+snapshot), or one whose mode or size no longer matches what was captured
+right after the sandbox was created, is by that alone proven changed and
+is handed straight to `git hash-object`; only a same-mode, same-size
+candidate is ambiguous enough to need its content actually fingerprinted,
+and that bounded chunked read is checked against a single deadline shared
+across every candidate in the call, derived from `utility_timeout_seconds`
+-- since this in-process read has no timeout of its own otherwise, unlike
+the `hash-object` subprocess it might lead to, and a same-size sparse
+replacement (created almost instantly, but logically huge) would
+otherwise stall promotion indefinitely (GH #110 follow-up). Every one of
+those commands also runs with `core.fsmonitor` and `core.hooksPath`
+forced to safe values via Git's `GIT_CONFIG_COUNT`/`KEY`/`VALUE`
+environment mechanism (which outranks repo-local, global, and system
+config), so a `.git/config` rewritten after the byte-identity check below
+but before these commands actually run -- a background process the coder
+leaves running could attempt exactly that -- still cannot make a trusted
+Git invocation execute a planted `core.fsmonitor` command or
+`post-index-change` hook. The earlier
+`.gitattributes`/`.git/config`/`.git/info/attributes` byte-identity checks
+against the sandbox's pristine baseline remain as defense in depth
+(GitHub issue #110).
+
+A separate class of race -- a background process swapping a regular
+candidate for a symlink between this process validating it and
+`git hash-object`'s own, later, independent open of that same path by
+name -- is a TOCTOU that requires a still-running, hostile same-user
+process surviving past the coder's own successful completion. Closing it
+would mean holding one race-free file reference across a call to an
+external `git` subprocess, which is OS-level containment this project's
+threat model (ADR-010) explicitly does not promise; see
+`docs/security-and-privacy.md` for why it is accepted as a documented
+residual risk instead of an in-code fix.
 """
 
 from __future__ import annotations
 
+import hashlib
 import os
 import shutil
+import stat
 import tempfile
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+from types import MappingProxyType
+from typing import NamedTuple
 
 from opencode_tools import git_safety
 from opencode_tools.domain import (
@@ -30,11 +123,50 @@ from opencode_tools.domain import (
     TargetRepository,
 )
 from opencode_tools.ports import Clock, LogChannel, ProcessRunner
+from opencode_tools.process import deadline_ns
 
 _MAX_CAPTURE_BYTES = 64 * 1024 * 1024
+_MAX_INTEGRITY_FILE_BYTES = 1024 * 1024
+_FINGERPRINT_CHUNK_BYTES = 1024 * 1024
 _SANDBOX_COMMIT_MESSAGE = "OpenCode-Tools coder sandbox baseline"
 _SANDBOX_AUTHOR_NAME = "OpenCode-Tools"
 _SANDBOX_AUTHOR_EMAIL = "opencode-tools@localhost"
+
+# Forced via Git's documented GIT_CONFIG_COUNT/KEY/VALUE environment
+# mechanism -- which outranks repo-local, global, and system config --
+# rather than relying solely on the one-time .git/config byte-identity
+# check below. That check and the Git invocation it protects are two
+# separate steps; a background process the coder leaves running could
+# rewrite .git/config with an executable `core.fsmonitor` command, or a
+# `core.hooksPath` pointing at a planted `post-index-change` hook, in the
+# window between them (GH #110 follow-up). Every `_run_git` call carries
+# this override, so no promotion (or preparation) Git command ever
+# consults whatever the sandbox's local config currently says for either
+# setting.
+_HARDENED_GIT_CONFIG_ENVIRONMENT: dict[str, str] = {
+    "GIT_CONFIG_COUNT": "2",
+    "GIT_CONFIG_KEY_0": "core.fsmonitor",
+    "GIT_CONFIG_VALUE_0": "false",
+    "GIT_CONFIG_KEY_1": "core.hooksPath",
+    "GIT_CONFIG_VALUE_1": os.devnull,
+}
+
+
+class _PristineEntry(NamedTuple):
+    """A pristine (pre-coder) candidate's cheap metadata plus content
+    fingerprint, captured once right after the sandbox was created.
+
+    `mode`/`size` come straight from the same `lstat` `_classify_entry`
+    already does for every current candidate, so promotion can prove a
+    candidate changed -- and skip fingerprinting it -- whenever either
+    differs, with no extra syscall. Only a candidate whose mode and size
+    both still match needs its (bounded) content fingerprint compared
+    against `fingerprint` (GH #110 follow-up).
+    """
+
+    mode: str
+    size: int
+    fingerprint: str
 
 
 class CoderSandboxError(Exception):
@@ -87,6 +219,10 @@ class CoderSandbox:
     root: Path
     baseline_head: str
     target_state: GitState
+    gitattributes_baseline: bytes | None
+    git_config_baseline: bytes
+    git_info_attributes_baseline: bytes | None
+    pristine_raw_snapshot: Mapping[str, _PristineEntry]
 
     def __post_init__(self) -> None:
         if not self.container_root.is_absolute():
@@ -97,6 +233,18 @@ class CoderSandbox:
             raise ValueError("baseline_head must not be empty")
         if not isinstance(self.target_state, GitState):
             raise TypeError("target_state must be GitState")
+        if self.gitattributes_baseline is not None and not isinstance(
+            self.gitattributes_baseline, bytes
+        ):
+            raise TypeError("gitattributes_baseline must be bytes or None")
+        if not isinstance(self.git_config_baseline, bytes):
+            raise TypeError("git_config_baseline must be bytes")
+        if self.git_info_attributes_baseline is not None and not isinstance(
+            self.git_info_attributes_baseline, bytes
+        ):
+            raise TypeError("git_info_attributes_baseline must be bytes or None")
+        if not isinstance(self.pristine_raw_snapshot, Mapping):
+            raise TypeError("pristine_raw_snapshot must be a Mapping")
 
 
 def _run_git(
@@ -121,6 +269,7 @@ def _run_git(
         environment_overrides={
             "GIT_TERMINAL_PROMPT": "0",
             **(environment_overrides or {}),
+            **_HARDENED_GIT_CONFIG_ENVIRONMENT,
         },
     )
     result = process_runner.run(spec, sink=sink)
@@ -135,6 +284,321 @@ def _run_git(
             process_result=result,
         )
     return result, sink.stdout
+
+
+def _read_integrity_file_or_none(path: Path) -> bytes | None:
+    """Read one of the sandbox's Git integrity-sensitive files.
+
+    Used for `.gitattributes`, `.git/config`, and `.git/info/attributes`,
+    each of which is coder-writable and must be compared byte-for-byte
+    against its pristine baseline before `git add`/`git diff` ever touch the
+    sandbox (GH #110). Fails closed rather than reading through a symlink,
+    accepting a non-regular file (a FIFO would hang a plain read), or
+    reading past a bound -- any of those is itself a sign of tampering, not
+    a legitimate state, given a plain `git clone` never produces one.
+    """
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except FileNotFoundError:
+        return None
+    except OSError as error:
+        raise CoderSandboxError(
+            f"{path} could not be safely read as a regular, non-symlinked file; "
+            "sandbox changes were not promoted."
+        ) from error
+    try:
+        file_stat = os.fstat(fd)
+        if not stat.S_ISREG(file_stat.st_mode):
+            raise CoderSandboxError(
+                f"{path} is unexpectedly not a regular file; "
+                "sandbox changes were not promoted."
+            )
+        data = os.read(fd, _MAX_INTEGRITY_FILE_BYTES + 1)
+        if len(data) > _MAX_INTEGRITY_FILE_BYTES:
+            raise CoderSandboxError(
+                f"{path} unexpectedly exceeds the bounded read size; "
+                "sandbox changes were not promoted."
+            )
+        return data
+    finally:
+        os.close(fd)
+
+
+def _classify_entry(entry_path: Path) -> tuple[str, int, bytes | None] | None:
+    """Return (mode, size, symlink_target) for `entry_path` --
+    `symlink_target` is `None` for a regular file, and `size` is the
+    byte length from the same `lstat` (a symlink's `st_size` is the
+    length of its target text on POSIX) -- or `None` if it is absent or
+    has been replaced by a directory (a previously-tracked file path
+    becoming a directory is not itself a promotable entry -- any new
+    content underneath is separately enumerated).
+
+    Classification alone never reads a regular file's content: only
+    `lstat`, and `readlink` for a symlink's target (always small, bounded
+    by the platform's `PATH_MAX`). Used directly for a path already known
+    to be brand new (absent from `pristine_raw_snapshot`), where there is
+    no pristine fingerprint to compare against and therefore nothing to
+    gain from reading a regular file's full content here -- it is about
+    to be handed to `git hash-object` wholesale anyway, which, unlike this
+    in-process read, is a subprocess bounded by `utility_timeout_seconds`
+    (GH #110 follow-up). Also used as the cheap first step for a *tracked*
+    candidate: a mode or size mismatch against `_PristineEntry` proves a
+    change without ever fingerprinting content either.
+
+    `NotADirectoryError` is treated the same as "does not exist": it means
+    an ancestor of this path -- a directory at baseline -- was replaced by
+    a regular file, so every one of its former children is, from this
+    path's perspective, simply gone (a valid directory-to-file transition,
+    not a failure).
+
+    Every other failure -- a coder-unreadable file via `chmod 000`, an
+    unsupported file type such as a FIFO -- fails closed as
+    `CoderSandboxError` rather than escaping as a raw `OSError` the caller
+    only catches as `CoderSandboxError`.
+    """
+    try:
+        entry_lstat = os.lstat(entry_path)
+    except (FileNotFoundError, NotADirectoryError):
+        return None
+    except OSError as error:
+        raise CoderSandboxError(
+            f"{entry_path} could not be inspected; sandbox changes were not promoted."
+        ) from error
+
+    if stat.S_ISDIR(entry_lstat.st_mode):
+        return None
+    if stat.S_ISLNK(entry_lstat.st_mode):
+        try:
+            target = os.readlink(os.fsencode(entry_path))
+        except OSError as error:
+            raise CoderSandboxError(
+                f"{entry_path} could not be read; sandbox changes were not promoted."
+            ) from error
+        return "120000", entry_lstat.st_size, target
+    if not stat.S_ISREG(entry_lstat.st_mode):
+        raise CoderSandboxError(
+            f"{entry_path} is an unsupported file type; "
+            "sandbox changes were not promoted."
+        )
+
+    mode = "100755" if entry_lstat.st_mode & 0o111 else "100644"
+    return mode, entry_lstat.st_size, None
+
+
+def _fingerprint_classified(
+    entry_path: Path,
+    mode: str,
+    symlink_target: bytes | None,
+    *,
+    clock: Clock,
+    deadline_ns: int,
+) -> str:
+    """Fingerprint a candidate already classified by `_classify_entry`,
+    reusing its symlink target rather than reading it again. A regular
+    file's content is read in bounded chunks against a shared, aggregate
+    `deadline_ns` (derived from `utility_timeout_seconds`, covering every
+    fingerprint read made for the call `deadline_ns` was built for), so a
+    same-mode, same-size sparse replacement of a tracked candidate cannot
+    stall promotion indefinitely (GH #110 follow-up)."""
+    if symlink_target is not None:
+        return _fingerprint_bytes(mode, symlink_target)
+    try:
+        return _fingerprint_file_chunked(
+            entry_path, mode, clock=clock, deadline_ns=deadline_ns
+        )
+    except OSError as error:
+        raise CoderSandboxError(
+            f"{entry_path} could not be read; sandbox changes were not promoted."
+        ) from error
+
+
+def _classify_and_fingerprint(
+    entry_path: Path, *, clock: Clock, deadline_ns: int
+) -> tuple[str, int, str] | None:
+    """Return (mode, size, fingerprint) for `entry_path`, or `None` if it
+    is absent (see `_classify_entry`).
+
+    A regular file is never read into memory whole: it is fingerprinted
+    directly from disk in bounded chunks, so a single very large candidate
+    -- already present at baseline, or newly created by the coder -- can
+    never be pulled entirely into this process's memory (GH #110
+    follow-up). The chunked read is also bounded by `deadline_ns`; see
+    `_fingerprint_file_chunked`.
+    """
+    classified = _classify_entry(entry_path)
+    if classified is None:
+        return None
+    mode, size, symlink_target = classified
+    fingerprint = _fingerprint_classified(
+        entry_path, mode, symlink_target, clock=clock, deadline_ns=deadline_ns
+    )
+    return mode, size, fingerprint
+
+
+def _fingerprint_bytes(mode: str, content: bytes) -> str:
+    """A cheap, in-process, collision-resistant fingerprint of (mode,
+    content), used purely for pristine-vs-current equality comparison --
+    never as a Git object id. Only used for a symlink's target, which is
+    always small; a regular file is fingerprinted by `_fingerprint_file_chunked`
+    instead, without ever holding its full content in memory."""
+    digest = hashlib.sha256()
+    digest.update(mode.encode("ascii"))
+    digest.update(b"\x00")
+    digest.update(content)
+    return digest.hexdigest()
+
+
+def _fingerprint_file_chunked(
+    entry_path: Path, mode: str, *, clock: Clock, deadline_ns: int
+) -> str:
+    """Fingerprint a regular file's content by reading it in bounded
+    chunks, so peak memory use is independent of file size (GH #110
+    follow-up: a multi-gigabyte tracked or coder-created file must not be
+    able to exhaust this process's memory).
+
+    Also checks `deadline_ns` before every chunk, since this in-process
+    read has no timeout of its own otherwise -- unlike every actual
+    subprocess this module runs, all bounded by `utility_timeout_seconds`.
+    A same-mode, same-size sparse file (created almost instantly, but
+    logically huge) swapped in for a tracked candidate would otherwise
+    still reach here and stall promotion indefinitely (GH #110
+    follow-up); a deadline miss fails closed as `CoderSandboxError`.
+    """
+    digest = hashlib.sha256()
+    digest.update(mode.encode("ascii"))
+    digest.update(b"\x00")
+    with entry_path.open("rb") as handle:
+        while True:
+            if clock.monotonic_ns() >= deadline_ns:
+                raise CoderSandboxError(
+                    f"{entry_path} fingerprinting exceeded the bounded promotion "
+                    "deadline; sandbox changes were not promoted."
+                )
+            chunk = handle.read(_FINGERPRINT_CHUNK_BYTES)
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _hash_stdin_blob(
+    process_runner: ProcessRunner,
+    *,
+    git_executable: Path,
+    cwd: Path,
+    content: bytes,
+    utility_timeout_seconds: float,
+    termination_grace_seconds: float,
+) -> str:
+    """Hash small `content` (a symlink target) exactly as `git add` would,
+    minus the clean filter. Never used for a regular file's content --
+    see `_hash_path_blob`, which lets Git stream the file itself."""
+    _, sha_raw = _run_git(
+        process_runner,
+        git_executable=git_executable,
+        cwd=cwd,
+        argv_tail=(
+            "-C",
+            str(cwd),
+            "hash-object",
+            "--no-filters",
+            "-w",
+            "-t",
+            "blob",
+            "--stdin",
+        ),
+        timeout_seconds=utility_timeout_seconds,
+        termination_grace_seconds=termination_grace_seconds,
+        stdin=content,
+        log_name="coder-sandbox-hash-object-stdin.log",
+    )
+    return _single_line(sha_raw, field_name="blob hash")
+
+
+def _hash_path_blob(
+    process_runner: ProcessRunner,
+    *,
+    git_executable: Path,
+    cwd: Path,
+    entry_path: Path,
+    utility_timeout_seconds: float,
+    termination_grace_seconds: float,
+) -> str:
+    """Hash a regular file exactly as `git add` would, minus the clean
+    filter, by giving Git the path directly. Git reads/streams the file
+    itself, so this process never buffers a changed file's content --
+    empirically confirmed `--no-filters` bypasses the clean filter the
+    same way whether content arrives by path or by `--stdin` (GH #110
+    follow-up)."""
+    _, sha_raw = _run_git(
+        process_runner,
+        git_executable=git_executable,
+        cwd=cwd,
+        argv_tail=(
+            "-C",
+            str(cwd),
+            "hash-object",
+            "--no-filters",
+            "-w",
+            "-t",
+            "blob",
+            "--",
+            str(entry_path),
+        ),
+        timeout_seconds=utility_timeout_seconds,
+        termination_grace_seconds=termination_grace_seconds,
+        log_name="coder-sandbox-hash-object-path.log",
+    )
+    return _single_line(sha_raw, field_name="blob hash")
+
+
+def _capture_raw_snapshot(
+    process_runner: ProcessRunner,
+    *,
+    git_executable: Path,
+    sandbox_root: Path,
+    clock: Clock,
+    utility_timeout_seconds: float,
+    termination_grace_seconds: float,
+) -> Mapping[str, _PristineEntry]:
+    """Fingerprint every tracked path's raw on-disk (checkout) bytes right
+    after the sandbox's baseline commit, before the coder ever runs.
+
+    Used at promotion time to tell an actual coder edit apart from mere
+    checkout-time normalization (e.g. an `eol=crlf` `.gitattributes` rule)
+    on a file the coder never touched (GH #110 follow-up). Everything is
+    tracked at this point (the baseline commit was just created), so
+    `--cached` alone is the full candidate set. Fingerprinting is done
+    entirely in-process (no `git hash-object` per file) -- only the single
+    `ls-files` call below spawns a subprocess -- and is bounded overall by
+    a deadline derived from `utility_timeout_seconds`, the same as every
+    fingerprint read this module does (GH #110 follow-up).
+    """
+    _, candidates_raw = _run_git(
+        process_runner,
+        git_executable=git_executable,
+        cwd=sandbox_root,
+        argv_tail=("-C", str(sandbox_root), "ls-files", "-z", "--cached"),
+        timeout_seconds=utility_timeout_seconds,
+        termination_grace_seconds=termination_grace_seconds,
+        log_name="coder-sandbox-baseline-ls-files.log",
+    )
+    fingerprint_deadline_ns = deadline_ns(clock.monotonic_ns(), utility_timeout_seconds)
+    snapshot: dict[str, _PristineEntry] = {}
+    for entry in candidates_raw.split(b"\x00"):
+        if not entry:
+            continue
+        rel_path = os.fsdecode(entry)
+        classified = _classify_and_fingerprint(
+            sandbox_root / rel_path, clock=clock, deadline_ns=fingerprint_deadline_ns
+        )
+        if classified is None:
+            continue
+        mode, size, fingerprint = classified
+        snapshot[rel_path] = _PristineEntry(
+            mode=mode, size=size, fingerprint=fingerprint
+        )
+    return MappingProxyType(snapshot)
 
 
 def _single_line(payload: bytes, *, field_name: str) -> str:
@@ -306,8 +770,6 @@ def prepare_coder_sandbox(
                 f"user.name={_SANDBOX_AUTHOR_NAME}",
                 "-c",
                 f"user.email={_SANDBOX_AUTHOR_EMAIL}",
-                "-c",
-                f"core.hooksPath={os.devnull}",
                 "commit",
                 "--quiet",
                 "--allow-empty",
@@ -336,15 +798,361 @@ def prepare_coder_sandbox(
         )
         baseline_head = _single_line(baseline_head_raw, field_name="baseline HEAD")
 
+        git_config_baseline = _read_integrity_file_or_none(git_dir / "config")
+        if git_config_baseline is None:
+            raise CoderSandboxError(
+                "The coder sandbox's .git/config is missing right after creation."
+            )
+
+        pristine_raw_snapshot = _capture_raw_snapshot(
+            process_runner,
+            git_executable=git_executable,
+            sandbox_root=sandbox_root,
+            clock=clock,
+            utility_timeout_seconds=utility_timeout_seconds,
+            termination_grace_seconds=termination_grace_seconds,
+        )
+
         return CoderSandbox(
             container_root=container_root,
             root=sandbox_root,
             baseline_head=baseline_head,
             target_state=capture.state,
+            gitattributes_baseline=_read_integrity_file_or_none(
+                sandbox_root / ".gitattributes"
+            ),
+            git_config_baseline=git_config_baseline,
+            git_info_attributes_baseline=_read_integrity_file_or_none(
+                git_dir / "info" / "attributes"
+            ),
+            pristine_raw_snapshot=pristine_raw_snapshot,
         )
     except Exception:
         shutil.rmtree(container_root, ignore_errors=True)
         raise
+
+
+_GITLINK_MODE = "160000"
+
+
+def _parse_ls_files_stage(raw: bytes) -> dict[str, tuple[str, str]]:
+    """Parse NUL-delimited `git ls-files -z --stage` output into
+    `{path: (mode, sha)}`. A merge-conflicted entry (stage != 0) is
+    skipped rather than misparsed -- `promote_coder_changes` already
+    requires a clean, single-commit sandbox HEAD, so none are expected
+    here."""
+    entries: dict[str, tuple[str, str]] = {}
+    for record in raw.split(b"\x00"):
+        if not record:
+            continue
+        metadata, _tab, path_bytes = record.partition(b"\t")
+        mode_bytes, _sp, rest = metadata.partition(b" ")
+        sha_bytes, _sp, stage_bytes = rest.partition(b" ")
+        if stage_bytes != b"0":
+            continue
+        entries[os.fsdecode(path_bytes)] = (
+            mode_bytes.decode("ascii"),
+            sha_bytes.decode("ascii"),
+        )
+    return entries
+
+
+def _has_symlinked_ancestor(sandbox_root: Path, rel_path: str) -> bool:
+    """Return True if any directory component between `sandbox_root` and
+    the leaf of `rel_path` is currently a symlink.
+
+    `lstat`/`open` only refuse to follow a symlink at a path's own final
+    component -- every *ancestor* component is followed transparently, by
+    ordinary POSIX path-resolution semantics. If the coder replaces a
+    tracked directory with a symlink (to anywhere, including outside the
+    sandbox entirely), naively reading an old cached path beneath it would
+    silently read -- and promote -- whatever is actually at the symlink's
+    target instead (GH #110 follow-up).
+    """
+    current = sandbox_root
+    for part in Path(rel_path).parts[:-1]:
+        current = current / part
+        try:
+            ancestor_lstat = os.lstat(current)
+        except OSError:
+            # A missing or otherwise inaccessible ancestor is not a
+            # symlink concern here -- the leaf's own lstat will raise or
+            # report "gone" correctly on its own.
+            return False
+        if stat.S_ISLNK(ancestor_lstat.st_mode):
+            return True
+    return False
+
+
+def _build_promotion_patch(
+    process_runner: ProcessRunner,
+    *,
+    git_executable: Path,
+    sandbox: CoderSandbox,
+    clock: Clock,
+    utility_timeout_seconds: float,
+    termination_grace_seconds: float,
+) -> bytes:
+    """Build the promotion patch without ever staging through `git add`.
+
+    The throwaway index is seeded directly from the sandbox's baseline
+    commit, so every path keeps its exact, correctly checkout-normalized
+    baseline blob unless it is proven to have actually changed. The
+    candidate path set is exactly what `git add -A` would have considered
+    -- tracked files plus non-ignored untracked ones, via `git ls-files
+    --cached --others --exclude-standard` -- so ignored artifacts a
+    coder's own tooling produced (build output, dependency installs,
+    caches) are never promoted. Every candidate is first classified with
+    `lstat`/`readlink` only (no content read). A candidate absent from
+    the pristine snapshot is brand new by definition -- nothing to
+    compare it against -- so it is hashed straight away. A candidate
+    present in the pristine snapshot whose mode or size differs from what
+    was captured right after the sandbox was created is, by that alone,
+    proven changed, and is also hashed straight away with no further
+    work. Only a candidate whose mode and size both still match is
+    ambiguous enough to need its *raw* on-disk bytes actually
+    fingerprinted (in-process, no subprocess) and compared against the
+    fingerprint captured back then: a match means nothing actually
+    changed (e.g. an `eol=crlf` `.gitattributes` rule alone does not
+    count), so the baseline entry already seeded into the index is left
+    alone with no further work. That content fingerprint read is bounded
+    by a single deadline shared across every candidate in this call,
+    derived from `utility_timeout_seconds` -- otherwise a same-mode,
+    same-size sparse replacement of a tracked file (created almost
+    instantly, but logically huge) could stall promotion indefinitely
+    before ever reaching a bounded subprocess (GH #110 follow-up). A real
+    mismatch or a brand-new path spawns `git hash-object --no-filters`
+    (never through the clean-filter/attribute machinery, and by path for
+    a regular file so Git streams it rather than this process buffering
+    it, bounded like every command here by `utility_timeout_seconds`) to
+    get an actual blob id. A path missing from this run's candidates but
+    present at baseline is removed. Removals are applied with
+    `--force-remove` and *before* additions, so a directory-to-file (or
+    file-to-directory) transition never leaves the index in a conflicting
+    state where both the old and new entry are present at once. Every
+    path list here is NUL-delimited (`-z`), since Git filenames may
+    contain a literal newline, tab, or any other byte but NUL.
+    """
+    promote_index = sandbox.container_root / "promote.index"
+    index_env = {"GIT_INDEX_FILE": str(promote_index)}
+    fingerprint_deadline_ns = deadline_ns(clock.monotonic_ns(), utility_timeout_seconds)
+
+    _run_git(
+        process_runner,
+        git_executable=git_executable,
+        cwd=sandbox.root,
+        argv_tail=("-C", str(sandbox.root), "read-tree", sandbox.baseline_head),
+        timeout_seconds=utility_timeout_seconds,
+        termination_grace_seconds=termination_grace_seconds,
+        environment_overrides=index_env,
+        log_name="coder-sandbox-promote-read-tree-baseline.log",
+    )
+
+    # A gitlink (mode 160000, a submodule reference) has no regular
+    # working-tree representation of its own to fingerprint -- the clone
+    # in prepare_coder_sandbox uses --no-recurse-submodules, so its path
+    # is an empty directory or entirely absent -- so it must never be run
+    # through the file classifier below (GH #110 follow-up: that
+    # misclassified it as deleted on every promotion, including a no-op
+    # one). Read it back from the index we just seeded, and preserve it
+    # exactly as-is by simply never touching that path again here. The
+    # sandbox's own real index is checked against the same baseline as a
+    # fail-closed guard: this PR does not support promoting an
+    # intentional submodule pointer change, so if one was somehow
+    # attempted, refuse the whole promotion rather than silently
+    # dropping or mishandling it.
+    _, baseline_stage_raw = _run_git(
+        process_runner,
+        git_executable=git_executable,
+        cwd=sandbox.root,
+        argv_tail=("-C", str(sandbox.root), "ls-files", "-z", "--stage"),
+        timeout_seconds=utility_timeout_seconds,
+        termination_grace_seconds=termination_grace_seconds,
+        environment_overrides=index_env,
+        log_name="coder-sandbox-promote-baseline-stage.log",
+    )
+    baseline_gitlinks = {
+        path: sha
+        for path, (mode, sha) in _parse_ls_files_stage(baseline_stage_raw).items()
+        if mode == _GITLINK_MODE
+    }
+    if baseline_gitlinks:
+        _, sandbox_stage_raw = _run_git(
+            process_runner,
+            git_executable=git_executable,
+            cwd=sandbox.root,
+            argv_tail=("-C", str(sandbox.root), "ls-files", "-z", "--stage"),
+            timeout_seconds=utility_timeout_seconds,
+            termination_grace_seconds=termination_grace_seconds,
+            log_name="coder-sandbox-promote-sandbox-stage.log",
+        )
+        sandbox_gitlinks = {
+            path: sha
+            for path, (mode, sha) in _parse_ls_files_stage(sandbox_stage_raw).items()
+            if mode == _GITLINK_MODE
+        }
+        if sandbox_gitlinks != baseline_gitlinks:
+            raise CoderSandboxError(
+                "The coder changed a submodule reference; sandbox changes were not promoted."
+            )
+
+    _, candidates_raw = _run_git(
+        process_runner,
+        git_executable=git_executable,
+        cwd=sandbox.root,
+        argv_tail=(
+            "-C",
+            str(sandbox.root),
+            "ls-files",
+            "-z",
+            "--cached",
+            "--others",
+            "--exclude-standard",
+        ),
+        timeout_seconds=utility_timeout_seconds,
+        termination_grace_seconds=termination_grace_seconds,
+        environment_overrides=index_env,
+        log_name="coder-sandbox-promote-ls-files.log",
+    )
+    current_paths = sorted(
+        {os.fsdecode(entry) for entry in candidates_raw.split(b"\x00") if entry}
+    )
+
+    changed_entries: list[bytes] = []
+    removed_entries: list[bytes] = []
+    seen_paths: set[str] = set()
+
+    for rel_path in current_paths:
+        seen_paths.add(rel_path)
+        if rel_path in baseline_gitlinks:
+            continue  # preserved exactly as read-tree already seeded it
+        if _has_symlinked_ancestor(sandbox.root, rel_path):
+            # Never read through a symlinked ancestor: whatever is really
+            # there (possibly outside the sandbox) must not be attributed
+            # to this path. The ancestor symlink itself is still handled
+            # normally as its own candidate below.
+            removed_entries.append(os.fsencode(rel_path) + b"\x00")
+            continue
+        entry_path = sandbox.root / rel_path
+        classified = _classify_entry(entry_path)
+        if classified is None:
+            if rel_path in sandbox.pristine_raw_snapshot:
+                removed_entries.append(os.fsencode(rel_path) + b"\x00")
+            continue  # otherwise: vanished again, and was never at baseline either
+        mode, size, symlink_target = classified
+
+        pristine_entry = sandbox.pristine_raw_snapshot.get(rel_path)
+        if (
+            pristine_entry is not None
+            and mode == pristine_entry.mode
+            and size == pristine_entry.size
+        ):
+            # Cheap metadata alone cannot prove a change here, so
+            # fingerprint the content -- bounded by the shared,
+            # aggregate deadline (GH #110 follow-up).
+            fingerprint = _fingerprint_classified(
+                entry_path,
+                mode,
+                symlink_target,
+                clock=clock,
+                deadline_ns=fingerprint_deadline_ns,
+            )
+            if fingerprint == pristine_entry.fingerprint:
+                continue  # untouched since the sandbox was created; no subprocess needed
+
+        if mode == "120000":
+            assert symlink_target is not None
+            sha = _hash_stdin_blob(
+                process_runner,
+                git_executable=git_executable,
+                cwd=sandbox.root,
+                content=symlink_target,
+                utility_timeout_seconds=utility_timeout_seconds,
+                termination_grace_seconds=termination_grace_seconds,
+            )
+        else:
+            sha = _hash_path_blob(
+                process_runner,
+                git_executable=git_executable,
+                cwd=sandbox.root,
+                entry_path=entry_path,
+                utility_timeout_seconds=utility_timeout_seconds,
+                termination_grace_seconds=termination_grace_seconds,
+            )
+        changed_entries.append(
+            f"{mode} {sha} 0\t".encode() + os.fsencode(rel_path) + b"\x00"
+        )
+
+    for rel_path in sandbox.pristine_raw_snapshot:
+        if rel_path not in seen_paths:
+            removed_entries.append(os.fsencode(rel_path) + b"\x00")
+
+    # Removals must land before additions: a directory<->file transition
+    # means the candidate set contains both the old and the new shape of
+    # the same path, and applying the addition first leaves the old entry
+    # in place, turning the removal into a conflicting no-op (GH #110
+    # follow-up).
+    if removed_entries:
+        _run_git(
+            process_runner,
+            git_executable=git_executable,
+            cwd=sandbox.root,
+            argv_tail=(
+                "-C",
+                str(sandbox.root),
+                "update-index",
+                "-z",
+                "--force-remove",
+                "--stdin",
+            ),
+            timeout_seconds=utility_timeout_seconds,
+            termination_grace_seconds=termination_grace_seconds,
+            stdin=b"".join(removed_entries),
+            environment_overrides=index_env,
+            log_name="coder-sandbox-promote-update-index-remove.log",
+        )
+    if changed_entries:
+        _run_git(
+            process_runner,
+            git_executable=git_executable,
+            cwd=sandbox.root,
+            argv_tail=(
+                "-C",
+                str(sandbox.root),
+                "update-index",
+                "-z",
+                "--add",
+                "--index-info",
+            ),
+            timeout_seconds=utility_timeout_seconds,
+            termination_grace_seconds=termination_grace_seconds,
+            stdin=b"".join(changed_entries),
+            environment_overrides=index_env,
+            log_name="coder-sandbox-promote-update-index.log",
+        )
+
+    _, patch = _run_git(
+        process_runner,
+        git_executable=git_executable,
+        cwd=sandbox.root,
+        argv_tail=(
+            "-C",
+            str(sandbox.root),
+            "diff",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--cached",
+            "--binary",
+            "--full-index",
+            sandbox.baseline_head,
+            "--",
+        ),
+        timeout_seconds=utility_timeout_seconds,
+        termination_grace_seconds=termination_grace_seconds,
+        environment_overrides=index_env,
+        log_name="coder-sandbox-promote-diff.log",
+    )
+    return patch
 
 
 def promote_coder_changes(
@@ -430,32 +1238,40 @@ def promote_coder_changes(
             "The real target changed while the coder was running; sandbox changes were not promoted."
         )
 
-    _run_git(
+    # Defense in depth (GH #110): a clean filter or textconv/external-diff
+    # driver declared anywhere the coder can reach -- root or nested
+    # .gitattributes, .git/config -- would run as this trusted orchestrator
+    # process, not the coder's own sandbox. The patch built below never
+    # stages by path, so none of this is actually consulted for content;
+    # still refuse promotion if the sandbox's own integrity files were
+    # touched, since that is itself a sign of tampering worth failing on.
+    if (
+        _read_integrity_file_or_none(sandbox.root / ".gitattributes")
+        != sandbox.gitattributes_baseline
+    ):
+        raise CoderSandboxError(
+            "The coder changed .gitattributes; sandbox changes were not promoted."
+        )
+    current_git_config = _read_integrity_file_or_none(git_dir / "config")
+    if current_git_config is None or current_git_config != sandbox.git_config_baseline:
+        raise CoderSandboxError(
+            "The coder changed the sandbox's local Git configuration; sandbox changes were not promoted."
+        )
+    if (
+        _read_integrity_file_or_none(git_dir / "info" / "attributes")
+        != sandbox.git_info_attributes_baseline
+    ):
+        raise CoderSandboxError(
+            "The coder added Git attribute overrides outside version control; sandbox changes were not promoted."
+        )
+
+    patch = _build_promotion_patch(
         process_runner,
         git_executable=git_executable,
-        cwd=sandbox.root,
-        argv_tail=("-C", str(sandbox.root), "add", "-A", "--"),
-        timeout_seconds=utility_timeout_seconds,
+        sandbox=sandbox,
+        clock=clock,
+        utility_timeout_seconds=utility_timeout_seconds,
         termination_grace_seconds=termination_grace_seconds,
-        log_name="coder-sandbox-promote-add.log",
-    )
-    _, patch = _run_git(
-        process_runner,
-        git_executable=git_executable,
-        cwd=sandbox.root,
-        argv_tail=(
-            "-C",
-            str(sandbox.root),
-            "diff",
-            "--cached",
-            "--binary",
-            "--full-index",
-            "HEAD",
-            "--",
-        ),
-        timeout_seconds=utility_timeout_seconds,
-        termination_grace_seconds=termination_grace_seconds,
-        log_name="coder-sandbox-promote-diff.log",
     )
     if not patch:
         return
