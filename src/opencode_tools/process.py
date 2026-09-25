@@ -354,9 +354,16 @@ class SubprocessRunner:
         not exited by `spec.timeout_seconds`, or if this process receives
         SIGINT/SIGTERM while it is running (SH-001), the same bounded
         `SIGTERM -> grace -> SIGKILL -> grace` escalation is applied to that
-        whole group (System Design SS10.2). Joining the reader threads
-        afterward is itself bounded by `spec.termination_grace_seconds`, so
-        a descendant that escaped the group (e.g. via its own `setsid()`)
+        whole group (System Design SS10.2). The SIGTERM/SIGINT handlers are
+        installed *before* `subprocess.Popen()` is even called, not after
+        the child is spawned and its reader/writer threads are started: a
+        signal arriving anywhere from the spawn syscall onward is always
+        caught as a cancellation and drives the same escalation, rather than
+        risking Python's default disposition (an unhandled `SIGTERM`) or an
+        uncaught `KeyboardInterrupt` unwinding past `run()` and leaving the
+        already-spawned child unsupervised (issue #112). Joining the reader
+        threads afterward is itself bounded by `spec.termination_grace_seconds`,
+        so a descendant that escaped the group (e.g. via its own `setsid()`)
         and keeps a pipe open can never prevent `run()` from returning --
         it only prevents `termination_confirmed` from being `True`.
         """
@@ -371,69 +378,6 @@ class SubprocessRunner:
         started_at = self._clock.now()
         start_ns = self._clock.monotonic_ns()
 
-        try:
-            process = subprocess.Popen(
-                spec.argv,
-                cwd=spec.cwd,
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                env=environment,
-                shell=False,
-                start_new_session=True,
-            )
-        except OSError:
-            finished_at = self._clock.now()
-            duration_ns = self._clock.monotonic_ns() - start_ns
-            return build_process_result(
-                command=command,
-                cwd=spec.cwd,
-                started_at=started_at,
-                finished_at=finished_at,
-                duration_ns=duration_ns,
-                return_code=None,
-                termination_confirmed=True,
-                stdout_byte_count=0,
-                stdout_sha256=_EMPTY_SHA256,
-                stderr_byte_count=0,
-                stderr_sha256=_EMPTY_SHA256,
-                log_path=sink.path,
-            )
-
-        assert process.stdin is not None
-        assert process.stdout is not None
-        assert process.stderr is not None
-
-        # subprocess.Popen's stdout/stderr are typed IO[bytes] generically,
-        # but with the default bufsize and no text/encoding mode they are
-        # always io.BufferedReader at runtime, which is what read1() needs.
-        stdout_stream = cast(io.BufferedReader, process.stdout)
-        stderr_stream = cast(io.BufferedReader, process.stderr)
-
-        sink_lock = threading.Lock()
-        sink_fault = threading.Event()
-        stdin_writer = _StdinWriter(stream=process.stdin, payload=stdin_payload)
-        stdout_reader = _StreamReader(
-            channel="stdout",
-            stream=stdout_stream,
-            sink=sink,
-            sink_lock=sink_lock,
-            sink_fault=sink_fault,
-            clock=self._clock,
-        )
-        stderr_reader = _StreamReader(
-            channel="stderr",
-            stream=stderr_stream,
-            sink=sink,
-            sink_lock=sink_lock,
-            sink_fault=sink_fault,
-            clock=self._clock,
-        )
-
-        stdin_writer.start()
-        stdout_reader.start()
-        stderr_reader.start()
-
         cancelled = threading.Event()
 
         def _request_cancellation(signal_number: int, frame: FrameType | None) -> None:
@@ -443,6 +387,69 @@ class SubprocessRunner:
         previous_sigterm = signal.signal(signal.SIGTERM, _request_cancellation)
         previous_sigint = signal.signal(signal.SIGINT, _request_cancellation)
         try:
+            try:
+                process = subprocess.Popen(
+                    spec.argv,
+                    cwd=spec.cwd,
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    env=environment,
+                    shell=False,
+                    start_new_session=True,
+                )
+            except OSError:
+                finished_at = self._clock.now()
+                duration_ns = self._clock.monotonic_ns() - start_ns
+                return build_process_result(
+                    command=command,
+                    cwd=spec.cwd,
+                    started_at=started_at,
+                    finished_at=finished_at,
+                    duration_ns=duration_ns,
+                    return_code=None,
+                    termination_confirmed=True,
+                    stdout_byte_count=0,
+                    stdout_sha256=_EMPTY_SHA256,
+                    stderr_byte_count=0,
+                    stderr_sha256=_EMPTY_SHA256,
+                    log_path=sink.path,
+                )
+
+            assert process.stdin is not None
+            assert process.stdout is not None
+            assert process.stderr is not None
+
+            # subprocess.Popen's stdout/stderr are typed IO[bytes] generically,
+            # but with the default bufsize and no text/encoding mode they are
+            # always io.BufferedReader at runtime, which is what read1() needs.
+            stdout_stream = cast(io.BufferedReader, process.stdout)
+            stderr_stream = cast(io.BufferedReader, process.stderr)
+
+            sink_lock = threading.Lock()
+            sink_fault = threading.Event()
+            stdin_writer = _StdinWriter(stream=process.stdin, payload=stdin_payload)
+            stdout_reader = _StreamReader(
+                channel="stdout",
+                stream=stdout_stream,
+                sink=sink,
+                sink_lock=sink_lock,
+                sink_fault=sink_fault,
+                clock=self._clock,
+            )
+            stderr_reader = _StreamReader(
+                channel="stderr",
+                stream=stderr_stream,
+                sink=sink,
+                sink_lock=sink_lock,
+                sink_fault=sink_fault,
+                clock=self._clock,
+            )
+
+            stdin_writer.start()
+            stdout_reader.start()
+            stderr_reader.start()
+
             return_code, timed_out, interrupted, logging_error = (
                 _wait_for_exit_or_deadline(
                     process,

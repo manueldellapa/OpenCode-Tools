@@ -17,6 +17,7 @@ import dataclasses
 import hashlib
 import os
 import signal
+import subprocess
 import sys
 import threading
 import time
@@ -732,6 +733,51 @@ def test_run_restores_the_previous_signal_handlers_after_returning(
 
     assert signal.getsignal(signal.SIGTERM) == sentinel_sigterm
     assert signal.getsignal(signal.SIGINT) == sentinel_sigint
+
+
+def test_run_honors_a_signal_delivered_the_instant_popen_returns(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Issue #112: the SIGTERM/SIGINT handlers must already be installed
+    *before* `subprocess.Popen()` is called, not only after the child is
+    spawned and its reader/writer threads are started. This sends the
+    process its own SIGTERM the instant the real `Popen()` returns --
+    simulating one arriving during the spawn syscall itself, the worst case
+    of the vulnerable window -- and asserts it is still caught as a
+    cancellation and drives the documented escalation. Before the fix, a
+    signal delivered this early would hit Python's default disposition
+    (SIGTERM) or raise an uncaught `KeyboardInterrupt` (SIGINT) instead,
+    which -- among other things -- would abort this very test process
+    rather than being reported as `INTERRUPTED`."""
+
+    real_popen = subprocess.Popen
+
+    def _popen_then_self_signal(*args: object, **kwargs: object) -> subprocess.Popen:
+        process = real_popen(*args, **kwargs)
+        os.kill(os.getpid(), signal.SIGTERM)
+        return process
+
+    monkeypatch.setattr(subprocess, "Popen", _popen_then_self_signal)
+
+    runner = SubprocessRunner(RealClock())
+    sink = RecordingAttemptLogSink()
+    spec = ProcessSpec(
+        argv=_helper_argv("--sleep", "10"),
+        cwd=tmp_path,
+        stdin=None,
+        timeout_seconds=30.0,
+        termination_grace_seconds=0.5,
+    )
+
+    started = time.monotonic()
+    result = runner.run(spec, sink=sink)
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 3.0
+    assert result.outcome is RunOutcome.INTERRUPTED
+    assert result.timed_out is False
+    assert result.termination_confirmed is True
 
 
 def test_run_terminates_the_child_and_reports_logging_error_on_a_sink_fault(
