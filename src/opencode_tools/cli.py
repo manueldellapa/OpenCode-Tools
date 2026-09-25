@@ -945,7 +945,12 @@ def run_composed_pipeline(
                 *last_record.errors,
                 *to_error_records(
                     error,
-                    phase=last_record.current_phase,
+                    # `last_record.current_phase` would still name the last
+                    # role that happened to persist (e.g. `ARCHITECT`) when
+                    # a *later* role's own `open_attempt_sink`/`persist` is
+                    # what actually raised -- `last_attempted_phase` always
+                    # names the invocation this error truly belongs to.
+                    phase=outcome.orchestrator.last_attempted_phase,
                     timestamp=clock.now(),
                     first_sequence=(
                         last_record.errors[-1].sequence + 1 if last_record.errors else 0
@@ -958,7 +963,17 @@ def run_composed_pipeline(
             target=target,
             trigger_outcome=error.outcome,
             review_status=None,
-            interrupted=isinstance(error, RunInterruptedError),
+            # A plain `isinstance(error, RunInterruptedError)` would miss an
+            # interruption already observed on this same invocation (the
+            # agent's own process outcome was `INTERRUPTED`) when a
+            # *different* `OpenCodeToolsError` is what a later operation in
+            # that same invocation -- the after-attempt Git check, the sink
+            # close, or the post-attempt `persist` itself -- went on to
+            # raise; `cancellation_requested` still reflects that fact.
+            interrupted=(
+                isinstance(error, RunInterruptedError)
+                or outcome.orchestrator.cancellation_requested
+            ),
             # `record` alone would lose the failed attempt's own
             # termination evidence when a post-attempt `persist` is exactly
             # what raised `error` -- `last_observed_termination_confirmed`

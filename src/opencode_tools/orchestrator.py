@@ -512,6 +512,20 @@ class IssueOrchestrator:
     SS16.3; ADR-006) for a possibly still-live child, even though that same
     attempt's own `AttemptRecord` never reached `record`.
 
+    `cancellation_requested` and `last_attempted_phase` are two more facts
+    that must not be lost to the same kind of persistence failure. The
+    former is simply this instance's own `_cancellation_requested` flag
+    read back, so a caller that caught some *other* `OpenCodeToolsError`
+    raised after an already-observed `INTERRUPTED` process outcome (the
+    after-attempt Git check, the sink close, or the post-attempt `persist`
+    itself) can still credit `resolve_terminal_outcome` with the
+    interruption instead of letting the unrelated error outrank it. The
+    latter advances the instant `run_logical_invocation` begins a new
+    role/review-cycle -- before either early-exit check, and long before
+    that invocation's own `AttemptRecord` could ever reach `record` -- so a
+    caught error is tagged with the role actually failing (e.g. `CODER`)
+    rather than the last one that happened to persist (e.g. `ARCHITECT`).
+
     `control_plane_digest` is the canonical digest `bootstrap_run` already
     obtained from one `OpenCodePreflightPort.verify()` call (M13-01); this
     class never calls `verify()` itself -- only `recheck(control_plane_digest)`,
@@ -558,6 +572,7 @@ class IssueOrchestrator:
         )
         self._cancellation_requested = False
         self._last_agent_result: AgentResult | None = None
+        self._current_phase: PipelinePhase = initial_record.current_phase
 
     @property
     def record(self) -> RunRecord:
@@ -586,6 +601,38 @@ class IssueOrchestrator:
         if self._last_agent_result is None:
             return None
         return self._last_agent_result.process.termination_confirmed
+
+    @property
+    def cancellation_requested(self) -> bool:
+        """Whether this run has ever been cancelled -- externally, via
+        `request_cancellation`, or because some already-observed
+        `AgentResult.process.outcome` was itself `INTERRUPTED` -- regardless
+        of whether that particular attempt's own `AttemptRecord` ever
+        reached `record`. A caller that only had `record` to fall back to
+        would lose an interruption already observed on an attempt whose own
+        `persist` (or a later operation in the same invocation, such as the
+        after-attempt Git check or the sink close) then raised a
+        *different* `OpenCodeToolsError` -- `error.outcome` alone would
+        then outrank `INTERRUPTED` in `resolve_terminal_outcome`'s
+        precedence, which is wrong: the cancellation was still real.
+        """
+
+        return self._cancellation_requested
+
+    @property
+    def last_attempted_phase(self) -> PipelinePhase:
+        """The phase of the invocation this instance most recently began
+        attempting -- unlike `record.current_phase`, this advances the
+        instant `run_logical_invocation` starts a new role/review-cycle,
+        before that invocation's own `AttemptRecord` (if any) could ever
+        reach `record`. A caller that only had `record.current_phase` to
+        fall back to would misattribute a caught error to the last role
+        that happened to persist (e.g. `ARCHITECT`) rather than the one
+        actually failing (e.g. `CODER`, when the first coder attempt's own
+        `open_attempt_sink`/`persist` is what raised).
+        """
+
+        return self._current_phase
 
     def request_cancellation(self) -> None:
         """Record an external cancellation request (System Design SH-001).
@@ -638,6 +685,14 @@ class IssueOrchestrator:
         if not isinstance(workspace, Workspace):
             raise TypeError("workspace must be Workspace")
 
+        state = PipelineState(phase=_PHASE_BY_ROLE[role], review_cycle=review_cycle)
+        # Recorded before either early-exit check below so a caller reading
+        # `last_attempted_phase` after a caught error always sees the role
+        # this invocation was actually for, never a stale, previously
+        # persisted one (`record.current_phase` only advances on a
+        # successful `persist`).
+        self._current_phase = state.phase
+
         if self._persistence_blocked:
             raise LoggingError(
                 code="orchestrator.persistence_blocked",
@@ -651,7 +706,6 @@ class IssueOrchestrator:
                 related_record=self._run_id,
             )
 
-        state = PipelineState(phase=_PHASE_BY_ROLE[role], review_cycle=review_cycle)
         invocation_id = _build_logical_invocation_id(self._run_id, role, review_cycle)
         cycle_component = _cycle_component(review_cycle)
 

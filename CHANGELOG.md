@@ -35,7 +35,14 @@ loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `persist` failure right after an attempt with a possibly still-live
   child no longer loses that fact -- `finalize_run` still forces postflight
   `INDETERMINATE` and quarantines the target lease instead of releasing it
-  for another run to acquire.
+  for another run to acquire. `IssueOrchestrator` likewise exposes
+  `cancellation_requested` and `last_attempted_phase` independently of
+  `record`: an interruption already observed on the failing attempt is no
+  longer lost behind an unrelated secondary `OpenCodeToolsError` (it still
+  outranks that error in `resolve_terminal_outcome`'s precedence), and the
+  preserved `ErrorRecord` is tagged with the role actually failing (e.g.
+  `CODER`) rather than the last role that happened to persist (e.g.
+  `ARCHITECT`).
 
 ## [0.1.2] - 2026-09-22
 
