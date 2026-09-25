@@ -9,13 +9,19 @@ with real local helper processes.
 from __future__ import annotations
 
 import hashlib
+import threading
 from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
 
 from opencode_tools.domain import ProcessResult, RunOutcome
-from opencode_tools.process import build_process_result, deadline_ns, sanitize_command
+from opencode_tools.process import (
+    _wait_for_exit_or_deadline,
+    build_process_result,
+    deadline_ns,
+    sanitize_command,
+)
 
 
 class FakeClock:
@@ -325,3 +331,101 @@ def test_sanitize_command_leaves_plain_filesystem_paths_untouched() -> None:
     argv = ("/usr/bin/git", "-C", str(Path("/workspaces/example/backend")))
 
     assert sanitize_command(argv) == argv
+
+
+class _FakeExitedProcess:
+    """A minimal `Popen`-shaped fake that reports as already exited."""
+
+    def __init__(self, return_code: int) -> None:
+        self._return_code = return_code
+
+    def poll(self) -> int | None:
+        return self._return_code
+
+
+def test_wait_for_exit_or_deadline_lets_a_cancellation_outrank_an_already_exited_child() -> (
+    None
+):
+    """A caught SIGINT/SIGTERM must win the same race `sink_fault` already
+    wins against `process.poll()` (see the function's own docstring):
+    otherwise a short-lived child that happens to finish at the same moment
+    a signal is caught would silently report its own exit code instead of
+    `INTERRUPTED`, breaking the documented "always" contract
+    (`build_process_result`'s own docstring, SH-001, issue #112)."""
+
+    cancelled = threading.Event()
+    cancelled.set()
+    process = _FakeExitedProcess(return_code=0)
+
+    return_code, timed_out, interrupted, logging_error = _wait_for_exit_or_deadline(
+        process,  # type: ignore[arg-type]
+        FakeClock(),
+        deadline_ns(0, 30.0),
+        cancelled,
+        threading.Event(),
+    )
+
+    assert interrupted is True
+    assert timed_out is False
+    assert logging_error is False
+    assert return_code is None
+
+
+def test_wait_for_exit_or_deadline_reports_an_uncancelled_exit_normally() -> None:
+    """The reordering that lets cancellation outrank `process.poll()` must
+    not change the ordinary, uncancelled path: an already-exited child is
+    still reported with its real return code."""
+
+    process = _FakeExitedProcess(return_code=0)
+
+    return_code, timed_out, interrupted, logging_error = _wait_for_exit_or_deadline(
+        process,  # type: ignore[arg-type]
+        FakeClock(),
+        deadline_ns(0, 30.0),
+        threading.Event(),
+        threading.Event(),
+    )
+
+    assert return_code == 0
+    assert timed_out is False
+    assert interrupted is False
+    assert logging_error is False
+
+
+class _FakeProcessThatSignalsDuringPoll:
+    """A minimal `Popen`-shaped fake whose `poll()` call itself triggers the
+    cancellation (simulating a signal caught *during* the syscall, after an
+    earlier `cancelled.is_set()` check already read `False`), then reports
+    the child as already exited."""
+
+    def __init__(self, *, cancelled: threading.Event, return_code: int) -> None:
+        self._cancelled = cancelled
+        self._return_code = return_code
+
+    def poll(self) -> int | None:
+        self._cancelled.set()
+        return self._return_code
+
+
+def test_wait_for_exit_or_deadline_rechecks_cancellation_after_polling() -> None:
+    """Codex review follow-up on issue #112 (P1): the two `cancelled`
+    checks around `process.poll()` are not atomic with the call itself, so
+    a signal caught *during* `poll()` -- after the earlier check already
+    read `False` -- must still be honored before its exit code is accepted
+    as final, exactly like `_FakeExitedProcess`'s already-set case above."""
+
+    cancelled = threading.Event()
+    process = _FakeProcessThatSignalsDuringPoll(cancelled=cancelled, return_code=0)
+
+    return_code, timed_out, interrupted, logging_error = _wait_for_exit_or_deadline(
+        process,  # type: ignore[arg-type]
+        FakeClock(),
+        deadline_ns(0, 30.0),
+        cancelled,
+        threading.Event(),
+    )
+
+    assert interrupted is True
+    assert timed_out is False
+    assert logging_error is False
+    assert return_code is None

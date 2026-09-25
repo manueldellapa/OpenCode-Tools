@@ -5,6 +5,22 @@ loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+- Closed an unsupervised-child window in `SubprocessRunner.run()` (issue
+  #112): the SIGTERM/SIGINT handlers are now installed *before*
+  `subprocess.Popen()` is called, rather than after the child was spawned
+  and its reader/writer threads were already started. Previously, a signal
+  arriving in that window hit Python's default SIGTERM disposition
+  (terminating the parent with zero cleanup) or an uncaught `SIGINT`
+  `KeyboardInterrupt` (unwinding past `run()` without ever signaling the
+  child), either way orphaning the already-spawned child instead of
+  triggering the documented `SIGTERM -> grace -> SIGKILL -> grace`
+  escalation across its whole process group (System Design SS10.2, SH-001).
+  This affected every child spawned through this adapter, including
+  `opencode` itself and every Git invocation from `git_safety.py`,
+  `coder_sandbox.py`, `locking.py`, and `github.py`.
+
 ### Security
 
 - Closed a Git clean-filter/textconv remote command execution path in coder

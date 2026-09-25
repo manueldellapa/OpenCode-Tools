@@ -17,6 +17,7 @@ import dataclasses
 import hashlib
 import os
 import signal
+import subprocess
 import sys
 import threading
 import time
@@ -732,6 +733,101 @@ def test_run_restores_the_previous_signal_handlers_after_returning(
 
     assert signal.getsignal(signal.SIGTERM) == sentinel_sigterm
     assert signal.getsignal(signal.SIGINT) == sentinel_sigint
+
+
+def test_run_honors_a_signal_delivered_the_instant_popen_returns(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Issue #112: the SIGTERM/SIGINT handlers must already be installed
+    *before* `subprocess.Popen()` is called, not only after the child is
+    spawned and its reader/writer threads are started. This sends the
+    process its own SIGTERM the instant the real `Popen()` returns --
+    simulating one arriving during the spawn syscall itself, the worst case
+    of the vulnerable window -- and asserts it is still caught as a
+    cancellation and drives the documented escalation. Before the fix, a
+    signal delivered this early would hit Python's default disposition
+    (SIGTERM) or raise an uncaught `KeyboardInterrupt` (SIGINT) instead,
+    which -- among other things -- would abort this very test process
+    rather than being reported as `INTERRUPTED`."""
+
+    real_popen = subprocess.Popen
+
+    def _popen_then_self_signal(
+        args: tuple[str, ...],
+        *,
+        cwd: Path,
+        stdin: int,
+        stdout: int,
+        stderr: int,
+        env: dict[str, str],
+        shell: bool,
+        start_new_session: bool,
+    ) -> subprocess.Popen[bytes]:
+        process = real_popen(
+            args,
+            cwd=cwd,
+            stdin=stdin,
+            stdout=stdout,
+            stderr=stderr,
+            env=env,
+            shell=shell,
+            start_new_session=start_new_session,
+        )
+        os.kill(os.getpid(), signal.SIGTERM)
+        return process
+
+    monkeypatch.setattr(subprocess, "Popen", _popen_then_self_signal)
+
+    runner = SubprocessRunner(RealClock())
+    sink = RecordingAttemptLogSink()
+    spec = ProcessSpec(
+        argv=_helper_argv("--sleep", "10"),
+        cwd=tmp_path,
+        stdin=None,
+        timeout_seconds=30.0,
+        termination_grace_seconds=0.5,
+    )
+
+    started = time.monotonic()
+    result = runner.run(spec, sink=sink)
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 3.0
+    assert result.outcome is RunOutcome.INTERRUPTED
+    assert result.timed_out is False
+    assert result.termination_confirmed is True
+
+
+def test_run_preserves_a_caught_cancellation_when_the_spawn_itself_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Issue #112 (Codex review, P2): if SIGTERM/SIGINT is caught while
+    `Popen()` is running but the spawn itself then raises `OSError` (e.g.
+    an invalid executable races with shutdown), the cancellation must still
+    win -- not be silently swallowed into an ordinary `PROCESS_ERROR`,
+    which would hide from the orchestrator that a shutdown was already
+    requested."""
+
+    def _self_signal_then_fail(
+        *args: object, **kwargs: object
+    ) -> subprocess.Popen[bytes]:
+        os.kill(os.getpid(), signal.SIGTERM)
+        raise OSError("simulated spawn failure racing with shutdown")
+
+    monkeypatch.setattr(subprocess, "Popen", _self_signal_then_fail)
+
+    runner = SubprocessRunner(RealClock())
+    sink = RecordingAttemptLogSink()
+    spec = _spec(_helper_argv(), tmp_path)
+
+    result = runner.run(spec, sink=sink)
+
+    assert result.outcome is RunOutcome.INTERRUPTED
+    assert result.return_code is None
+    assert result.termination_confirmed is True
+    assert sink.writes == []
 
 
 def test_run_terminates_the_child_and_reports_logging_error_on_a_sink_fault(
