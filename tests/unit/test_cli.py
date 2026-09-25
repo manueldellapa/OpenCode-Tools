@@ -512,6 +512,7 @@ class _FakeRunStore:
         self._initialize_error = initialize_error
         self._fail_persist_on_call = fail_persist_on_call
         self.persist_calls = 0
+        self.persisted_records: list[RunRecord] = []
 
     def initialize(self, workspace: Workspace, run_id: str) -> Path:
         if self._initialize_error is not None:
@@ -525,6 +526,7 @@ class _FakeRunStore:
 
     def persist(self, record: object) -> PersistenceStatus:
         self.persist_calls += 1
+        self.persisted_records.append(cast("RunRecord", record))
         if (
             self._fail_persist_on_call is not None
             and self.persist_calls >= self._fail_persist_on_call
@@ -745,7 +747,12 @@ def test_a_mid_pipeline_logging_error_still_converges_through_finalize_run(
     uncaught -- `main` would otherwise mistake an already-initialized run
     for a pre-init failure (#109). It must converge through the same
     `finalize_run` every other terminal path does, still releasing the
-    lease and still returning an `IssueResult`, never the raw error."""
+    lease and still returning an `IssueResult`, never the raw error -- and
+    the caught error itself must survive onto the persisted `RunRecord.
+    errors`, exactly like `bootstrap_run`'s own late-stage except-handler
+    already preserves its own caught error, so the terminal artifact and
+    `_render_issue_result`'s stderr summary keep the actual diagnosis
+    instead of only the bare `LOGGING_ERROR` outcome."""
 
     workspace, target = _workspace_and_target(tmp_path)
     runtime_root = tmp_path / "runtime"
@@ -784,6 +791,13 @@ def test_a_mid_pipeline_logging_error_still_converges_through_finalize_run(
     assert result.trigger_outcome is RunOutcome.LOGGING_ERROR
     assert result.final_status is FinalStatus.FAILED
     assert lease.released is True
+
+    final_record = run_store.persisted_records[-1]
+    assert [error.code for error in final_record.errors] == [
+        "orchestrator.run_record_persist_failed"
+    ]
+    assert final_record.errors[-1].outcome is RunOutcome.LOGGING_ERROR
+    assert final_record.errors[-1].phase is PipelinePhase.ARCHITECT
 
 
 # --- _CliAgentRunner: decode/classify/parse/identity-verify composition --

@@ -26,7 +26,10 @@ loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `finalize_run`, exactly like `bootstrap_run`'s own late-stage failures.
   Previously it escaped to `main`'s pre-init handler, which wrongly reported
   "artifact: none", printed no `FINAL_STATUS` line, and left the target
-  lease held forever since `finalize_run` was never reached.
+  lease held forever since `finalize_run` was never reached. The caught
+  error is also folded into `RunRecord.errors` before finalization, so the
+  persisted artifact and stderr summary keep the actual diagnosis instead
+  of only the bare `LOGGING_ERROR` terminal outcome.
 
 ## [0.1.2] - 2026-09-22
 

@@ -41,6 +41,7 @@ import platform
 import sys
 import time
 from collections.abc import Mapping, Sequence
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Protocol, cast, runtime_checkable
@@ -89,6 +90,7 @@ from opencode_tools.errors import (
     OpenCodeToolsError,
     ProtocolError,
     RunInterruptedError,
+    to_error_records,
 )
 from opencode_tools.orchestrator import (
     IssuePipelineResult,
@@ -931,8 +933,28 @@ def run_composed_pipeline(
         # "successivo alla run init" exactly like `bootstrap_run`'s own
         # late-stage failures, and must converge through the same
         # `finalize_run` rather than escape to `main`'s pre-init handler.
+        # The caught error itself is folded into `errors` first (mirroring
+        # `bootstrap_run`'s own late-stage except-handler and `finalize_run`'s
+        # own quarantine-failure handling), so both the persisted artifact
+        # and `_render_issue_result`'s stderr summary keep the actual
+        # diagnosis instead of only the bare terminal outcome.
+        last_record = outcome.orchestrator.record
+        record_with_error = replace(
+            last_record,
+            errors=(
+                *last_record.errors,
+                *to_error_records(
+                    error,
+                    phase=last_record.current_phase,
+                    timestamp=clock.now(),
+                    first_sequence=(
+                        last_record.errors[-1].sequence + 1 if last_record.errors else 0
+                    ),
+                ),
+            ),
+        )
         return finalize_run(
-            record=outcome.orchestrator.record,
+            record=record_with_error,
             target=target,
             trigger_outcome=error.outcome,
             review_status=None,
