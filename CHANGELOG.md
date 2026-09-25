@@ -29,7 +29,13 @@ loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   lease held forever since `finalize_run` was never reached. The caught
   error is also folded into `RunRecord.errors` before finalization, so the
   persisted artifact and stderr summary keep the actual diagnosis instead
-  of only the bare `LOGGING_ERROR` terminal outcome.
+  of only the bare `LOGGING_ERROR` terminal outcome. `IssueOrchestrator`
+  now also exposes the last observed `termination_confirmed` independently
+  of `record` (which stops advancing once persistence is blocked), so a
+  `persist` failure right after an attempt with a possibly still-live
+  child no longer loses that fact -- `finalize_run` still forces postflight
+  `INDETERMINATE` and quarantines the target lease instead of releasing it
+  for another run to acquire.
 
 ## [0.1.2] - 2026-09-22
 

@@ -544,7 +544,10 @@ class _FakeOpenCodePreflight:
 
 
 def _agent_process_result(
-    *, workspace_root: Path, outcome: RunOutcome
+    *,
+    workspace_root: Path,
+    outcome: RunOutcome,
+    termination_confirmed: bool | None = True,
 ) -> ProcessResult:
     return ProcessResult(
         command=("/usr/bin/opencode", "run"),
@@ -554,7 +557,7 @@ def _agent_process_result(
         duration_ns=1_000_000_000,
         return_code=0 if outcome is RunOutcome.SUCCEEDED else 1,
         timed_out=False,
-        termination_confirmed=True,
+        termination_confirmed=termination_confirmed,
         log_path=Path("architect.log"),
         stdout_byte_count=0,
         stdout_sha256="digest",
@@ -570,8 +573,11 @@ class _FakeAgentRunner:
     pipeline -> finalize composition without needing a 3-role choreography.
     """
 
-    def __init__(self, *, workspace_root: Path) -> None:
+    def __init__(
+        self, *, workspace_root: Path, termination_confirmed: bool | None = True
+    ) -> None:
         self._workspace_root = workspace_root
+        self._termination_confirmed = termination_confirmed
         self.bind_issue_locator_calls: list[IssueLocator] = []
         self.run_calls: list[tuple[object, int | None, int]] = []
 
@@ -601,7 +607,18 @@ class _FakeAgentRunner:
             review_cycle=review_cycle,
             provider_attempt=provider_attempt,
             process=_agent_process_result(
-                workspace_root=self._workspace_root, outcome=RunOutcome.SUCCEEDED
+                workspace_root=self._workspace_root,
+                # `ProcessResult` forbids an unconfirmed termination on a
+                # `SUCCEEDED` outcome (domain.py's own invariant), so an
+                # unconfirmed run here is reported as a `PROCESS_ERROR`
+                # instead -- the realistic shape of a process group whose
+                # termination could not be confirmed.
+                outcome=(
+                    RunOutcome.SUCCEEDED
+                    if self._termination_confirmed is True
+                    else RunOutcome.PROCESS_ERROR
+                ),
+                termination_confirmed=self._termination_confirmed,
             ),
             terminal_response=response,
             session_id="session-architect-1",
@@ -798,6 +815,61 @@ def test_a_mid_pipeline_logging_error_still_converges_through_finalize_run(
     ]
     assert final_record.errors[-1].outcome is RunOutcome.LOGGING_ERROR
     assert final_record.errors[-1].phase is PipelinePhase.ARCHITECT
+
+
+def test_a_mid_pipeline_logging_error_still_quarantines_an_unconfirmed_termination(
+    tmp_path: Path,
+) -> None:
+    """The architect's attempt itself observes `termination_confirmed=
+    False` (a possibly still-live child) right before its own post-attempt
+    `persist` call fails and raises `LoggingError` -- losing that
+    observation to `IssueOrchestrator.record`, which never advances past
+    the pre-attempt snapshot. `run_composed_pipeline`'s except-handler must
+    still recover it via `IssueOrchestrator.last_observed_termination_
+    confirmed` and pass `False` through to `finalize_run`, so postflight is
+    forced `INDETERMINATE` and the lease is quarantined -- not silently
+    released for another run to acquire -- exactly as it would have been
+    had persistence never failed at all."""
+
+    workspace, target = _workspace_and_target(tmp_path)
+    runtime_root = tmp_path / "runtime"
+    app_config = _app_config(runtime_root=runtime_root)
+    run_request = RunRequest(
+        issue_number=42, workspace=workspace, target_root=workspace.root
+    )
+
+    git_safety = _FakeGitSafety(target=target)
+    lease = _FakeLease()
+    lease_factory = _FakeLeaseFactory(lease)
+    # Bootstrap persists twice before any agent ever runs; failing the 3rd
+    # call fails the architect's own post-attempt persist instead.
+    run_store = _FakeRunStore(fail_persist_on_call=3)
+    agent_runner = _FakeAgentRunner(
+        workspace_root=workspace.root, termination_confirmed=False
+    )
+
+    result = run_composed_pipeline(
+        run_request=run_request,
+        app_config=app_config,
+        run_id="20260915T090000.000000Z-abcdefabcdef",
+        process_runner=cast("ProcessRunner", None),
+        clock=_SteppingClock(),
+        sleeper=_RecordingSleeper(),
+        git_safety_port=cast("GitSafetyPort", git_safety),
+        issue_resolver=cast("IssueResolver", _FakeIssueResolver()),
+        run_store=cast("RunStorePort", run_store),
+        lease_factory=cast("TargetLeaseFactory", lease_factory),
+        opencode_preflight=cast("OpenCodePreflightPort", _FakeOpenCodePreflight()),
+        agent_runner=cast("AgentRunner", agent_runner),
+    )
+
+    assert [call[0] for call in agent_runner.run_calls] == [AgentRole.ARCHITECT]
+    assert isinstance(result, IssueResult)
+    assert result.termination_confirmed is False
+    assert result.git_safety_status is GitSafetyStatus.INDETERMINATE
+    assert result.final_status is FinalStatus.FAILED
+    assert lease.quarantine_reasons
+    assert lease.released is True
 
 
 # --- _CliAgentRunner: decode/classify/parse/identity-verify composition --

@@ -959,7 +959,12 @@ def run_composed_pipeline(
             trigger_outcome=error.outcome,
             review_status=None,
             interrupted=isinstance(error, RunInterruptedError),
-            termination_confirmed=None,
+            # `record` alone would lose the failed attempt's own
+            # termination evidence when a post-attempt `persist` is exactly
+            # what raised `error` -- `last_observed_termination_confirmed`
+            # survives that loss, so a possibly still-live child still
+            # forces postflight `INDETERMINATE` and quarantines the lease.
+            termination_confirmed=outcome.orchestrator.last_observed_termination_confirmed,
             git_safety=git_safety_port,
             run_store=run_store,
             lease=outcome.lease,

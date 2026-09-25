@@ -502,6 +502,16 @@ class IssueOrchestrator:
     `planned_delay_seconds` `retry.decide_retry` already computed -- never a
     real sleep in this module's own tests.
 
+    Unlike `record`, `last_observed_termination_confirmed` does *not* stop
+    advancing once persistence is blocked: it is captured the instant an
+    `AgentResult` is received, before that attempt's own `persist` call is
+    even attempted, so a caller that catches the `LoggingError` a failed
+    `persist` raises still learns whether the process group that just ran
+    was confirmed terminated -- the one fact `finalize_run` needs to force
+    postflight `INDETERMINATE` and quarantine the lease (System Design
+    SS16.3; ADR-006) for a possibly still-live child, even though that same
+    attempt's own `AttemptRecord` never reached `record`.
+
     `control_plane_digest` is the canonical digest `bootstrap_run` already
     obtained from one `OpenCodePreflightPort.verify()` call (M13-01); this
     class never calls `verify()` itself -- only `recheck(control_plane_digest)`,
@@ -547,6 +557,7 @@ class IssueOrchestrator:
             initial_record.persistence_status is not PersistenceStatus.OK
         )
         self._cancellation_requested = False
+        self._last_agent_result: AgentResult | None = None
 
     @property
     def record(self) -> RunRecord:
@@ -558,6 +569,23 @@ class IssueOrchestrator:
         """
 
         return self._record
+
+    @property
+    def last_observed_termination_confirmed(self) -> bool | None:
+        """The most recently observed attempt's own `AgentResult.process.
+        termination_confirmed`, captured the moment the agent returns --
+        unlike `record`, this survives even when that same attempt's
+        `AttemptRecord` never reaches `record` because its own `persist`
+        call failed. A caller that only had `record` to fall back to would
+        otherwise lose exactly the fact System Design SS16.3/ADR-006 needs
+        to force postflight `INDETERMINATE` and quarantine the lease: a
+        possibly still-live child process. `None` only when no agent has
+        ever been invoked yet.
+        """
+
+        if self._last_agent_result is None:
+            return None
+        return self._last_agent_result.process.termination_confirmed
 
     def request_cancellation(self) -> None:
         """Record an external cancellation request (System Design SH-001).
@@ -707,6 +735,7 @@ class IssueOrchestrator:
             sink=sink,
         )
         _record(InvocationEventKind.AGENT_RESULT_RECEIVED)
+        self._last_agent_result = agent_result
 
         if agent_result.process.outcome is RunOutcome.INTERRUPTED:
             self._cancellation_requested = True
