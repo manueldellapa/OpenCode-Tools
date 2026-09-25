@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import os
 import shutil
 import subprocess
@@ -12,6 +13,9 @@ from pathlib import Path
 
 import pytest
 
+from opencode_tools import (
+    coder_sandbox,  # see test below for why the module itself is imported
+)
 from opencode_tools.coder_sandbox import (
     CoderSandbox,
     CoderSandboxError,
@@ -656,9 +660,17 @@ def test_promotion_preserves_checkout_normalized_files_left_untouched(
     assert (root / "NEW.txt").read_text(encoding="utf-8") == "new\n"
 
 
-def test_promotion_refuses_an_unreadable_candidate_file(tmp_path: Path) -> None:
-    """GH #110 P2 review: a coder-unreadable file (e.g. `chmod 000`) must
-    raise CoderSandboxError, not a raw PermissionError."""
+def test_promotion_refuses_an_unreadable_new_candidate_file(tmp_path: Path) -> None:
+    """GH #110 P2/P1 review: a coder-unreadable brand-new file (e.g.
+    `chmod 000`) must raise CoderSandboxError, not a raw PermissionError.
+
+    A brand-new path is classified without an in-process content read
+    (GH #110 follow-up), so `chmod 000` alone does not fail at
+    classification -- `lstat` does not require read permission -- and the
+    failure is instead surfaced by the bounded `git hash-object`
+    subprocess itself refusing to open the file, which `_run_git` already
+    converts to a `CoderSandboxError` rather than letting a raw process
+    failure escape."""
 
     root, target = _repository(tmp_path)
 
@@ -668,7 +680,7 @@ def test_promotion_refuses_an_unreadable_candidate_file(tmp_path: Path) -> None:
         secret.write_text("top secret\n", encoding="utf-8")
         secret.chmod(0o000)
 
-        with pytest.raises(CoderSandboxError, match="could not be read"):
+        with pytest.raises(CoderSandboxError):
             promote_coder_changes(
                 runner,
                 git_executable=git,
@@ -684,6 +696,39 @@ def test_promotion_refuses_an_unreadable_candidate_file(tmp_path: Path) -> None:
 
     assert (root / "README.md").read_text(encoding="utf-8") == "before\n"
     assert not (root / "secret.txt").exists()
+
+
+def test_promotion_refuses_an_unreadable_changed_tracked_file(tmp_path: Path) -> None:
+    """GH #110 P2 review: a coder-unreadable *tracked* file that was
+    changed (e.g. `chmod 000` after editing) must still raise
+    CoderSandboxError from the in-process classification/fingerprint step
+    -- the fast path for brand-new candidates above does not apply here,
+    since this path is present in `pristine_raw_snapshot` and must still
+    be fingerprinted to prove it actually changed."""
+
+    root, target = _repository(tmp_path)
+
+    git, clock, runner, sandbox = _prepare(target)
+    tracked = sandbox.root / "README.md"
+    try:
+        tracked.write_text("changed\n", encoding="utf-8")
+        tracked.chmod(0o000)
+
+        with pytest.raises(CoderSandboxError, match="could not be read"):
+            promote_coder_changes(
+                runner,
+                git_executable=git,
+                target=target,
+                sandbox=sandbox,
+                clock=clock,
+                utility_timeout_seconds=10,
+                termination_grace_seconds=1,
+            )
+    finally:
+        tracked.chmod(0o644)
+        cleanup_coder_sandbox(sandbox)
+
+    assert (root / "README.md").read_text(encoding="utf-8") == "before\n"
 
 
 def test_promotion_only_hashes_genuinely_changed_files(tmp_path: Path) -> None:
@@ -1192,3 +1237,131 @@ def test_promotion_never_reads_external_content_through_a_symlinked_ancestor(
     # proof no external content was ever staged as its replacement.
     original_entries = _git(["ls-files", "--stage", "--", "dir/child.txt"], cwd=root)
     assert "dir/child.txt" in original_entries
+
+
+def test_promotion_skips_fingerprinting_a_brand_new_file_and_hashes_it_directly(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """GH #110 P1 review: a path absent from `pristine_raw_snapshot` is
+    already known to be new -- there is nothing to compare it against, so
+    fingerprinting its content first is redundant work with no timeout of
+    its own (unlike the bounded `git hash-object` subprocess that follows
+    either way). Promotion must classify a brand-new path's mode without
+    ever reading its content in-process."""
+
+    root, target = _repository(tmp_path)
+    git, clock, runner, sandbox = _prepare(target)
+
+    fingerprinted_paths: list[str] = []
+    original_fingerprint = coder_sandbox._fingerprint_file_chunked
+
+    def _spy(entry_path: Path, mode: str) -> str:
+        fingerprinted_paths.append(str(entry_path))
+        return original_fingerprint(entry_path, mode)
+
+    monkeypatch.setattr(coder_sandbox, "_fingerprint_file_chunked", _spy)
+
+    try:
+        (sandbox.root / "brand-new.txt").write_text("new content\n", encoding="utf-8")
+        promote_coder_changes(
+            runner,
+            git_executable=git,
+            target=target,
+            sandbox=sandbox,
+            clock=clock,
+            utility_timeout_seconds=10,
+            termination_grace_seconds=1,
+        )
+    finally:
+        cleanup_coder_sandbox(sandbox)
+
+    assert not any(p.endswith("brand-new.txt") for p in fingerprinted_paths), (
+        f"a brand-new path was fingerprinted before being hashed: {fingerprinted_paths!r}"
+    )
+    assert (root / "brand-new.txt").read_text(encoding="utf-8") == "new content\n"
+
+
+def test_promotion_never_executes_a_planted_fsmonitor_command(tmp_path: Path) -> None:
+    """GH #110 P1 review: `.git/config` is checked against its pristine
+    byte-identity baseline before promotion runs -- but a background
+    process the coder leaves running could still rewrite it after that
+    check completes and before the Git commands below actually run (a
+    TOCTOU window the one-time check alone cannot close). This constructs
+    exactly that end state -- a `.git/config` that already matches the
+    (now-poisoned) baseline -- and confirms every trusted promotion Git
+    invocation still refuses to execute an active `core.fsmonitor`
+    command, because it is forced off regardless of what the sandbox's
+    local config says."""
+
+    root, target = _repository(tmp_path)
+    marker = tmp_path / "fsmonitor-marker"
+
+    git, clock, runner, sandbox = _prepare(target)
+    try:
+        (sandbox.root / "new.txt").write_text("new\n", encoding="utf-8")
+        _git(
+            ["config", "core.fsmonitor", f"touch {marker}; true"],
+            cwd=sandbox.root,
+        )
+        poisoned_config = (sandbox.root / ".git" / "config").read_bytes()
+        poisoned_sandbox = dataclasses.replace(
+            sandbox, git_config_baseline=poisoned_config
+        )
+
+        promote_coder_changes(
+            runner,
+            git_executable=git,
+            target=target,
+            sandbox=poisoned_sandbox,
+            clock=clock,
+            utility_timeout_seconds=10,
+            termination_grace_seconds=1,
+        )
+    finally:
+        cleanup_coder_sandbox(sandbox)
+
+    assert not marker.exists(), "a planted core.fsmonitor command executed"
+    assert (root / "new.txt").read_text(encoding="utf-8") == "new\n"
+
+
+def test_promotion_never_executes_a_planted_post_index_change_hook(
+    tmp_path: Path,
+) -> None:
+    """GH #110 P1 review: same TOCTOU rationale as the fsmonitor case
+    above, for `core.hooksPath` -- an index-changing command
+    (`update-index`) must never execute a coder-planted
+    `post-index-change` hook, even when `.git/config` already matches the
+    byte-identity baseline, because `core.hooksPath` is forced to
+    `os.devnull` regardless of what the sandbox's local config says."""
+
+    root, target = _repository(tmp_path)
+    marker = tmp_path / "hook-marker"
+    hooks_dir = tmp_path / "planted-hooks"
+    hooks_dir.mkdir()
+    hook_path = hooks_dir / "post-index-change"
+    hook_path.write_text(f"#!/bin/sh\ntouch {marker}\n", encoding="utf-8")
+    hook_path.chmod(0o755)
+
+    git, clock, runner, sandbox = _prepare(target)
+    try:
+        (sandbox.root / "new.txt").write_text("new\n", encoding="utf-8")
+        _git(["config", "core.hooksPath", str(hooks_dir)], cwd=sandbox.root)
+        poisoned_config = (sandbox.root / ".git" / "config").read_bytes()
+        poisoned_sandbox = dataclasses.replace(
+            sandbox, git_config_baseline=poisoned_config
+        )
+
+        promote_coder_changes(
+            runner,
+            git_executable=git,
+            target=target,
+            sandbox=poisoned_sandbox,
+            clock=clock,
+            utility_timeout_seconds=10,
+            termination_grace_seconds=1,
+        )
+    finally:
+        cleanup_coder_sandbox(sandbox)
+
+    assert not marker.exists(), "a planted core.hooksPath hook executed"
+    assert (root / "new.txt").read_text(encoding="utf-8") == "new\n"

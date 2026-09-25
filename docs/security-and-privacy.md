@@ -38,6 +38,29 @@ escapes OpenCode's directory boundary, a compromised
 performed through another channel. See ADR-010 for the remaining threat
 model.
 
+**Accepted residual risk: a promotion-time file-to-symlink race.** Coder
+sandbox promotion (issue #110) validates each changed candidate's type
+with a non-following `lstat`, then, for a regular file, hands its *path*
+to a separate `git hash-object --no-filters` subprocess, which reopens
+that path itself. A still-running process the coder left behind -- one
+that survives past the coder's own successful completion and keeps its
+already-granted write access to the sandbox -- could in principle replace
+that regular file with a symlink in the narrow window between the two
+opens, causing `hash-object` to read (and promote) whatever the symlink
+points to instead. Closing this specific race would mean hashing from the
+exact file descriptor validated at classification time instead of a
+path `git` reopens on its own, which is not achievable through `git`'s
+own CLI (`hash-object` only accepts a path or a full content stream, not
+an inherited descriptor) without reintroducing the whole-file in-process
+buffering this same effort deliberately removed. More generally, making
+any two-step validate-then-act sequence in this module race-free against
+a hostile background process holding same-user write access for its
+whole duration is OS-level containment -- exactly what ADR-010 states
+v0.1 does not promise ("non è una sandbox OS generale... nessuna garanzia
+OS-level ulteriore entra implicitamente nell'implementazione corrente").
+It is accepted here as a documented residual risk rather than fixed in
+code, consistent with the other residual risks above.
+
 ## Controls actually applied
 
 - Every subprocess uses structured argv with `shell=False`; the agent
