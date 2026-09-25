@@ -390,3 +390,42 @@ def test_wait_for_exit_or_deadline_reports_an_uncancelled_exit_normally() -> Non
     assert timed_out is False
     assert interrupted is False
     assert logging_error is False
+
+
+class _FakeProcessThatSignalsDuringPoll:
+    """A minimal `Popen`-shaped fake whose `poll()` call itself triggers the
+    cancellation (simulating a signal caught *during* the syscall, after an
+    earlier `cancelled.is_set()` check already read `False`), then reports
+    the child as already exited."""
+
+    def __init__(self, *, cancelled: threading.Event, return_code: int) -> None:
+        self._cancelled = cancelled
+        self._return_code = return_code
+
+    def poll(self) -> int | None:
+        self._cancelled.set()
+        return self._return_code
+
+
+def test_wait_for_exit_or_deadline_rechecks_cancellation_after_polling() -> None:
+    """Codex review follow-up on issue #112 (P1): the two `cancelled`
+    checks around `process.poll()` are not atomic with the call itself, so
+    a signal caught *during* `poll()` -- after the earlier check already
+    read `False` -- must still be honored before its exit code is accepted
+    as final, exactly like `_FakeExitedProcess`'s already-set case above."""
+
+    cancelled = threading.Event()
+    process = _FakeProcessThatSignalsDuringPoll(cancelled=cancelled, return_code=0)
+
+    return_code, timed_out, interrupted, logging_error = _wait_for_exit_or_deadline(
+        process,  # type: ignore[arg-type]
+        FakeClock(),
+        deadline_ns(0, 30.0),
+        cancelled,
+        threading.Event(),
+    )
+
+    assert interrupted is True
+    assert timed_out is False
+    assert logging_error is False
+    assert return_code is None

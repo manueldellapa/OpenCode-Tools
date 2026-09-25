@@ -178,6 +178,11 @@ def _wait_for_exit_or_deadline(
     the same moment would silently report its own exit code instead of
     `INTERRUPTED`, swallowing the shutdown request the `SIGTERM -> grace ->
     SIGKILL -> grace` escalation (SH-001) is supposed to always trigger.
+    `cancelled` is rechecked immediately after `process.poll()` returns an
+    exit code, too: the two checks around `poll()` are not atomic with the
+    call itself, so a signal caught *during* `poll()` (after the earlier
+    check already read `False`) must still win before that exit code is
+    accepted as final.
     """
 
     while True:
@@ -187,6 +192,8 @@ def _wait_for_exit_or_deadline(
             return None, False, True, False
         return_code = process.poll()
         if return_code is not None:
+            if cancelled.is_set():
+                return None, False, True, False
             return return_code, False, False, False
         if clock.monotonic_ns() >= deadline:
             return None, True, False, False
