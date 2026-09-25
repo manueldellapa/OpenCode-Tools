@@ -1058,3 +1058,137 @@ def test_unrelated_promotion_preserves_an_uninitialized_submodule_gitlink(
     assert (root / "NEW.txt").read_text(encoding="utf-8") == "new\n"
     assert _git(["rev-parse", "HEAD:submod"], cwd=root) == gitlink_sha
     assert (root / "submod").is_dir()
+
+
+def _repository_with_tracked_subdirectory(
+    tmp_path: Path,
+) -> tuple[Path, TargetRepository]:
+    """A target repo where `dir/child.txt` is tracked at baseline, so the
+    sandbox's own HEAD (and `prepare_coder_sandbox`'s pristine snapshot)
+    genuinely includes it before any coder edit."""
+    root = tmp_path / "target"
+    root.mkdir()
+    _git(["init", "--quiet", "--initial-branch=main"], cwd=root)
+    (root / "dir").mkdir()
+    (root / "dir" / "child.txt").write_text(
+        "original tracked content\n", encoding="utf-8"
+    )
+    _git(["add", "-A"], cwd=root)
+    _git(["commit", "--quiet", "-m", "initial"], cwd=root)
+    git_dir = Path(_git(["rev-parse", "--absolute-git-dir"], cwd=root))
+    return root, TargetRepository(
+        root=root.resolve(),
+        workspace_relative=Path("."),
+        git_common_dir=git_dir.resolve(),
+    )
+
+
+def test_promotion_handles_directory_replaced_by_symlink_with_cached_descendants(
+    tmp_path: Path,
+) -> None:
+    """GH #110 P1 review: replacing a tracked directory with a symlink
+    (to another directory inside the sandbox that happens to have a
+    same-named child with *different* content) must never read through
+    that symlinked ancestor to fingerprint/hash the old cached
+    descendant -- it must be treated as deleted, and the symlink promoted
+    as a symlink."""
+
+    root, target = _repository_with_tracked_subdirectory(tmp_path)
+
+    git, clock, runner, sandbox = _prepare(target)
+    recorder = _RecordingProcessRunner(runner)
+    try:
+        other = sandbox.root / "other"
+        other.mkdir()
+        (other / "child.txt").write_text("different content\n", encoding="utf-8")
+
+        shutil.rmtree(sandbox.root / "dir")
+        os.symlink(other, sandbox.root / "dir")
+
+        promote_coder_changes(
+            recorder,
+            git_executable=git,
+            target=target,
+            sandbox=sandbox,
+            clock=clock,
+            utility_timeout_seconds=10,
+            termination_grace_seconds=1,
+        )
+    finally:
+        cleanup_coder_sandbox(sandbox)
+
+    assert (root / "dir").is_symlink()
+    assert os.readlink(root / "dir") == str(other)
+    # The old cached dir/child.txt content must never have been read or
+    # hashed through the new symlink. "different content" legitimately
+    # appears in the final `git apply` patch (other/child.txt is its own,
+    # unrelated, correctly-promoted new file) -- exclude only that call and
+    # confirm no earlier classify/hash/index-build step ever saw it.
+    for spec in recorder.recorded_specs:
+        if "apply" in spec.argv:
+            continue
+        stdin = spec.stdin or b""
+        assert b"different content" not in stdin, (
+            f"content behind the new symlink was read: {stdin!r}"
+        )
+    # The old cached dir/child.txt path itself must have been removed from
+    # the index, and never re-added (proving it was classified deleted,
+    # not resolved through the new symlink).
+    removed_dir_child = False
+    for spec in recorder.recorded_specs:
+        stdin = spec.stdin or b""
+        if "--force-remove" in spec.argv and b"dir/child.txt" in stdin:
+            removed_dir_child = True
+        if "--index-info" in spec.argv:
+            assert b"\tdir/child.txt\x00" not in stdin, (
+                f"dir/child.txt was re-added to the index: {stdin!r}"
+            )
+    assert removed_dir_child, "dir/child.txt was never removed from the index"
+
+
+def test_promotion_never_reads_external_content_through_a_symlinked_ancestor(
+    tmp_path: Path,
+) -> None:
+    """GH #110 P1 review: a symlink pointing entirely outside the sandbox
+    must never cause external filesystem content to be read into this
+    process, let alone promoted, when resolving an old cached path
+    beneath it."""
+
+    root, target = _repository_with_tracked_subdirectory(tmp_path)
+    secret_marker = b"SECRET EXTERNAL CONTENT SHOULD NEVER BE PROMOTED"
+    external = tmp_path / "external-secret-location"
+    external.mkdir()
+    (external / "child.txt").write_bytes(secret_marker + b"\n")
+
+    git, clock, runner, sandbox = _prepare(target)
+    recorder = _RecordingProcessRunner(runner)
+    try:
+        shutil.rmtree(sandbox.root / "dir")
+        os.symlink(external, sandbox.root / "dir")
+
+        promote_coder_changes(
+            recorder,
+            git_executable=git,
+            target=target,
+            sandbox=sandbox,
+            clock=clock,
+            utility_timeout_seconds=10,
+            termination_grace_seconds=1,
+        )
+    finally:
+        cleanup_coder_sandbox(sandbox)
+
+    assert (root / "dir").is_symlink()
+    assert os.readlink(root / "dir") == str(external)
+    # The decisive check: the external file's content must never have
+    # reached this process at all, through any subprocess stdin.
+    for spec in recorder.recorded_specs:
+        stdin = spec.stdin or b""
+        assert secret_marker not in stdin, (
+            f"external content leaked into a subprocess call: {stdin!r}"
+        )
+    # The target's own real index (git apply without --index never
+    # touches it) must still have the *original* dir/child.txt blob --
+    # proof no external content was ever staged as its replacement.
+    original_entries = _git(["ls-files", "--stage", "--", "dir/child.txt"], cwd=root)
+    assert "dir/child.txt" in original_entries

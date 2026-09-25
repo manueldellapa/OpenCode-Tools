@@ -52,7 +52,16 @@ or entirely absent -- and is therefore never run through the file
 classifier at all: it is preserved exactly as `read-tree` already seeded
 it, and promotion fails closed instead if the sandbox's own index ever
 disagrees with the baseline about a gitlink's pointer (this PR does not
-support promoting an intentional submodule pointer change). The earlier
+support promoting an intentional submodule pointer change). Likewise, a
+candidate is never read through a *symlinked ancestor*: `lstat`/`open`
+only refuse to follow a symlink at a path's own final component, not at
+any directory component leading to it, so if the coder replaces a
+tracked directory with a symlink (to anywhere, including outside the
+sandbox entirely), naively reading an old cached path beneath it would
+silently read -- and promote -- whatever is actually at the symlink's
+target instead. Every ancestor component of every candidate is checked
+with non-following `lstat` first; a candidate with any current symlinked
+ancestor is treated as removed rather than ever opened. The earlier
 `.gitattributes`/`.git/config`/`.git/info/attributes` byte-identity checks
 against the sandbox's pristine baseline remain as defense in depth
 (GitHub issue #110).
@@ -699,6 +708,33 @@ def _parse_ls_files_stage(raw: bytes) -> dict[str, tuple[str, str]]:
     return entries
 
 
+def _has_symlinked_ancestor(sandbox_root: Path, rel_path: str) -> bool:
+    """Return True if any directory component between `sandbox_root` and
+    the leaf of `rel_path` is currently a symlink.
+
+    `lstat`/`open` only refuse to follow a symlink at a path's own final
+    component -- every *ancestor* component is followed transparently, by
+    ordinary POSIX path-resolution semantics. If the coder replaces a
+    tracked directory with a symlink (to anywhere, including outside the
+    sandbox entirely), naively reading an old cached path beneath it would
+    silently read -- and promote -- whatever is actually at the symlink's
+    target instead (GH #110 follow-up).
+    """
+    current = sandbox_root
+    for part in Path(rel_path).parts[:-1]:
+        current = current / part
+        try:
+            ancestor_lstat = os.lstat(current)
+        except OSError:
+            # A missing or otherwise inaccessible ancestor is not a
+            # symlink concern here -- the leaf's own lstat will raise or
+            # report "gone" correctly on its own.
+            return False
+        if stat.S_ISLNK(ancestor_lstat.st_mode):
+            return True
+    return False
+
+
 def _build_promotion_patch(
     process_runner: ProcessRunner,
     *,
@@ -826,6 +862,13 @@ def _build_promotion_patch(
         seen_paths.add(rel_path)
         if rel_path in baseline_gitlinks:
             continue  # preserved exactly as read-tree already seeded it
+        if _has_symlinked_ancestor(sandbox.root, rel_path):
+            # Never read through a symlinked ancestor: whatever is really
+            # there (possibly outside the sandbox) must not be attributed
+            # to this path. The ancestor symlink itself is still handled
+            # normally as its own candidate below.
+            removed_entries.append(os.fsencode(rel_path) + b"\x00")
+            continue
         entry_path = sandbox.root / rel_path
         classified = _classify_and_fingerprint(entry_path)
         if classified is None:
