@@ -49,7 +49,17 @@ loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   own* later write of `run.json` succeeds -- so a transient fault (e.g. the
   attempt-log sink) that clears before `finalize_run` runs still leaves
   `_render_issue_result`'s incomplete-artifact warning intact instead of
-  reporting the run as a clean success.
+  reporting the run as a clean success -- rendered as its own, distinct
+  warning ("the run artifact is incomplete"), never the "final persistence
+  failed" wording reserved for `PersistenceStatus.FAILED`, since `run.json`
+  itself was genuinely written. `IssueOrchestrator` also exposes its own
+  live `last_accepted_git_state`, independent of `record`: a coder's
+  permitted edit is accepted (`after` check `SAFE`) before that same
+  attempt's own `persist` can fail, and `finalize_run` now takes this
+  checkpoint explicitly instead of only ever reconstructing it from
+  `record.attempts` -- which would compare postflight against the
+  *pre-coder* state and falsely report an already-accepted edit as
+  `UNSAFE`.
 
 ## [0.1.2] - 2026-09-22
 

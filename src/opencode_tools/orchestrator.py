@@ -526,6 +526,15 @@ class IssueOrchestrator:
     caught error is tagged with the role actually failing (e.g. `CODER`)
     rather than the last one that happened to persist (e.g. `ARCHITECT`).
 
+    `last_accepted_git_state` is this instance's own live counterpart to
+    the module-level `_last_accepted_git_state(record)` reconstruction
+    `finalize_run` otherwise falls back to: it advances the moment an
+    attempt's own `after` checkpoint comes back `SAFE`, strictly before
+    that attempt's `AttemptRecord` is even built. A caller passing it
+    explicitly to `finalize_run` gets the true accepted checkpoint even
+    when the attempt that just accepted it is exactly the one whose own
+    `persist` failure is why `record` never advanced to include it.
+
     `control_plane_digest` is the canonical digest `bootstrap_run` already
     obtained from one `OpenCodePreflightPort.verify()` call (M13-01); this
     class never calls `verify()` itself -- only `recheck(control_plane_digest)`,
@@ -633,6 +642,22 @@ class IssueOrchestrator:
         """
 
         return self._current_phase
+
+    @property
+    def last_accepted_git_state(self) -> GitState | None:
+        """The last Git checkpoint this instance itself has accepted --
+        `initial_record.git_baseline` advanced to an attempt's own `after`
+        checkpoint the moment that check comes back `SAFE`, before that
+        attempt's `AttemptRecord` is even built, let alone persisted. A
+        caller deriving the same fact from `record.attempts` instead would
+        miss exactly the attempt whose own `open_attempt_sink`/`persist`
+        failure is why it is reading this property at all -- comparing
+        `finalize_run`'s postflight probe against a checkpoint one attempt
+        too old, and falsely reporting an already-*accepted* Git delta as
+        `UNSAFE`.
+        """
+
+        return self._last_accepted_git_state
 
     def request_cancellation(self) -> None:
         """Record an external cancellation request (System Design SH-001).
@@ -1655,6 +1680,7 @@ def finalize_run(
     lease: TargetLease | None,
     clock: Clock,
     max_review_cycles: int,
+    last_accepted_git_state: GitState | None = None,
 ) -> IssueResult:
     """Converge one terminal path into postflight and finalization (M13-04).
 
@@ -1706,6 +1732,18 @@ def finalize_run(
     and the freshly-resolved `LOGGING_ERROR`-inclusive terminal outcome,
     never reporting an unpersisted `APPROVED` as genuine (System Design
     SS15.4).
+
+    `last_accepted_git_state`, when given, is used verbatim as this
+    checkpoint instead of reconstructing it from `record.attempts`. Every
+    caller with a live `IssueOrchestrator` still running (the normal
+    `run_issue_pipeline` path, and a caught mid-pipeline error alike) should
+    pass its own `last_accepted_git_state` here: `record` can be stale --
+    missing exactly the attempt whose own `persist` is what caused this
+    call -- even though that attempt's `SAFE` `after` checkpoint was
+    already accepted before the persist failure ever happened. Left `None`
+    (`bootstrap_run`'s own late-stage failures, before any orchestrator
+    exists, and every existing caller unaffected by this) reconstructs it
+    from `record` exactly as before.
     """
 
     if type(record) is not RunRecord:
@@ -1722,7 +1760,11 @@ def finalize_run(
     _require_int(max_review_cycles, "max_review_cycles", minimum=1)
 
     next_sequence = max((check.sequence for check in record.git_checks), default=-1) + 1
-    last_accepted_state = _last_accepted_git_state(record)
+    last_accepted_state = (
+        last_accepted_git_state
+        if last_accepted_git_state is not None
+        else _last_accepted_git_state(record)
+    )
     postflight: GitCheckRecord | None = None
     if last_accepted_state is not None:
         postflight = git_safety.check(

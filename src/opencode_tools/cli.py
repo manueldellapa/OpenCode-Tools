@@ -1008,6 +1008,14 @@ def run_composed_pipeline(
             lease=outcome.lease,
             clock=clock,
             max_review_cycles=app_config.execution.max_review_cycles,
+            # `record_with_error` is the last *durably persisted* snapshot
+            # -- missing exactly the attempt whose own `open_attempt_sink`/
+            # `persist` failure is why we are here, even though that
+            # attempt's `SAFE` `after` checkpoint was already accepted
+            # first. Deriving the checkpoint from `record_with_error` alone
+            # would compare postflight against a checkpoint one attempt too
+            # old, falsely reporting an authorized Git delta as `UNSAFE`.
+            last_accepted_git_state=outcome.orchestrator.last_accepted_git_state,
         )
 
     return finalize_run(
@@ -1159,9 +1167,18 @@ def _render_issue_result(result: IssueResult, *, last_record: RunRecord | None) 
         f"terminal outcome: {result.trigger_outcome.value}",
         f"artifact: {result.artifact_path}",
     ]
-    if result.persistence_status is not PersistenceStatus.OK:
+    if result.persistence_status is PersistenceStatus.FAILED:
         lines.append(
             "warning: final persistence failed; the run artifact may be incomplete."
+        )
+    elif result.persistence_status is PersistenceStatus.INCOMPLETE:
+        # Distinct from `FAILED`: `run.json` itself was written -- an
+        # *earlier* attempt's own record or log is what never became
+        # durable, not this final write, so a caller must not read this as
+        # "the final write failed" (it did not).
+        lines.append(
+            "warning: the run artifact is incomplete; an earlier attempt's "
+            "own record or log was not safely finalized."
         )
 
     git_state: GitState | None = None

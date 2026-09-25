@@ -412,13 +412,19 @@ def _git_state(*, target_root: Path, fingerprint: str = "fp-0") -> GitState:
     )
 
 
-def _git_check(*, sequence: int, purpose: str, state: GitState) -> GitCheckRecord:
+def _git_check(
+    *,
+    sequence: int,
+    purpose: str,
+    state: GitState,
+    safety_status: GitSafetyStatus = GitSafetyStatus.SAFE,
+) -> GitCheckRecord:
     return GitCheckRecord(
         sequence=sequence,
         purpose=purpose,
         process_results=(),
         state=state,
-        safety_status=GitSafetyStatus.SAFE,
+        safety_status=safety_status,
     )
 
 
@@ -461,13 +467,28 @@ class _FakeGitSafety:
     """`resolve_target` and `check_runtime_location` succeed; `check` hands
     back one clean `SAFE` checkpoint per call, in the fixed order bootstrap
     and a single failed architect invocation need (baseline, before, after).
+
+    `accepted_fingerprint_after_purpose`, when given, simulates a role's
+    own edit actually landing on the target's working tree: every `check`
+    call up to and including the one whose `purpose` matches it returns
+    `fingerprint="fp-0"`; every call after returns `fingerprint="fp-1"`
+    instead. A `role=None` call (the baseline, or a postflight-style probe)
+    additionally compares its own `baseline` argument against that current
+    fingerprint and reports `UNSAFE` on a mismatch -- exactly the real
+    `check_git_state` continuity check this fake otherwise always skips.
     """
 
     def __init__(
-        self, *, target: TargetRepository, resolve_error: PreflightError | None = None
+        self,
+        *,
+        target: TargetRepository,
+        resolve_error: PreflightError | None = None,
+        accepted_fingerprint_after_purpose: str | None = None,
     ) -> None:
         self._target = target
         self._resolve_error = resolve_error
+        self._accepted_fingerprint_after_purpose = accepted_fingerprint_after_purpose
+        self._fingerprint_changed = False
         self.check_calls: list[str] = []
 
     def check_runtime_location(self, runtime_root: Path) -> None:
@@ -490,10 +511,21 @@ class _FakeGitSafety:
         baseline: GitState | None = None,
     ) -> GitCheckRecord:
         self.check_calls.append(purpose)
+        if purpose == self._accepted_fingerprint_after_purpose:
+            self._fingerprint_changed = True
+        current_fingerprint = "fp-1" if self._fingerprint_changed else "fp-0"
+        safety_status = GitSafetyStatus.SAFE
+        if (
+            role is None
+            and baseline is not None
+            and baseline.fingerprint != current_fingerprint
+        ):
+            safety_status = GitSafetyStatus.UNSAFE
         return _git_check(
             sequence=sequence,
             purpose=purpose,
-            state=_git_state(target_root=target.root),
+            state=_git_state(target_root=target.root, fingerprint=current_fingerprint),
+            safety_status=safety_status,
         )
 
 
@@ -1145,6 +1177,108 @@ def test_a_coder_persist_failure_is_tagged_with_the_coder_phase_not_the_architec
     assert final_record.errors[-1].phase is PipelinePhase.CODER
 
 
+def test_a_coder_persist_failure_still_uses_the_coders_own_accepted_checkpoint(
+    tmp_path: Path,
+) -> None:
+    """The coder's own attempt makes a permitted edit -- its `after` check
+    is `SAFE` and advances `IssueOrchestrator`'s own live `_last_accepted_
+    git_state` -- strictly *before* that same attempt's own post-attempt
+    `persist` then fails. `record` never advances past the architect's own
+    checkpoint, so deriving the postflight baseline from `record` alone
+    would compare `finalize_run`'s postflight probe against the *pre-coder*
+    state and falsely report the coder's already-accepted edit as `UNSAFE`.
+    `IssueOrchestrator.last_accepted_git_state` must survive that loss."""
+
+    workspace, target = _workspace_and_target(tmp_path)
+    runtime_root = tmp_path / "runtime"
+    app_config = _app_config(runtime_root=runtime_root)
+    run_request = RunRequest(
+        issue_number=42, workspace=workspace, target_root=workspace.root
+    )
+
+    # The coder's own `after` check (`CODER:1:1:after`) is where the edit
+    # actually lands on the target's working tree; postflight's own probe
+    # (`role=None`) then observes that same, already-landed state.
+    git_safety = _FakeGitSafety(
+        target=target, accepted_fingerprint_after_purpose="CODER:1:1:after"
+    )
+    lease = _FakeLease()
+    lease_factory = _FakeLeaseFactory(lease)
+    # Bootstrap persists twice, then the architect's own successful attempt
+    # persists once more (call 3); failing the 4th call fails the coder's
+    # own post-attempt persist instead.
+    run_store = _FakeRunStore(fail_persist_on_call=4)
+
+    issue_ref = IssueRef(
+        locator=_issue_locator(),
+        url="https://github.com/octocat/hello-world/issues/42",
+        title="Fix the thing",
+    )
+    architect_result = AgentResult(
+        role=AgentRole.ARCHITECT,
+        phase=PipelinePhase.ARCHITECT,
+        review_cycle=None,
+        provider_attempt=1,
+        process=_agent_process_result(
+            workspace_root=workspace.root, outcome=RunOutcome.SUCCEEDED
+        ),
+        terminal_response=ParsedAgentResponse(
+            role=AgentRole.ARCHITECT,
+            body="Handoff.",
+            agent_status=AgentStatus.READY,
+            issue_ref=issue_ref,
+        ),
+        session_id="session-architect-1",
+        verified_agent="architect",
+        provider_diagnostic=None,
+        outcome=RunOutcome.SUCCEEDED,
+    )
+    coder_result = AgentResult(
+        role=AgentRole.CODER,
+        phase=PipelinePhase.CODER,
+        review_cycle=1,
+        provider_attempt=1,
+        process=_agent_process_result(
+            workspace_root=workspace.root, outcome=RunOutcome.SUCCEEDED
+        ),
+        terminal_response=ParsedAgentResponse(
+            role=AgentRole.CODER,
+            body="Implemented the fix.",
+            agent_status=AgentStatus.COMPLETED,
+        ),
+        session_id="session-coder-1-1",
+        verified_agent="coder",
+        provider_diagnostic=None,
+        outcome=RunOutcome.SUCCEEDED,
+    )
+    agent_runner = _SequencedAgentRunner([architect_result, coder_result])
+
+    result = run_composed_pipeline(
+        run_request=run_request,
+        app_config=app_config,
+        run_id="20260915T090000.000000Z-abcdefabcdef",
+        process_runner=cast("ProcessRunner", None),
+        clock=_SteppingClock(),
+        sleeper=_RecordingSleeper(),
+        git_safety_port=cast("GitSafetyPort", git_safety),
+        issue_resolver=cast("IssueResolver", _FakeIssueResolver()),
+        run_store=cast("RunStorePort", run_store),
+        lease_factory=cast("TargetLeaseFactory", lease_factory),
+        opencode_preflight=cast("OpenCodePreflightPort", _FakeOpenCodePreflight()),
+        agent_runner=cast("AgentRunner", agent_runner),
+    )
+
+    assert [call[0] for call in agent_runner.calls] == [
+        AgentRole.ARCHITECT,
+        AgentRole.CODER,
+    ]
+    assert isinstance(result, IssueResult)
+    # The point of the fix: nothing changed *after* the coder's own already-
+    # accepted edit, so postflight must still be `SAFE` -- comparing against
+    # the stale, pre-coder checkpoint would report it `UNSAFE` instead.
+    assert result.git_safety_status is GitSafetyStatus.SAFE
+
+
 # --- _CliAgentRunner: decode/classify/parse/identity-verify composition --
 
 
@@ -1784,7 +1918,32 @@ def test_render_issue_result_warns_when_final_persistence_failed(
 
     _render_issue_result(result, last_record=None)
 
-    assert "may be incomplete" in capsys.readouterr().err
+    err = capsys.readouterr().err
+    assert "may be incomplete" in err
+    assert "final persistence failed" in err
+
+
+def test_render_issue_result_distinguishes_an_incomplete_artifact_from_a_failed_final_write(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """`PersistenceStatus.INCOMPLETE` means `run.json` itself was written
+    successfully -- only an *earlier* attempt's own record or log never
+    became durable -- unlike `PersistenceStatus.FAILED`, where this final
+    write is what failed. Claiming "final persistence failed" for
+    `INCOMPLETE` would be factually wrong and could make an operator
+    distrust a terminal artifact that was, in fact, written cleanly."""
+
+    result = _issue_result(
+        trigger_outcome=RunOutcome.LOGGING_ERROR,
+        expected_exit_code=40,
+        persistence_status=PersistenceStatus.INCOMPLETE,
+    )
+
+    _render_issue_result(result, last_record=None)
+
+    err = capsys.readouterr().err
+    assert "incomplete" in err
+    assert "final persistence failed" not in err
 
 
 def test_render_issue_result_omits_the_change_summary_without_a_last_record(
