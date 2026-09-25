@@ -26,14 +26,16 @@ from opencode_tools.process import SubprocessRunner
 
 
 class _RecordingProcessRunner:
-    """Wraps a real ProcessRunner and records every spec's argv."""
+    """Wraps a real ProcessRunner and records every spec's argv and stdin."""
 
     def __init__(self, inner: SubprocessRunner) -> None:
         self._inner = inner
         self.recorded_argv: list[tuple[str, ...]] = []
+        self.recorded_specs: list[ProcessSpec] = []
 
     def run(self, spec: ProcessSpec, *, sink: AttemptLogSink) -> ProcessResult:
         self.recorded_argv.append(spec.argv)
+        self.recorded_specs.append(spec)
         return self._inner.run(spec, sink=sink)
 
 
@@ -927,3 +929,132 @@ def test_promotion_of_a_large_changed_file_still_blocks_clean_filters(
 
     assert not marker.exists()
     assert (root / "subdir" / "large.bin").read_bytes() == large_payload
+
+
+def _repository_with_submodule(tmp_path: Path) -> tuple[Path, TargetRepository, str]:
+    """A target repo with a submodule gitlink, plus the gitlink's sha.
+
+    `prepare_coder_sandbox` clones with `--no-recurse-submodules`, so the
+    sandbox never initializes it -- `submod` is an empty directory on
+    disk while the index still carries the `160000` entry.
+    """
+    sub_root = tmp_path / "sub"
+    sub_root.mkdir()
+    _git(["init", "--quiet", "--initial-branch=main"], cwd=sub_root)
+    (sub_root / "f.txt").write_text("hi\n", encoding="utf-8")
+    _git(["add", "-A"], cwd=sub_root)
+    _git(["commit", "--quiet", "-m", "sub initial"], cwd=sub_root)
+
+    root = tmp_path / "target"
+    root.mkdir()
+    _git(["init", "--quiet", "--initial-branch=main"], cwd=root)
+    (root / "README.md").write_text("before\n", encoding="utf-8")
+    _git(
+        [
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "--quiet",
+            "add",
+            str(sub_root),
+            "submod",
+        ],
+        cwd=root,
+    )
+    # `submodule add` only stages `.gitmodules` and the gitlink -- stage
+    # README.md too so it is a genuinely tracked file at baseline.
+    _git(["add", "-A"], cwd=root)
+    _git(["commit", "--quiet", "-m", "initial"], cwd=root)
+    gitlink_sha = _git(["rev-parse", "HEAD:submod"], cwd=root)
+    git_dir = Path(_git(["rev-parse", "--absolute-git-dir"], cwd=root))
+    return (
+        root,
+        TargetRepository(
+            root=root.resolve(),
+            workspace_relative=Path("."),
+            git_common_dir=git_dir.resolve(),
+        ),
+        gitlink_sha,
+    )
+
+
+def _assert_submod_never_proposed_for_removal(
+    recorder: _RecordingProcessRunner,
+) -> None:
+    """The precise signal for this bug: whether `submod` was ever fed to
+    `update-index --force-remove`, independent of whether `git apply`
+    happens to make that particular hunk a visible no-op afterwards on a
+    given target layout."""
+    for spec in recorder.recorded_specs:
+        if "--force-remove" in spec.argv:
+            stdin = spec.stdin or b""
+            assert b"submod" not in stdin, (
+                f"submod was proposed for index removal: {stdin!r}"
+            )
+
+
+def test_noop_promotion_preserves_an_uninitialized_submodule_gitlink(
+    tmp_path: Path,
+) -> None:
+    """GH #110 P1 review: a no-op promotion must not delete a tracked
+    submodule reference just because it is checked out as an empty
+    directory (or missing entirely) in the coder-writable sandbox."""
+
+    root, target, gitlink_sha = _repository_with_submodule(tmp_path)
+
+    git, clock, runner, sandbox = _prepare(target)
+    recorder = _RecordingProcessRunner(runner)
+    try:
+        # Genuinely nothing changed: no coder edits at all.
+        promote_coder_changes(
+            recorder,
+            git_executable=git,
+            target=target,
+            sandbox=sandbox,
+            clock=clock,
+            utility_timeout_seconds=10,
+            termination_grace_seconds=1,
+        )
+    finally:
+        cleanup_coder_sandbox(sandbox)
+
+    apply_calls = [argv for argv in recorder.recorded_argv if "apply" in argv]
+    assert apply_calls == [], (
+        f"expected no git apply call for a true no-op, got {apply_calls}"
+    )
+    _assert_submod_never_proposed_for_removal(recorder)
+    assert _git(["rev-parse", "HEAD:submod"], cwd=root) == gitlink_sha
+
+
+def test_unrelated_promotion_preserves_an_uninitialized_submodule_gitlink(
+    tmp_path: Path,
+) -> None:
+    """GH #110 P1 review: promoting an unrelated coder change must not
+    propose deleting a tracked submodule reference."""
+
+    root, target, gitlink_sha = _repository_with_submodule(tmp_path)
+
+    git, clock, runner, sandbox = _prepare(target)
+    recorder = _RecordingProcessRunner(runner)
+    try:
+        (sandbox.root / "README.md").write_text("after\n", encoding="utf-8")
+        (sandbox.root / "NEW.txt").write_text("new\n", encoding="utf-8")
+
+        promote_coder_changes(
+            recorder,
+            git_executable=git,
+            target=target,
+            sandbox=sandbox,
+            clock=clock,
+            utility_timeout_seconds=10,
+            termination_grace_seconds=1,
+        )
+    finally:
+        cleanup_coder_sandbox(sandbox)
+
+    _assert_submod_never_proposed_for_removal(recorder)
+
+    assert (root / "README.md").read_text(encoding="utf-8") == "after\n"
+    assert (root / "NEW.txt").read_text(encoding="utf-8") == "new\n"
+    assert _git(["rev-parse", "HEAD:submod"], cwd=root) == gitlink_sha
+    assert (root / "submod").is_dir()

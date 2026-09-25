@@ -44,7 +44,15 @@ NUL-delimited (`-z` / `--index-info` with `-z`), since a Git filename may
 contain a literal newline or tab, and every candidate read/stat/readlink
 failure other than "does not exist" (including a directory replaced by a
 file, or vice versa) fails closed as `CoderSandboxError`. No attribute or
-filter lookup is ever consulted for the promoted content. The earlier
+filter lookup is ever consulted for the promoted content. A baseline
+gitlink (mode `160000`, a submodule reference) is a tree/index concept
+with no regular working-tree representation of its own -- `prepare_coder_sandbox`
+clones with `--no-recurse-submodules`, so its path is an empty directory
+or entirely absent -- and is therefore never run through the file
+classifier at all: it is preserved exactly as `read-tree` already seeded
+it, and promotion fails closed instead if the sandbox's own index ever
+disagrees with the baseline about a gitlink's pointer (this PR does not
+support promoting an intentional submodule pointer change). The earlier
 `.gitattributes`/`.git/config`/`.git/info/attributes` byte-identity checks
 against the sandbox's pristine baseline remain as defense in depth
 (GitHub issue #110).
@@ -666,6 +674,31 @@ def prepare_coder_sandbox(
         raise
 
 
+_GITLINK_MODE = "160000"
+
+
+def _parse_ls_files_stage(raw: bytes) -> dict[str, tuple[str, str]]:
+    """Parse NUL-delimited `git ls-files -z --stage` output into
+    `{path: (mode, sha)}`. A merge-conflicted entry (stage != 0) is
+    skipped rather than misparsed -- `promote_coder_changes` already
+    requires a clean, single-commit sandbox HEAD, so none are expected
+    here."""
+    entries: dict[str, tuple[str, str]] = {}
+    for record in raw.split(b"\x00"):
+        if not record:
+            continue
+        metadata, _tab, path_bytes = record.partition(b"\t")
+        mode_bytes, _sp, rest = metadata.partition(b" ")
+        sha_bytes, _sp, stage_bytes = rest.partition(b" ")
+        if stage_bytes != b"0":
+            continue
+        entries[os.fsdecode(path_bytes)] = (
+            mode_bytes.decode("ascii"),
+            sha_bytes.decode("ascii"),
+        )
+    return entries
+
+
 def _build_promotion_patch(
     process_runner: ProcessRunner,
     *,
@@ -715,6 +748,54 @@ def _build_promotion_patch(
         log_name="coder-sandbox-promote-read-tree-baseline.log",
     )
 
+    # A gitlink (mode 160000, a submodule reference) has no regular
+    # working-tree representation of its own to fingerprint -- the clone
+    # in prepare_coder_sandbox uses --no-recurse-submodules, so its path
+    # is an empty directory or entirely absent -- so it must never be run
+    # through the file classifier below (GH #110 follow-up: that
+    # misclassified it as deleted on every promotion, including a no-op
+    # one). Read it back from the index we just seeded, and preserve it
+    # exactly as-is by simply never touching that path again here. The
+    # sandbox's own real index is checked against the same baseline as a
+    # fail-closed guard: this PR does not support promoting an
+    # intentional submodule pointer change, so if one was somehow
+    # attempted, refuse the whole promotion rather than silently
+    # dropping or mishandling it.
+    _, baseline_stage_raw = _run_git(
+        process_runner,
+        git_executable=git_executable,
+        cwd=sandbox.root,
+        argv_tail=("-C", str(sandbox.root), "ls-files", "-z", "--stage"),
+        timeout_seconds=utility_timeout_seconds,
+        termination_grace_seconds=termination_grace_seconds,
+        environment_overrides=index_env,
+        log_name="coder-sandbox-promote-baseline-stage.log",
+    )
+    baseline_gitlinks = {
+        path: sha
+        for path, (mode, sha) in _parse_ls_files_stage(baseline_stage_raw).items()
+        if mode == _GITLINK_MODE
+    }
+    if baseline_gitlinks:
+        _, sandbox_stage_raw = _run_git(
+            process_runner,
+            git_executable=git_executable,
+            cwd=sandbox.root,
+            argv_tail=("-C", str(sandbox.root), "ls-files", "-z", "--stage"),
+            timeout_seconds=utility_timeout_seconds,
+            termination_grace_seconds=termination_grace_seconds,
+            log_name="coder-sandbox-promote-sandbox-stage.log",
+        )
+        sandbox_gitlinks = {
+            path: sha
+            for path, (mode, sha) in _parse_ls_files_stage(sandbox_stage_raw).items()
+            if mode == _GITLINK_MODE
+        }
+        if sandbox_gitlinks != baseline_gitlinks:
+            raise CoderSandboxError(
+                "The coder changed a submodule reference; sandbox changes were not promoted."
+            )
+
     _, candidates_raw = _run_git(
         process_runner,
         git_executable=git_executable,
@@ -743,6 +824,8 @@ def _build_promotion_patch(
 
     for rel_path in current_paths:
         seen_paths.add(rel_path)
+        if rel_path in baseline_gitlinks:
+            continue  # preserved exactly as read-tree already seeded it
         entry_path = sandbox.root / rel_path
         classified = _classify_and_fingerprint(entry_path)
         if classified is None:
