@@ -680,3 +680,149 @@ def test_promotion_refuses_an_unreadable_candidate_file(tmp_path: Path) -> None:
 
     assert (root / "README.md").read_text(encoding="utf-8") == "before\n"
     assert not (root / "secret.txt").exists()
+
+
+def test_promotion_only_hashes_genuinely_changed_files(tmp_path: Path) -> None:
+    """GH #110 P1 review: unchanged files must never spawn `git hash-object`
+    -- only a path actually proven to differ from the pristine snapshot
+    may, so subprocess count scales with the size of the coder's real
+    change, not with the size of the repository."""
+
+    root = tmp_path / "target"
+    root.mkdir()
+    _git(["init", "--quiet", "--initial-branch=main"], cwd=root)
+    file_count = 50
+    for i in range(file_count):
+        (root / f"file{i:03d}.txt").write_text(f"content {i}\n", encoding="utf-8")
+    _git(["add", "-A"], cwd=root)
+    _git(["commit", "--quiet", "-m", "initial"], cwd=root)
+    git_dir = Path(_git(["rev-parse", "--absolute-git-dir"], cwd=root))
+    target = TargetRepository(
+        root=root.resolve(),
+        workspace_relative=Path("."),
+        git_common_dir=git_dir.resolve(),
+    )
+
+    git, clock, runner, sandbox = _prepare(target)
+    recorder = _RecordingProcessRunner(runner)
+    try:
+        # Nothing changed at all: promotion must not hash anything.
+        promote_coder_changes(
+            recorder,
+            git_executable=git,
+            target=target,
+            sandbox=sandbox,
+            clock=clock,
+            utility_timeout_seconds=10,
+            termination_grace_seconds=1,
+        )
+        noop_hash_calls = [
+            argv for argv in recorder.recorded_argv if "hash-object" in argv
+        ]
+        assert noop_hash_calls == [], (
+            f"expected no hash-object calls for a no-op promotion, got {noop_hash_calls}"
+        )
+
+        # Exactly one real change among `file_count` tracked files.
+        (sandbox.root / "file000.txt").write_text("changed\n", encoding="utf-8")
+        recorder.recorded_argv.clear()
+        promote_coder_changes(
+            recorder,
+            git_executable=git,
+            target=target,
+            sandbox=sandbox,
+            clock=clock,
+            utility_timeout_seconds=10,
+            termination_grace_seconds=1,
+        )
+    finally:
+        cleanup_coder_sandbox(sandbox)
+
+    hash_calls = [argv for argv in recorder.recorded_argv if "hash-object" in argv]
+    assert len(hash_calls) == 1, (
+        f"expected exactly 1 hash-object call, got {hash_calls}"
+    )
+    assert (root / "file000.txt").read_text(encoding="utf-8") == "changed\n"
+
+
+def test_promotion_handles_directory_replaced_by_file(tmp_path: Path) -> None:
+    """GH #110 P2 review: a coder replacing a tracked directory with a
+    regular file must promote as a clean deletion + addition, not abort
+    with a raw NotADirectoryError."""
+
+    root = tmp_path / "target"
+    root.mkdir()
+    _git(["init", "--quiet", "--initial-branch=main"], cwd=root)
+    (root / "dir").mkdir()
+    (root / "dir" / "child.txt").write_text("child\n", encoding="utf-8")
+    _git(["add", "-A"], cwd=root)
+    _git(["commit", "--quiet", "-m", "initial"], cwd=root)
+    git_dir = Path(_git(["rev-parse", "--absolute-git-dir"], cwd=root))
+    target = TargetRepository(
+        root=root.resolve(),
+        workspace_relative=Path("."),
+        git_common_dir=git_dir.resolve(),
+    )
+
+    git, clock, runner, sandbox = _prepare(target)
+    try:
+        shutil.rmtree(sandbox.root / "dir")
+        (sandbox.root / "dir").write_text("now a file\n", encoding="utf-8")
+
+        promote_coder_changes(
+            runner,
+            git_executable=git,
+            target=target,
+            sandbox=sandbox,
+            clock=clock,
+            utility_timeout_seconds=10,
+            termination_grace_seconds=1,
+        )
+    finally:
+        cleanup_coder_sandbox(sandbox)
+
+    assert (root / "dir").is_file()
+    assert (root / "dir").read_text(encoding="utf-8") == "now a file\n"
+
+
+def test_promotion_handles_file_replaced_by_directory(tmp_path: Path) -> None:
+    """GH #110 P2 review: a coder replacing a tracked file with a
+    (nonempty) directory must promote via force-remove -- the old entry
+    still existing on disk, just as a directory, must not block removing
+    it from the index."""
+
+    root = tmp_path / "target"
+    root.mkdir()
+    _git(["init", "--quiet", "--initial-branch=main"], cwd=root)
+    (root / "node").write_text("old file content\n", encoding="utf-8")
+    _git(["add", "-A"], cwd=root)
+    _git(["commit", "--quiet", "-m", "initial"], cwd=root)
+    git_dir = Path(_git(["rev-parse", "--absolute-git-dir"], cwd=root))
+    target = TargetRepository(
+        root=root.resolve(),
+        workspace_relative=Path("."),
+        git_common_dir=git_dir.resolve(),
+    )
+
+    git, clock, runner, sandbox = _prepare(target)
+    try:
+        (sandbox.root / "node").unlink()
+        (sandbox.root / "node").mkdir()
+        (sandbox.root / "node" / "child.js").write_text(
+            "child content\n", encoding="utf-8"
+        )
+
+        promote_coder_changes(
+            runner,
+            git_executable=git,
+            target=target,
+            sandbox=sandbox,
+            clock=clock,
+            utility_timeout_seconds=10,
+            termination_grace_seconds=1,
+        )
+    finally:
+        cleanup_coder_sandbox(sandbox)
+
+    assert (root / "node").is_dir()
+    assert (root / "node" / "child.js").read_text(encoding="utf-8") == "child content\n"

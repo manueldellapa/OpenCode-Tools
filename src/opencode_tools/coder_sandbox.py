@@ -21,27 +21,33 @@ sandbox's baseline commit, builds the candidate path set the same way
 `git add -A` would -- tracked files plus non-ignored untracked ones, via
 `git ls-files --cached --others --exclude-standard`, so ignored artifacts
 a coder's own tooling produced are never promoted -- and, for each
-candidate, hashes its *raw* on-disk bytes directly with
-`git hash-object --no-filters` (Git's own documented way to compute a
-blob exactly as `add` would while skipping the filter entirely). A path
-whose raw hash still matches the raw snapshot captured right after the
-sandbox was created (before the coder ever ran) is left untouched in the
-index, so a file only affected by checkout-time normalization (e.g. an
-`eol=crlf` `.gitattributes` rule) keeps its exact, correctly normalized
-baseline blob rather than being "promoted" back to its raw checkout form.
-Only genuinely new, changed, or deleted paths update the index, which is
-then diffed against the baseline commit with `--no-ext-diff --no-textconv`
-as well. Every path list involved is NUL-delimited (`-z` / `--index-info`
-with `-z`), since a Git filename may contain a literal newline or tab, and
-every candidate read/stat/readlink failure other than "does not exist"
-fails closed as `CoderSandboxError`. No attribute or filter lookup is ever
-consulted for the promoted content. The earlier `.gitattributes`/
-`.git/config`/`.git/info/attributes` byte-identity checks against the
-sandbox's pristine baseline remain as defense in depth (GitHub issue #110).
+candidate, fingerprints its *raw* on-disk bytes in-process (SHA-256 over
+mode + content; no subprocess per file). A path whose fingerprint still
+matches the fingerprint captured right after the sandbox was created
+(before the coder ever ran) is left untouched in the index, so a file
+only affected by checkout-time normalization (e.g. an `eol=crlf`
+`.gitattributes` rule) keeps its exact, correctly normalized baseline
+blob rather than being "promoted" back to its raw checkout form -- and,
+because most files in a real change set are untouched, `git hash-object
+--no-filters` (Git's own documented way to compute a blob exactly as
+`add` would while skipping the filter entirely) only ever runs for the
+paths actually proven to be new or changed. Only those paths, or ones
+missing from this run's candidates but present at baseline, update or
+remove an index entry, which is then diffed against the baseline commit
+with `--no-ext-diff --no-textconv` as well. Every path list involved is
+NUL-delimited (`-z` / `--index-info` with `-z`), since a Git filename may
+contain a literal newline or tab, and every candidate read/stat/readlink
+failure other than "does not exist" (including a directory replaced by a
+file, or vice versa) fails closed as `CoderSandboxError`. No attribute or
+filter lookup is ever consulted for the promoted content. The earlier
+`.gitattributes`/`.git/config`/`.git/info/attributes` byte-identity checks
+against the sandbox's pristine baseline remain as defense in depth
+(GitHub issue #110).
 """
 
 from __future__ import annotations
 
+import hashlib
 import os
 import shutil
 import stat
@@ -123,7 +129,7 @@ class CoderSandbox:
     gitattributes_baseline: bytes | None
     git_config_baseline: bytes
     git_info_attributes_baseline: bytes | None
-    pristine_raw_snapshot: Mapping[str, tuple[str, str]]
+    pristine_raw_snapshot: Mapping[str, str]
 
     def __post_init__(self) -> None:
         if not self.container_root.is_absolute():
@@ -230,14 +236,20 @@ def _lstat_and_read_raw(entry_path: Path) -> tuple[str, bytes] | None:
     path becoming a directory is not itself a promotable entry -- any new
     content underneath is separately enumerated).
 
-    Every failure other than "does not exist" -- a coder-unreadable file
-    via `chmod 000`, an unsupported file type such as a FIFO -- fails
-    closed as `CoderSandboxError` rather than escaping as a raw `OSError`
-    the caller only catches as `CoderSandboxError` (GH #110 follow-up).
+    `NotADirectoryError` is treated the same as "does not exist": it means
+    an ancestor of this path -- a directory at baseline -- was replaced by
+    a regular file, so every one of its former children is, from this
+    path's perspective, simply gone (a valid directory-to-file transition,
+    not a failure).
+
+    Every other failure -- a coder-unreadable file via `chmod 000`, an
+    unsupported file type such as a FIFO -- fails closed as
+    `CoderSandboxError` rather than escaping as a raw `OSError` the caller
+    only catches as `CoderSandboxError` (GH #110 follow-up).
     """
     try:
         entry_lstat = os.lstat(entry_path)
-    except FileNotFoundError:
+    except (FileNotFoundError, NotADirectoryError):
         return None
     except OSError as error:
         raise CoderSandboxError(
@@ -267,6 +279,20 @@ def _lstat_and_read_raw(entry_path: Path) -> tuple[str, bytes] | None:
             f"{entry_path} could not be read; sandbox changes were not promoted."
         ) from error
     return mode, content
+
+
+def _fingerprint_raw(mode: str, content: bytes) -> str:
+    """A cheap, in-process, collision-resistant fingerprint of (mode,
+    content), used purely for pristine-vs-current equality comparison --
+    never as a Git object id. Computing this costs no subprocess at all,
+    unlike `git hash-object` (GH #110 follow-up: hashing every tracked
+    file via a fresh subprocess made prepare/promote take seconds per
+    hundred files, minutes on a real repository)."""
+    digest = hashlib.sha256()
+    digest.update(mode.encode("ascii"))
+    digest.update(b"\x00")
+    digest.update(content)
+    return digest.hexdigest()
 
 
 def _hash_raw_blob(
@@ -304,15 +330,17 @@ def _capture_raw_snapshot(
     sandbox_root: Path,
     utility_timeout_seconds: float,
     termination_grace_seconds: float,
-) -> Mapping[str, tuple[str, str]]:
-    """Hash every tracked path's raw on-disk (checkout) bytes right after
-    the sandbox's baseline commit, before the coder ever runs.
+) -> Mapping[str, str]:
+    """Fingerprint every tracked path's raw on-disk (checkout) bytes right
+    after the sandbox's baseline commit, before the coder ever runs.
 
     Used at promotion time to tell an actual coder edit apart from mere
     checkout-time normalization (e.g. an `eol=crlf` `.gitattributes` rule)
     on a file the coder never touched (GH #110 follow-up). Everything is
     tracked at this point (the baseline commit was just created), so
-    `--cached` alone is the full candidate set.
+    `--cached` alone is the full candidate set. Fingerprinting is done
+    entirely in-process (no `git hash-object` per file) -- only the single
+    `ls-files` call below spawns a subprocess.
     """
     _, candidates_raw = _run_git(
         process_runner,
@@ -323,7 +351,7 @@ def _capture_raw_snapshot(
         termination_grace_seconds=termination_grace_seconds,
         log_name="coder-sandbox-baseline-ls-files.log",
     )
-    snapshot: dict[str, tuple[str, str]] = {}
+    snapshot: dict[str, str] = {}
     for entry in candidates_raw.split(b"\x00"):
         if not entry:
             continue
@@ -332,16 +360,7 @@ def _capture_raw_snapshot(
         if raw is None:
             continue
         mode, content = raw
-        sha = _hash_raw_blob(
-            process_runner,
-            git_executable=git_executable,
-            cwd=sandbox_root,
-            content=content,
-            persist=False,
-            utility_timeout_seconds=utility_timeout_seconds,
-            termination_grace_seconds=termination_grace_seconds,
-        )
-        snapshot[rel_path] = (mode, sha)
+        snapshot[rel_path] = _fingerprint_raw(mode, content)
     return MappingProxyType(snapshot)
 
 
@@ -595,15 +614,19 @@ def _build_promotion_patch(
     --cached --others --exclude-standard` -- so ignored artifacts a
     coder's own tooling produced (build output, dependency installs,
     caches) are never promoted. Each candidate's *raw* on-disk bytes are
-    hashed with `git hash-object --no-filters` (never through the
-    clean-filter/attribute machinery) and compared against the raw hash
-    captured for that same path right after the sandbox was created: a
-    match means nothing actually changed (e.g. an `eol=crlf`
+    fingerprinted in-process (no subprocess) and compared against the
+    fingerprint captured for that same path right after the sandbox was
+    created: a match means nothing actually changed (e.g. an `eol=crlf`
     `.gitattributes` rule alone does not count), so the baseline entry
-    already seeded into the index is left alone; a mismatch, a brand-new
-    path, or a path missing from this run's candidates but present at
-    baseline updates or removes that one index entry. Every path list
-    here is NUL-delimited (`-z`), since Git filenames may contain a
+    already seeded into the index is left alone with no further work; only
+    a real mismatch or a brand-new path spawns `git hash-object
+    --no-filters` (never through the clean-filter/attribute machinery) to
+    get an actual blob id. A path missing from this run's candidates but
+    present at baseline is removed. Removals are applied with
+    `--force-remove` and *before* additions, so a directory-to-file (or
+    file-to-directory) transition never leaves the index in a conflicting
+    state where both the old and new entry are present at once. Every path
+    list here is NUL-delimited (`-z`), since Git filenames may contain a
     literal newline, tab, or any other byte but NUL.
     """
     promote_index = sandbox.container_root / "promote.index"
@@ -653,6 +676,10 @@ def _build_promotion_patch(
             removed_entries.append(os.fsencode(rel_path) + b"\x00")
             continue
         mode, content = raw
+        if sandbox.pristine_raw_snapshot.get(rel_path) == _fingerprint_raw(
+            mode, content
+        ):
+            continue  # untouched since the sandbox was created; no subprocess needed
         sha = _hash_raw_blob(
             process_runner,
             git_executable=git_executable,
@@ -662,8 +689,6 @@ def _build_promotion_patch(
             utility_timeout_seconds=utility_timeout_seconds,
             termination_grace_seconds=termination_grace_seconds,
         )
-        if sandbox.pristine_raw_snapshot.get(rel_path) == (mode, sha):
-            continue  # untouched since the sandbox was created
         changed_entries.append(
             f"{mode} {sha} 0\t".encode() + os.fsencode(rel_path) + b"\x00"
         )
@@ -672,6 +697,30 @@ def _build_promotion_patch(
         if rel_path not in seen_paths:
             removed_entries.append(os.fsencode(rel_path) + b"\x00")
 
+    # Removals must land before additions: a directory<->file transition
+    # means the candidate set contains both the old and the new shape of
+    # the same path, and applying the addition first leaves the old entry
+    # in place, turning the removal into a conflicting no-op (GH #110
+    # follow-up).
+    if removed_entries:
+        _run_git(
+            process_runner,
+            git_executable=git_executable,
+            cwd=sandbox.root,
+            argv_tail=(
+                "-C",
+                str(sandbox.root),
+                "update-index",
+                "-z",
+                "--force-remove",
+                "--stdin",
+            ),
+            timeout_seconds=utility_timeout_seconds,
+            termination_grace_seconds=termination_grace_seconds,
+            stdin=b"".join(removed_entries),
+            environment_overrides=index_env,
+            log_name="coder-sandbox-promote-update-index-remove.log",
+        )
     if changed_entries:
         _run_git(
             process_runner,
@@ -690,25 +739,6 @@ def _build_promotion_patch(
             stdin=b"".join(changed_entries),
             environment_overrides=index_env,
             log_name="coder-sandbox-promote-update-index.log",
-        )
-    if removed_entries:
-        _run_git(
-            process_runner,
-            git_executable=git_executable,
-            cwd=sandbox.root,
-            argv_tail=(
-                "-C",
-                str(sandbox.root),
-                "update-index",
-                "-z",
-                "--remove",
-                "--stdin",
-            ),
-            timeout_seconds=utility_timeout_seconds,
-            termination_grace_seconds=termination_grace_seconds,
-            stdin=b"".join(removed_entries),
-            environment_overrides=index_env,
-            log_name="coder-sandbox-promote-update-index-remove.log",
         )
 
     _, patch = _run_git(
