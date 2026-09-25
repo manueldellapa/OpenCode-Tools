@@ -6,6 +6,7 @@ import os
 import shutil
 import subprocess
 import time
+import tracemalloc
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -14,6 +15,7 @@ import pytest
 from opencode_tools.coder_sandbox import (
     CoderSandbox,
     CoderSandboxError,
+    _capture_raw_snapshot,  # see test below for why this private helper is imported
     cleanup_coder_sandbox,
     prepare_coder_sandbox,
     promote_coder_changes,
@@ -826,3 +828,102 @@ def test_promotion_handles_file_replaced_by_directory(tmp_path: Path) -> None:
 
     assert (root / "node").is_dir()
     assert (root / "node" / "child.js").read_text(encoding="utf-8") == "child content\n"
+
+
+def test_capture_raw_snapshot_fingerprints_a_large_file_without_buffering_it_whole(
+    tmp_path: Path,
+) -> None:
+    """GH #110 P1 review: fingerprinting a large tracked file must never
+    hold its full content in memory -- peak Python allocation must stay
+    close to the chunk size, not the file size.
+
+    This calls `_capture_raw_snapshot` directly, on a plain repository,
+    rather than going through `prepare_coder_sandbox` on a real target:
+    `prepare_coder_sandbox` also runs `git_safety.capture_git_state` on
+    the target, which computes its own, separate content-sensitive
+    fingerprint of every file (by design, unrelated to this fix) and
+    would otherwise dominate the measurement, hiding a regression in the
+    code this fix actually touches.
+    """
+
+    root = tmp_path / "repo"
+    root.mkdir()
+    _git(["init", "--quiet", "--initial-branch=main"], cwd=root)
+    large_size = 16 * 1024 * 1024  # 16 MiB: well beyond the 1 MiB read chunk
+    large_payload = (bytes(range(256)) * ((large_size // 256) + 1))[:large_size]
+    (root / "large.bin").write_bytes(large_payload)
+    _git(["add", "-A"], cwd=root)
+    _git(["commit", "--quiet", "-m", "initial"], cwd=root)
+
+    git = shutil.which("git")
+    assert git is not None
+    clock = RealClock()
+    runner = SubprocessRunner(clock)
+
+    tracemalloc.start()
+    try:
+        snapshot = _capture_raw_snapshot(
+            runner,
+            git_executable=Path(git),
+            sandbox_root=root,
+            utility_timeout_seconds=30,
+            termination_grace_seconds=1,
+        )
+        _current, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+
+    assert "large.bin" in snapshot
+    assert peak < large_size // 4, (
+        f"_capture_raw_snapshot allocated {peak} Python-level bytes while "
+        f"fingerprinting a {large_size}-byte tracked file -- expected it to "
+        "stay close to the chunk size, not the file size"
+    )
+
+
+def test_promotion_of_a_large_changed_file_still_blocks_clean_filters(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """GH #110 P1 review: switching a genuinely changed regular file's
+    hashing to a pathname-based `git hash-object` call must still never
+    execute a coder-planted clean filter, even for a large file."""
+
+    root, target = _repository(tmp_path)
+    marker = tmp_path / "pwned-marker-large"
+    global_gitconfig = tmp_path / "fake-global-gitconfig-large"
+    global_gitconfig.write_text(
+        f'[filter "evil"]\n\tclean = touch {marker} && cat\n', encoding="utf-8"
+    )
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(global_gitconfig))
+    large_size = 8 * 1024 * 1024  # large enough to exercise the pathname-based hash
+    large_payload = (bytes(range(256)) * ((large_size // 256) + 1))[:large_size]
+
+    git, clock, runner, sandbox = _prepare(target)
+    try:
+        nested = sandbox.root / "subdir"
+        nested.mkdir()
+        (nested / ".gitattributes").write_text(
+            "large.bin filter=evil\n", encoding="utf-8"
+        )
+        (nested / "large.bin").write_bytes(large_payload)
+
+        # Neither integrity baseline changed -- the root .gitattributes and
+        # the sandbox's local .git/config are untouched by this attack, and
+        # the filter driver lives only in (fake) global config, so this
+        # exercises the pathname-based hash-object call for a genuinely
+        # new, large candidate rather than being blocked by the earlier
+        # defense-in-depth checks.
+        promote_coder_changes(
+            runner,
+            git_executable=git,
+            target=target,
+            sandbox=sandbox,
+            clock=clock,
+            utility_timeout_seconds=30,
+            termination_grace_seconds=1,
+        )
+    finally:
+        cleanup_coder_sandbox(sandbox)
+
+    assert not marker.exists()
+    assert (root / "subdir" / "large.bin").read_bytes() == large_payload

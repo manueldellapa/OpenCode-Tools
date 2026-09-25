@@ -22,19 +22,24 @@ sandbox's baseline commit, builds the candidate path set the same way
 `git ls-files --cached --others --exclude-standard`, so ignored artifacts
 a coder's own tooling produced are never promoted -- and, for each
 candidate, fingerprints its *raw* on-disk bytes in-process (SHA-256 over
-mode + content; no subprocess per file). A path whose fingerprint still
-matches the fingerprint captured right after the sandbox was created
-(before the coder ever ran) is left untouched in the index, so a file
-only affected by checkout-time normalization (e.g. an `eol=crlf`
-`.gitattributes` rule) keeps its exact, correctly normalized baseline
-blob rather than being "promoted" back to its raw checkout form -- and,
-because most files in a real change set are untouched, `git hash-object
---no-filters` (Git's own documented way to compute a blob exactly as
-`add` would while skipping the filter entirely) only ever runs for the
-paths actually proven to be new or changed. Only those paths, or ones
-missing from this run's candidates but present at baseline, update or
-remove an index entry, which is then diffed against the baseline commit
-with `--no-ext-diff --no-textconv` as well. Every path list involved is
+mode + content, read in bounded chunks so a single huge candidate can
+never be pulled whole into this process's memory; no subprocess per
+file). A path whose fingerprint still matches the fingerprint captured
+right after the sandbox was created (before the coder ever ran) is left
+untouched in the index, so a file only affected by checkout-time
+normalization (e.g. an `eol=crlf` `.gitattributes` rule) keeps its exact,
+correctly normalized baseline blob rather than being "promoted" back to
+its raw checkout form -- and, because most files in a real change set are
+untouched, `git hash-object --no-filters` (Git's own documented way to
+compute a blob exactly as `add` would while skipping the filter entirely)
+only ever runs for the paths actually proven to be new or changed, and
+does so by *path* for a regular file (Git streams it directly; this
+process never buffers a changed file's content either) -- only a
+symlink's small, bounded target is ever passed through this process
+itself, via `--stdin`. Only paths proven new or changed, or ones missing
+from this run's candidates but present at baseline, update or remove an
+index entry, which is then diffed against the baseline commit with
+`--no-ext-diff --no-textconv` as well. Every path list involved is
 NUL-delimited (`-z` / `--index-info` with `-z`), since a Git filename may
 contain a literal newline or tab, and every candidate read/stat/readlink
 failure other than "does not exist" (including a directory replaced by a
@@ -71,6 +76,7 @@ from opencode_tools.ports import Clock, LogChannel, ProcessRunner
 
 _MAX_CAPTURE_BYTES = 64 * 1024 * 1024
 _MAX_INTEGRITY_FILE_BYTES = 1024 * 1024
+_FINGERPRINT_CHUNK_BYTES = 1024 * 1024
 _SANDBOX_COMMIT_MESSAGE = "OpenCode-Tools coder sandbox baseline"
 _SANDBOX_AUTHOR_NAME = "OpenCode-Tools"
 _SANDBOX_AUTHOR_EMAIL = "opencode-tools@localhost"
@@ -230,11 +236,19 @@ def _read_integrity_file_or_none(path: Path) -> bytes | None:
         os.close(fd)
 
 
-def _lstat_and_read_raw(entry_path: Path) -> tuple[str, bytes] | None:
-    """Return (mode, raw_content) for `entry_path`, or `None` if it is
+def _classify_and_fingerprint(entry_path: Path) -> tuple[str, str] | None:
+    """Return (mode, fingerprint) for `entry_path`, or `None` if it is
     absent or has been replaced by a directory (a previously-tracked file
     path becoming a directory is not itself a promotable entry -- any new
     content underneath is separately enumerated).
+
+    A regular file is never read into memory whole: it is fingerprinted
+    directly from disk in bounded chunks, so a single very large candidate
+    -- already present at baseline, or newly created by the coder -- can
+    never be pulled entirely into this process's memory (GH #110
+    follow-up). A symlink's target is always small (bounded by the
+    platform's `PATH_MAX`) and is read whole, matching how a symlink is
+    represented as a Git blob.
 
     `NotADirectoryError` is treated the same as "does not exist": it means
     an ancestor of this path -- a directory at baseline -- was replaced by
@@ -245,7 +259,7 @@ def _lstat_and_read_raw(entry_path: Path) -> tuple[str, bytes] | None:
     Every other failure -- a coder-unreadable file via `chmod 000`, an
     unsupported file type such as a FIFO -- fails closed as
     `CoderSandboxError` rather than escaping as a raw `OSError` the caller
-    only catches as `CoderSandboxError` (GH #110 follow-up).
+    only catches as `CoderSandboxError`.
     """
     try:
         entry_lstat = os.lstat(entry_path)
@@ -259,35 +273,34 @@ def _lstat_and_read_raw(entry_path: Path) -> tuple[str, bytes] | None:
     if stat.S_ISDIR(entry_lstat.st_mode):
         return None
     if stat.S_ISLNK(entry_lstat.st_mode):
-        mode = "120000"
-    elif stat.S_ISREG(entry_lstat.st_mode):
-        mode = "100755" if entry_lstat.st_mode & 0o111 else "100644"
-    else:
+        try:
+            target = os.readlink(os.fsencode(entry_path))
+        except OSError as error:
+            raise CoderSandboxError(
+                f"{entry_path} could not be read; sandbox changes were not promoted."
+            ) from error
+        return "120000", _fingerprint_bytes("120000", target)
+    if not stat.S_ISREG(entry_lstat.st_mode):
         raise CoderSandboxError(
             f"{entry_path} is an unsupported file type; "
             "sandbox changes were not promoted."
         )
 
+    mode = "100755" if entry_lstat.st_mode & 0o111 else "100644"
     try:
-        content = (
-            os.readlink(os.fsencode(entry_path))
-            if mode == "120000"
-            else entry_path.read_bytes()
-        )
+        return mode, _fingerprint_file_chunked(entry_path, mode)
     except OSError as error:
         raise CoderSandboxError(
             f"{entry_path} could not be read; sandbox changes were not promoted."
         ) from error
-    return mode, content
 
 
-def _fingerprint_raw(mode: str, content: bytes) -> str:
+def _fingerprint_bytes(mode: str, content: bytes) -> str:
     """A cheap, in-process, collision-resistant fingerprint of (mode,
     content), used purely for pristine-vs-current equality comparison --
-    never as a Git object id. Computing this costs no subprocess at all,
-    unlike `git hash-object` (GH #110 follow-up: hashing every tracked
-    file via a fresh subprocess made prepare/promote take seconds per
-    hundred files, minutes on a real repository)."""
+    never as a Git object id. Only used for a symlink's target, which is
+    always small; a regular file is fingerprinted by `_fingerprint_file_chunked`
+    instead, without ever holding its full content in memory."""
     digest = hashlib.sha256()
     digest.update(mode.encode("ascii"))
     digest.update(b"\x00")
@@ -295,30 +308,87 @@ def _fingerprint_raw(mode: str, content: bytes) -> str:
     return digest.hexdigest()
 
 
-def _hash_raw_blob(
+def _fingerprint_file_chunked(entry_path: Path, mode: str) -> str:
+    """Fingerprint a regular file's content by reading it in bounded
+    chunks, so peak memory use is independent of file size (GH #110
+    follow-up: a multi-gigabyte tracked or coder-created file must not be
+    able to exhaust this process's memory)."""
+    digest = hashlib.sha256()
+    digest.update(mode.encode("ascii"))
+    digest.update(b"\x00")
+    with entry_path.open("rb") as handle:
+        while chunk := handle.read(_FINGERPRINT_CHUNK_BYTES):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _hash_stdin_blob(
     process_runner: ProcessRunner,
     *,
     git_executable: Path,
     cwd: Path,
     content: bytes,
-    persist: bool,
     utility_timeout_seconds: float,
     termination_grace_seconds: float,
 ) -> str:
-    """Hash `content` exactly as `git add` would, minus the clean filter."""
-    argv_tail: tuple[str, ...] = ("-C", str(cwd), "hash-object", "--no-filters")
-    if persist:
-        argv_tail += ("-w",)
-    argv_tail += ("-t", "blob", "--stdin")
+    """Hash small `content` (a symlink target) exactly as `git add` would,
+    minus the clean filter. Never used for a regular file's content --
+    see `_hash_path_blob`, which lets Git stream the file itself."""
     _, sha_raw = _run_git(
         process_runner,
         git_executable=git_executable,
         cwd=cwd,
-        argv_tail=argv_tail,
+        argv_tail=(
+            "-C",
+            str(cwd),
+            "hash-object",
+            "--no-filters",
+            "-w",
+            "-t",
+            "blob",
+            "--stdin",
+        ),
         timeout_seconds=utility_timeout_seconds,
         termination_grace_seconds=termination_grace_seconds,
         stdin=content,
-        log_name="coder-sandbox-hash-object.log",
+        log_name="coder-sandbox-hash-object-stdin.log",
+    )
+    return _single_line(sha_raw, field_name="blob hash")
+
+
+def _hash_path_blob(
+    process_runner: ProcessRunner,
+    *,
+    git_executable: Path,
+    cwd: Path,
+    entry_path: Path,
+    utility_timeout_seconds: float,
+    termination_grace_seconds: float,
+) -> str:
+    """Hash a regular file exactly as `git add` would, minus the clean
+    filter, by giving Git the path directly. Git reads/streams the file
+    itself, so this process never buffers a changed file's content --
+    empirically confirmed `--no-filters` bypasses the clean filter the
+    same way whether content arrives by path or by `--stdin` (GH #110
+    follow-up)."""
+    _, sha_raw = _run_git(
+        process_runner,
+        git_executable=git_executable,
+        cwd=cwd,
+        argv_tail=(
+            "-C",
+            str(cwd),
+            "hash-object",
+            "--no-filters",
+            "-w",
+            "-t",
+            "blob",
+            "--",
+            str(entry_path),
+        ),
+        timeout_seconds=utility_timeout_seconds,
+        termination_grace_seconds=termination_grace_seconds,
+        log_name="coder-sandbox-hash-object-path.log",
     )
     return _single_line(sha_raw, field_name="blob hash")
 
@@ -356,11 +426,11 @@ def _capture_raw_snapshot(
         if not entry:
             continue
         rel_path = os.fsdecode(entry)
-        raw = _lstat_and_read_raw(sandbox_root / rel_path)
-        if raw is None:
+        classified = _classify_and_fingerprint(sandbox_root / rel_path)
+        if classified is None:
             continue
-        mode, content = raw
-        snapshot[rel_path] = _fingerprint_raw(mode, content)
+        _mode, fingerprint = classified
+        snapshot[rel_path] = fingerprint
     return MappingProxyType(snapshot)
 
 
@@ -620,8 +690,10 @@ def _build_promotion_patch(
     `.gitattributes` rule alone does not count), so the baseline entry
     already seeded into the index is left alone with no further work; only
     a real mismatch or a brand-new path spawns `git hash-object
-    --no-filters` (never through the clean-filter/attribute machinery) to
-    get an actual blob id. A path missing from this run's candidates but
+    --no-filters` (never through the clean-filter/attribute machinery,
+    and by path for a regular file so Git streams it rather than this
+    process buffering it) to get an actual blob id. A path missing from
+    this run's candidates but
     present at baseline is removed. Removals are applied with
     `--force-remove` and *before* additions, so a directory-to-file (or
     file-to-directory) transition never leaves the index in a conflicting
@@ -671,24 +743,39 @@ def _build_promotion_patch(
 
     for rel_path in current_paths:
         seen_paths.add(rel_path)
-        raw = _lstat_and_read_raw(sandbox.root / rel_path)
-        if raw is None:
+        entry_path = sandbox.root / rel_path
+        classified = _classify_and_fingerprint(entry_path)
+        if classified is None:
             removed_entries.append(os.fsencode(rel_path) + b"\x00")
             continue
-        mode, content = raw
-        if sandbox.pristine_raw_snapshot.get(rel_path) == _fingerprint_raw(
-            mode, content
-        ):
+        mode, fingerprint = classified
+        if sandbox.pristine_raw_snapshot.get(rel_path) == fingerprint:
             continue  # untouched since the sandbox was created; no subprocess needed
-        sha = _hash_raw_blob(
-            process_runner,
-            git_executable=git_executable,
-            cwd=sandbox.root,
-            content=content,
-            persist=True,
-            utility_timeout_seconds=utility_timeout_seconds,
-            termination_grace_seconds=termination_grace_seconds,
-        )
+
+        if mode == "120000":
+            try:
+                target = os.readlink(os.fsencode(entry_path))
+            except OSError as error:
+                raise CoderSandboxError(
+                    f"{entry_path} could not be read; sandbox changes were not promoted."
+                ) from error
+            sha = _hash_stdin_blob(
+                process_runner,
+                git_executable=git_executable,
+                cwd=sandbox.root,
+                content=target,
+                utility_timeout_seconds=utility_timeout_seconds,
+                termination_grace_seconds=termination_grace_seconds,
+            )
+        else:
+            sha = _hash_path_blob(
+                process_runner,
+                git_executable=git_executable,
+                cwd=sandbox.root,
+                entry_path=entry_path,
+                utility_timeout_seconds=utility_timeout_seconds,
+                termination_grace_seconds=termination_grace_seconds,
+            )
         changed_entries.append(
             f"{mode} {sha} 0\t".encode() + os.fsencode(rel_path) + b"\x00"
         )
