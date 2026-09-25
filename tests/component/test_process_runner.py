@@ -735,6 +735,43 @@ def test_run_restores_the_previous_signal_handlers_after_returning(
     assert signal.getsignal(signal.SIGINT) == sentinel_sigint
 
 
+def test_run_saves_and_restores_a_caller_installed_handler_verbatim(
+    tmp_path: Path,
+) -> None:
+    """Issue #111: `cli.run_composed_pipeline` installs its own persistent
+    SIGINT/SIGTERM handler around the whole issue pipeline, once
+    `bootstrap_run` hands back a live `IssueOrchestrator`, so that an idle
+    window between two provider attempts (e.g. `run_provider_attempts`' own
+    backoff sleep) is not left with Python's raw default disposition. That
+    handler composes with this module's own -- installed only for the
+    duration of one child call -- *without any change here* only because
+    `run()` treats whatever was previously installed as fully opaque: it is
+    saved verbatim by `signal.signal()`'s own return value and handed back
+    to `signal.signal()` unchanged once this call returns, regardless of
+    its concrete type. This proves that generic contract explicitly for a
+    plain Python function (indistinguishable, as far as this module is
+    concerned, from `cli.py`'s own closure), not only for whatever handler
+    happened to be installed before the test itself ran."""
+
+    def _caller_handler(signal_number: int, frame: object) -> None:
+        del signal_number, frame
+
+    signal.signal(signal.SIGTERM, _caller_handler)
+    signal.signal(signal.SIGINT, _caller_handler)
+    try:
+        runner = SubprocessRunner(RealClock())
+        sink = RecordingAttemptLogSink()
+        spec = _spec(_helper_argv(), tmp_path)
+
+        runner.run(spec, sink=sink)
+
+        assert signal.getsignal(signal.SIGTERM) is _caller_handler
+        assert signal.getsignal(signal.SIGINT) is _caller_handler
+    finally:
+        signal.signal(signal.SIGTERM, signal.SIG_DFL)
+        signal.signal(signal.SIGINT, signal.SIG_DFL)
+
+
 def test_run_honors_a_signal_delivered_the_instant_popen_returns(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

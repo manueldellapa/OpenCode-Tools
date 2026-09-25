@@ -38,12 +38,14 @@ from __future__ import annotations
 import argparse
 import hashlib
 import platform
+import signal
 import sys
 import time
 from collections.abc import Mapping, Sequence
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
+from types import FrameType
 from typing import Protocol, cast, runtime_checkable
 
 from opencode_tools import (
@@ -910,15 +912,41 @@ def run_composed_pipeline(
             "bootstrap_run must set orchestrator/issue_locator/record when error is None"
         )
 
+    orchestrator = outcome.orchestrator
     target = outcome.record.target
     if isinstance(agent_runner, _AcceptsIssueLocator):
         agent_runner.bind_issue_locator(outcome.issue_locator)
     if isinstance(agent_runner, _AcceptsTargetRepository):
         agent_runner.bind_target(target)
 
+    def _request_pipeline_cancellation(
+        signal_number: int, frame: FrameType | None
+    ) -> None:
+        del signal_number, frame
+        orchestrator.request_cancellation()
+
+    # A SIGINT/SIGTERM arriving anywhere in `run_issue_pipeline` -- most
+    # notably during `run_provider_attempts`' own backoff sleep between
+    # provider retries, but equally any other idle window between one
+    # logical invocation and the next -- must not unwind as a raw Python
+    # `KeyboardInterrupt`/default `SIGTERM` disposition (System Design
+    # SH-001): `run.json` already exists by this point (`bootstrap_run`
+    # returned), so that would be misreported by `main`'s own pre-init
+    # handlers exactly like issue #111 describes. Installing this handler
+    # here, once `orchestrator` exists, makes it the "previous" handler
+    # `SubprocessRunner.run` itself saves and restores around each child
+    # call (`process.py`), so the two compose without any change there:
+    # during a live child, `process.py`'s own escalation still applies;
+    # between children, this handler simply records the request so the
+    # next `run_logical_invocation` raises `RunInterruptedError` (or, if a
+    # retry's backoff sleep is what is interrupted, so that its next
+    # attempt does) instead of a bare `KeyboardInterrupt` ever reaching
+    # `main`.
+    previous_sigint = signal.signal(signal.SIGINT, _request_pipeline_cancellation)
+    previous_sigterm = signal.signal(signal.SIGTERM, _request_pipeline_cancellation)
     try:
         pipeline_result = run_issue_pipeline(
-            orchestrator=outcome.orchestrator,
+            orchestrator=orchestrator,
             issue_locator=outcome.issue_locator,
             workspace=run_request.workspace,
             target=target,
@@ -1017,6 +1045,14 @@ def run_composed_pipeline(
             # old, falsely reporting an authorized Git delta as `UNSAFE`.
             last_accepted_git_state=outcome.orchestrator.last_accepted_git_state,
         )
+    finally:
+        # Restored as soon as `run_issue_pipeline` itself has returned or
+        # raised -- there is no further idle window between logical
+        # invocations past this point for this handler to guard, and
+        # `finalize_run` below runs no agent, so it needs no cancellation
+        # handling of its own.
+        signal.signal(signal.SIGINT, previous_sigint)
+        signal.signal(signal.SIGTERM, previous_sigterm)
 
     return finalize_run(
         record=outcome.orchestrator.record,

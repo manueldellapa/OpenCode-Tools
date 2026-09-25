@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import signal
 import subprocess
 import sys
 import tomllib
@@ -1076,6 +1077,111 @@ def test_an_observed_interruption_still_wins_over_an_unrelated_secondary_error(
     assert result.trigger_outcome is RunOutcome.INTERRUPTED
     assert result.final_status is FinalStatus.FAILED
     assert lease.released is True
+
+
+def test_a_sigint_during_provider_retry_backoff_converges_through_finalize_run(
+    tmp_path: Path,
+) -> None:
+    """Issue #111: unlike the "durante" case above (a live child's own
+    `INTERRUPTED` process outcome), a SIGINT arriving during
+    `run_provider_attempts`' own backoff sleep -- strictly between two
+    provider attempts, with no subprocess alive at all -- used to reach
+    Python's default disposition unhandled: `process.py`'s per-subprocess
+    handler had already been torn down, and nothing else installed one, so
+    it surfaced as a raw `KeyboardInterrupt` past `run_composed_pipeline`
+    (which only catches `OpenCodeToolsError`) into `main`'s pre-init
+    `except KeyboardInterrupt` -- misreporting an already-initialized run
+    (`run.json` exists; the `IssueOrchestrator` is live) as having failed
+    before it could ever start.
+
+    `run_composed_pipeline` now installs a persistent SIGINT/SIGTERM
+    handler, once `bootstrap_run` hands back the `IssueOrchestrator`, whose
+    only job is `request_cancellation()`. This sends itself a real SIGINT
+    from inside the injected `Sleeper.sleep()` -- exactly where the backoff
+    delay would be spent -- to prove that *actual* handler is what is
+    installed and fires, not a simulated flag flip. The architect's own
+    retry attempt 2 is consequently never invoked: the next
+    `run_logical_invocation` raises `RunInterruptedError` immediately, which
+    the existing (#109) except-handler converges through the very same
+    `finalize_run` any other terminal path uses -- `RunOutcome.INTERRUPTED`,
+    exit code 20, and a released lease -- never `main`'s pre-init 130 path.
+    """
+
+    workspace, target = _workspace_and_target(tmp_path)
+    runtime_root = tmp_path / "runtime"
+    app_config = _app_config(runtime_root=runtime_root)
+    run_request = RunRequest(
+        issue_number=42, workspace=workspace, target_root=workspace.root
+    )
+
+    git_safety = _FakeGitSafety(target=target)
+    lease = _FakeLease()
+    lease_factory = _FakeLeaseFactory(lease)
+    run_store = _FakeRunStore()
+
+    # A trusted, budgeted, retryable `PROVIDER_ERROR` on attempt 1 -- the
+    # underlying process itself terminated cleanly (`SUCCEEDED`); only the
+    # provider diagnostic marks it retryable -- authorizes exactly one
+    # retry (System Design SS12.2), which is what schedules the backoff
+    # sleep this test's `Sleeper` fake hijacks.
+    diagnostic = ProviderDiagnostic(
+        source="opencode-stdout",
+        signature="rate_limited",
+        retryable=True,
+        status_code=429,
+    )
+    first_attempt = AgentResult(
+        role=AgentRole.ARCHITECT,
+        phase=PipelinePhase.ARCHITECT,
+        review_cycle=None,
+        provider_attempt=1,
+        process=_agent_process_result(
+            workspace_root=workspace.root, outcome=RunOutcome.SUCCEEDED
+        ),
+        terminal_response=None,
+        session_id="session-architect-1",
+        verified_agent="architect",
+        provider_diagnostic=diagnostic,
+        outcome=RunOutcome.PROVIDER_ERROR,
+    )
+    # A second element would mean the cancellation was *not* honored (the
+    # retried attempt 2 ran anyway); `_SequencedAgentRunner.run` popping
+    # from an exhausted list would itself fail the test loudly.
+    agent_runner = _SequencedAgentRunner([first_attempt])
+
+    class _SigintDuringBackoffSleep:
+        """Sends this process a real SIGINT instead of actually sleeping --
+        the same signal an operator's Ctrl-C would deliver mid-backoff."""
+
+        def sleep(self, seconds: float) -> None:
+            del seconds
+            os.kill(os.getpid(), signal.SIGINT)
+
+    result = run_composed_pipeline(
+        run_request=run_request,
+        app_config=app_config,
+        run_id="20260915T090000.000000Z-abcdefabcdef",
+        process_runner=cast("ProcessRunner", None),
+        clock=_SteppingClock(),
+        sleeper=_SigintDuringBackoffSleep(),
+        git_safety_port=cast("GitSafetyPort", git_safety),
+        issue_resolver=cast("IssueResolver", _FakeIssueResolver()),
+        run_store=cast("RunStorePort", run_store),
+        lease_factory=cast("TargetLeaseFactory", lease_factory),
+        opencode_preflight=cast("OpenCodePreflightPort", _FakeOpenCodePreflight()),
+        agent_runner=cast("AgentRunner", agent_runner),
+    )
+
+    assert [call[0] for call in agent_runner.calls] == [AgentRole.ARCHITECT]
+    assert isinstance(result, IssueResult)
+    assert result.trigger_outcome is RunOutcome.INTERRUPTED
+    assert result.expected_exit_code == 20
+    assert result.final_status is FinalStatus.FAILED
+    assert lease.released is True
+
+    final_record = run_store.persisted_records[-1]
+    assert final_record.errors[-1].outcome is RunOutcome.INTERRUPTED
+    assert final_record.errors[-1].phase is PipelinePhase.ARCHITECT
 
 
 def test_a_coder_persist_failure_is_tagged_with_the_coder_phase_not_the_architect(
@@ -2312,11 +2418,16 @@ def test_main_returns_130_on_a_sigint_before_the_run_could_be_initialized(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     """A `KeyboardInterrupt` reaching `main` can only ever originate before a
-    run directory exists -- once one exists, `process.py`'s own signal
-    handling (installed only around a live subprocess) turns a SIGINT into
-    `RunOutcome.INTERRUPTED` on the pipeline itself, never a raw Python
-    exception -- so `main` maps it to exit 130 with no `FINAL_STATUS`
-    promise, per FR-047 and System Design SS13.4."""
+    run directory exists: this one is raised by `runlog.check_platform_
+    baseline` itself, strictly before `run_composed_pipeline` -- and so
+    before `bootstrap_run` -- is ever even called, so no persistent
+    cancellation handler (issue #111) has been installed yet either. Once a
+    run directory exists, `run_composed_pipeline`'s own persistent SIGINT/
+    SIGTERM handler and `process.py`'s per-subprocess one between them turn
+    a SIGINT into `RunOutcome.INTERRUPTED` on the pipeline itself, never a
+    raw Python exception reaching this far -- so `main` maps *this*,
+    genuinely pre-init case to exit 130 with no `FINAL_STATUS` promise, per
+    FR-047 and System Design SS13.4."""
 
     from opencode_tools import runlog
 
