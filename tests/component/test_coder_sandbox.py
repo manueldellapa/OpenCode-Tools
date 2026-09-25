@@ -25,7 +25,7 @@ from opencode_tools.coder_sandbox import (
     promote_coder_changes,
 )
 from opencode_tools.domain import ProcessResult, ProcessSpec, TargetRepository
-from opencode_tools.ports import AttemptLogSink
+from opencode_tools.ports import AttemptLogSink, Clock
 from opencode_tools.process import SubprocessRunner
 
 
@@ -40,6 +40,27 @@ class _RecordingProcessRunner:
     def run(self, spec: ProcessSpec, *, sink: AttemptLogSink) -> ProcessResult:
         self.recorded_argv.append(spec.argv)
         self.recorded_specs.append(spec)
+        return self._inner.run(spec, sink=sink)
+
+
+class _DoomedPathProcessRunner:
+    """Wraps a real ProcessRunner; rewrites a `git hash-object` call's
+    path argument for `doomed_path` to a nonexistent one, so Git itself
+    fails to open it -- a genuine subprocess failure, injected without
+    depending on filesystem permissions, which `chmod 000` does not
+    enforce when the test suite runs as root (GH #110 P2 review)."""
+
+    def __init__(self, inner: SubprocessRunner, *, doomed_path: Path) -> None:
+        self._inner = inner
+        self._doomed = str(doomed_path)
+
+    def run(self, spec: ProcessSpec, *, sink: AttemptLogSink) -> ProcessResult:
+        if "hash-object" in spec.argv and self._doomed in spec.argv:
+            argv = tuple(
+                f"{arg}-does-not-exist" if arg == self._doomed else arg
+                for arg in spec.argv
+            )
+            spec = dataclasses.replace(spec, argv=argv)
         return self._inner.run(spec, sink=sink)
 
 
@@ -661,16 +682,18 @@ def test_promotion_preserves_checkout_normalized_files_left_untouched(
 
 
 def test_promotion_refuses_an_unreadable_new_candidate_file(tmp_path: Path) -> None:
-    """GH #110 P2/P1 review: a coder-unreadable brand-new file (e.g.
-    `chmod 000`) must raise CoderSandboxError, not a raw PermissionError.
+    """GH #110 P2/P1 review: a brand-new candidate Git itself cannot open
+    must raise CoderSandboxError, not a raw process failure escaping
+    unhandled.
 
     A brand-new path is classified without an in-process content read
-    (GH #110 follow-up), so `chmod 000` alone does not fail at
-    classification -- `lstat` does not require read permission -- and the
-    failure is instead surfaced by the bounded `git hash-object`
-    subprocess itself refusing to open the file, which `_run_git` already
-    converts to a `CoderSandboxError` rather than letting a raw process
-    failure escape."""
+    (GH #110 follow-up), so the failure is surfaced by the bounded
+    `git hash-object` subprocess itself refusing to open the file. This
+    injects that subprocess failure directly (`_DoomedPathProcessRunner`
+    rewrites the path Git is given) rather than via `chmod 000`, since a
+    suite run as root (common in Linux containers) ignores permission
+    bits entirely and would make a `chmod`-based test invalid there
+    (GH #110 P2 review)."""
 
     root, target = _repository(tmp_path)
 
@@ -678,11 +701,11 @@ def test_promotion_refuses_an_unreadable_new_candidate_file(tmp_path: Path) -> N
     secret = sandbox.root / "secret.txt"
     try:
         secret.write_text("top secret\n", encoding="utf-8")
-        secret.chmod(0o000)
+        doomed_runner = _DoomedPathProcessRunner(runner, doomed_path=secret)
 
         with pytest.raises(CoderSandboxError):
             promote_coder_changes(
-                runner,
+                doomed_runner,
                 git_executable=git,
                 target=target,
                 sandbox=sandbox,
@@ -691,28 +714,47 @@ def test_promotion_refuses_an_unreadable_new_candidate_file(tmp_path: Path) -> N
                 termination_grace_seconds=1,
             )
     finally:
-        secret.chmod(0o644)
         cleanup_coder_sandbox(sandbox)
 
     assert (root / "README.md").read_text(encoding="utf-8") == "before\n"
     assert not (root / "secret.txt").exists()
 
 
-def test_promotion_refuses_an_unreadable_changed_tracked_file(tmp_path: Path) -> None:
+def test_promotion_refuses_an_unreadable_changed_tracked_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """GH #110 P2 review: a coder-unreadable *tracked* file that was
-    changed (e.g. `chmod 000` after editing) must still raise
-    CoderSandboxError from the in-process classification/fingerprint step
-    -- the fast path for brand-new candidates above does not apply here,
-    since this path is present in `pristine_raw_snapshot` and must still
-    be fingerprinted to prove it actually changed."""
+    changed must still raise CoderSandboxError from the in-process
+    classification/fingerprint step -- the fast path for brand-new
+    candidates does not apply here, since this path is present in
+    `pristine_raw_snapshot`. The replacement content keeps the same byte
+    length as the pristine baseline, so the cheap mode/size fast path
+    cannot skip it either -- it must still be fingerprinted to prove it
+    actually changed.
+
+    Injects the read failure directly (`_fingerprint_file_chunked` is
+    exactly "the Python read" for this path) rather than via `chmod 000`,
+    since a suite run as root ignores permission bits entirely and would
+    make a `chmod`-based test invalid there (GH #110 P2 review)."""
 
     root, target = _repository(tmp_path)
 
     git, clock, runner, sandbox = _prepare(target)
     tracked = sandbox.root / "README.md"
+
+    def _unreadable(
+        entry_path: Path, mode: str, *, clock: Clock, deadline_ns: int
+    ) -> str:
+        del mode, clock, deadline_ns
+        raise PermissionError(f"synthetic unreadable file for a test: {entry_path}")
+
+    monkeypatch.setattr(coder_sandbox, "_fingerprint_file_chunked", _unreadable)
+
     try:
-        tracked.write_text("changed\n", encoding="utf-8")
-        tracked.chmod(0o000)
+        tracked.write_text(
+            "altered", encoding="utf-8"
+        )  # same byte length as "before\n"
+        assert len(tracked.read_bytes()) == len(b"before\n")
 
         with pytest.raises(CoderSandboxError, match="could not be read"):
             promote_coder_changes(
@@ -725,7 +767,6 @@ def test_promotion_refuses_an_unreadable_changed_tracked_file(tmp_path: Path) ->
                 termination_grace_seconds=1,
             )
     finally:
-        tracked.chmod(0o644)
         cleanup_coder_sandbox(sandbox)
 
     assert (root / "README.md").read_text(encoding="utf-8") == "before\n"
@@ -913,6 +954,7 @@ def test_capture_raw_snapshot_fingerprints_a_large_file_without_buffering_it_who
             runner,
             git_executable=Path(git),
             sandbox_root=root,
+            clock=clock,
             utility_timeout_seconds=30,
             termination_grace_seconds=1,
         )
@@ -1255,9 +1297,17 @@ def test_promotion_skips_fingerprinting_a_brand_new_file_and_hashes_it_directly(
     fingerprinted_paths: list[str] = []
     original_fingerprint = coder_sandbox._fingerprint_file_chunked
 
-    def _spy(entry_path: Path, mode: str) -> str:
+    def _spy(
+        entry_path: Path,
+        mode: str,
+        *,
+        clock: Clock,
+        deadline_ns: int,
+    ) -> str:
         fingerprinted_paths.append(str(entry_path))
-        return original_fingerprint(entry_path, mode)
+        return original_fingerprint(
+            entry_path, mode, clock=clock, deadline_ns=deadline_ns
+        )
 
     monkeypatch.setattr(coder_sandbox, "_fingerprint_file_chunked", _spy)
 
@@ -1365,3 +1415,65 @@ def test_promotion_never_executes_a_planted_post_index_change_hook(
 
     assert not marker.exists(), "a planted core.hooksPath hook executed"
     assert (root / "new.txt").read_text(encoding="utf-8") == "new\n"
+
+
+def test_promotion_bounds_fingerprinting_a_huge_sparse_tracked_file_replacement(
+    tmp_path: Path,
+) -> None:
+    """GH #110 P1 review: replacing a tracked file with a huge sparse file
+    of the *same* mode and size (so the cheap metadata fast path cannot
+    skip it -- unlike a `truncate -s 1T` that changes the size) must not
+    let the in-process content fingerprint read block promotion
+    indefinitely. It is bounded by a deadline derived from
+    `utility_timeout_seconds`, the same as every other command here, and
+    fails closed with `CoderSandboxError` well before a full read of a
+    terabyte-scale file could ever complete.
+
+    Uses a synthetic pristine snapshot entry (same technique as the
+    fsmonitor/hooksPath TOCTOU regressions above) claiming the size a
+    real same-size tracked file would have had, rather than actually
+    committing and cloning a terabyte-scale blob through Git -- this
+    isolates exactly the fingerprinting mechanism under test."""
+
+    _root, target = _repository(tmp_path)
+    git, clock, runner, sandbox = _prepare(target)
+
+    huge_size = 1024**4  # 1 TiB logical size; sparse, so ~0 bytes on disk
+    huge_path = sandbox.root / "huge.bin"
+    try:
+        with huge_path.open("wb") as handle:
+            handle.truncate(huge_size)
+        # A byte near the end -- still effectively free on a sparse file --
+        # so this is genuinely different content from the pristine
+        # snapshot below, not a coincidental no-op.
+        with huge_path.open("r+b") as handle:
+            handle.seek(huge_size - 1)
+            handle.write(b"\xff")
+
+        poisoned_snapshot = dict(sandbox.pristine_raw_snapshot)
+        poisoned_snapshot["huge.bin"] = coder_sandbox._PristineEntry(
+            mode="100644", size=huge_size, fingerprint="0" * 64
+        )
+        poisoned_sandbox = dataclasses.replace(
+            sandbox, pristine_raw_snapshot=poisoned_snapshot
+        )
+
+        started = time.monotonic()
+        with pytest.raises(CoderSandboxError, match="deadline"):
+            promote_coder_changes(
+                runner,
+                git_executable=git,
+                target=target,
+                sandbox=poisoned_sandbox,
+                clock=clock,
+                utility_timeout_seconds=0.2,
+                termination_grace_seconds=1,
+            )
+        elapsed = time.monotonic() - started
+    finally:
+        cleanup_coder_sandbox(sandbox)
+
+    assert elapsed < 5.0, (
+        f"promotion took {elapsed:.1f}s -- the fingerprint deadline did not "
+        "bound the huge sparse file's read"
+    )
