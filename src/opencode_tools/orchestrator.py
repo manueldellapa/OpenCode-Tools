@@ -502,6 +502,39 @@ class IssueOrchestrator:
     `planned_delay_seconds` `retry.decide_retry` already computed -- never a
     real sleep in this module's own tests.
 
+    Unlike `record`, `last_observed_termination_confirmed` does *not* stop
+    advancing once persistence is blocked: it is captured the instant an
+    `AgentResult` is received, before that attempt's own `persist` call is
+    even attempted, so a caller that catches the `LoggingError` a failed
+    `persist` raises still learns whether the process group that just ran
+    was confirmed terminated -- the one fact `finalize_run` needs to force
+    postflight `INDETERMINATE` and quarantine the lease (System Design
+    SS16.3; ADR-006) for a possibly still-live child, even though that same
+    attempt's own `AttemptRecord` never reached `record`.
+
+    `cancellation_requested` and `last_attempted_phase` are two more facts
+    that must not be lost to the same kind of persistence failure. The
+    former is simply this instance's own `_cancellation_requested` flag
+    read back, so a caller that caught some *other* `OpenCodeToolsError`
+    raised after an already-observed `INTERRUPTED` process outcome (the
+    after-attempt Git check, the sink close, or the post-attempt `persist`
+    itself) can still credit `resolve_terminal_outcome` with the
+    interruption instead of letting the unrelated error outrank it. The
+    latter advances the instant `run_logical_invocation` begins a new
+    role/review-cycle -- before either early-exit check, and long before
+    that invocation's own `AttemptRecord` could ever reach `record` -- so a
+    caught error is tagged with the role actually failing (e.g. `CODER`)
+    rather than the last one that happened to persist (e.g. `ARCHITECT`).
+
+    `last_accepted_git_state` is this instance's own live counterpart to
+    the module-level `_last_accepted_git_state(record)` reconstruction
+    `finalize_run` otherwise falls back to: it advances the moment an
+    attempt's own `after` checkpoint comes back `SAFE`, strictly before
+    that attempt's `AttemptRecord` is even built. A caller passing it
+    explicitly to `finalize_run` gets the true accepted checkpoint even
+    when the attempt that just accepted it is exactly the one whose own
+    `persist` failure is why `record` never advanced to include it.
+
     `control_plane_digest` is the canonical digest `bootstrap_run` already
     obtained from one `OpenCodePreflightPort.verify()` call (M13-01); this
     class never calls `verify()` itself -- only `recheck(control_plane_digest)`,
@@ -547,6 +580,8 @@ class IssueOrchestrator:
             initial_record.persistence_status is not PersistenceStatus.OK
         )
         self._cancellation_requested = False
+        self._last_agent_result: AgentResult | None = None
+        self._current_phase: PipelinePhase = initial_record.current_phase
 
     @property
     def record(self) -> RunRecord:
@@ -558,6 +593,71 @@ class IssueOrchestrator:
         """
 
         return self._record
+
+    @property
+    def last_observed_termination_confirmed(self) -> bool | None:
+        """The most recently observed attempt's own `AgentResult.process.
+        termination_confirmed`, captured the moment the agent returns --
+        unlike `record`, this survives even when that same attempt's
+        `AttemptRecord` never reaches `record` because its own `persist`
+        call failed. A caller that only had `record` to fall back to would
+        otherwise lose exactly the fact System Design SS16.3/ADR-006 needs
+        to force postflight `INDETERMINATE` and quarantine the lease: a
+        possibly still-live child process. `None` only when no agent has
+        ever been invoked yet.
+        """
+
+        if self._last_agent_result is None:
+            return None
+        return self._last_agent_result.process.termination_confirmed
+
+    @property
+    def cancellation_requested(self) -> bool:
+        """Whether this run has ever been cancelled -- externally, via
+        `request_cancellation`, or because some already-observed
+        `AgentResult.process.outcome` was itself `INTERRUPTED` -- regardless
+        of whether that particular attempt's own `AttemptRecord` ever
+        reached `record`. A caller that only had `record` to fall back to
+        would lose an interruption already observed on an attempt whose own
+        `persist` (or a later operation in the same invocation, such as the
+        after-attempt Git check or the sink close) then raised a
+        *different* `OpenCodeToolsError` -- `error.outcome` alone would
+        then outrank `INTERRUPTED` in `resolve_terminal_outcome`'s
+        precedence, which is wrong: the cancellation was still real.
+        """
+
+        return self._cancellation_requested
+
+    @property
+    def last_attempted_phase(self) -> PipelinePhase:
+        """The phase of the invocation this instance most recently began
+        attempting -- unlike `record.current_phase`, this advances the
+        instant `run_logical_invocation` starts a new role/review-cycle,
+        before that invocation's own `AttemptRecord` (if any) could ever
+        reach `record`. A caller that only had `record.current_phase` to
+        fall back to would misattribute a caught error to the last role
+        that happened to persist (e.g. `ARCHITECT`) rather than the one
+        actually failing (e.g. `CODER`, when the first coder attempt's own
+        `open_attempt_sink`/`persist` is what raised).
+        """
+
+        return self._current_phase
+
+    @property
+    def last_accepted_git_state(self) -> GitState | None:
+        """The last Git checkpoint this instance itself has accepted --
+        `initial_record.git_baseline` advanced to an attempt's own `after`
+        checkpoint the moment that check comes back `SAFE`, before that
+        attempt's `AttemptRecord` is even built, let alone persisted. A
+        caller deriving the same fact from `record.attempts` instead would
+        miss exactly the attempt whose own `open_attempt_sink`/`persist`
+        failure is why it is reading this property at all -- comparing
+        `finalize_run`'s postflight probe against a checkpoint one attempt
+        too old, and falsely reporting an already-*accepted* Git delta as
+        `UNSAFE`.
+        """
+
+        return self._last_accepted_git_state
 
     def request_cancellation(self) -> None:
         """Record an external cancellation request (System Design SH-001).
@@ -610,6 +710,14 @@ class IssueOrchestrator:
         if not isinstance(workspace, Workspace):
             raise TypeError("workspace must be Workspace")
 
+        state = PipelineState(phase=_PHASE_BY_ROLE[role], review_cycle=review_cycle)
+        # Recorded before either early-exit check below so a caller reading
+        # `last_attempted_phase` after a caught error always sees the role
+        # this invocation was actually for, never a stale, previously
+        # persisted one (`record.current_phase` only advances on a
+        # successful `persist`).
+        self._current_phase = state.phase
+
         if self._persistence_blocked:
             raise LoggingError(
                 code="orchestrator.persistence_blocked",
@@ -623,7 +731,6 @@ class IssueOrchestrator:
                 related_record=self._run_id,
             )
 
-        state = PipelineState(phase=_PHASE_BY_ROLE[role], review_cycle=review_cycle)
         invocation_id = _build_logical_invocation_id(self._run_id, role, review_cycle)
         cycle_component = _cycle_component(review_cycle)
 
@@ -707,6 +814,7 @@ class IssueOrchestrator:
             sink=sink,
         )
         _record(InvocationEventKind.AGENT_RESULT_RECEIVED)
+        self._last_agent_result = agent_result
 
         if agent_result.process.outcome is RunOutcome.INTERRUPTED:
             self._cancellation_requested = True
@@ -1572,6 +1680,7 @@ def finalize_run(
     lease: TargetLease | None,
     clock: Clock,
     max_review_cycles: int,
+    last_accepted_git_state: GitState | None = None,
 ) -> IssueResult:
     """Converge one terminal path into postflight and finalization (M13-04).
 
@@ -1623,6 +1732,18 @@ def finalize_run(
     and the freshly-resolved `LOGGING_ERROR`-inclusive terminal outcome,
     never reporting an unpersisted `APPROVED` as genuine (System Design
     SS15.4).
+
+    `last_accepted_git_state`, when given, is used verbatim as this
+    checkpoint instead of reconstructing it from `record.attempts`. Every
+    caller with a live `IssueOrchestrator` still running (the normal
+    `run_issue_pipeline` path, and a caught mid-pipeline error alike) should
+    pass its own `last_accepted_git_state` here: `record` can be stale --
+    missing exactly the attempt whose own `persist` is what caused this
+    call -- even though that attempt's `SAFE` `after` checkpoint was
+    already accepted before the persist failure ever happened. Left `None`
+    (`bootstrap_run`'s own late-stage failures, before any orchestrator
+    exists, and every existing caller unaffected by this) reconstructs it
+    from `record` exactly as before.
     """
 
     if type(record) is not RunRecord:
@@ -1639,7 +1760,11 @@ def finalize_run(
     _require_int(max_review_cycles, "max_review_cycles", minimum=1)
 
     next_sequence = max((check.sequence for check in record.git_checks), default=-1) + 1
-    last_accepted_state = _last_accepted_git_state(record)
+    last_accepted_state = (
+        last_accepted_git_state
+        if last_accepted_git_state is not None
+        else _last_accepted_git_state(record)
+    )
     postflight: GitCheckRecord | None = None
     if last_accepted_state is not None:
         postflight = git_safety.check(
@@ -1736,7 +1861,13 @@ def finalize_run(
             expected_exit_code=expected_exit_code,
             trigger_outcome=terminal_precedence.terminal_outcome,
             git_safety_status=effective_git_safety_status,
-            persistence_status=PersistenceStatus.OK,
+            # `record` may already have carried a non-`OK` persistence
+            # status into this call (an attempt whose own `AttemptRecord`
+            # or log never became durable, though `run.json` itself was
+            # still writable) -- that fact must not be erased just because
+            # *this* write of `run.json` succeeds; `_render_issue_result`'s
+            # incomplete-artifact warning depends on it surviving here.
+            persistence_status=final_record.persistence_status,
             changes_preserved=True,
             termination_confirmed=termination_confirmed,
         )

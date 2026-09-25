@@ -42,6 +42,7 @@ from opencode_tools.domain import (
     GitSafetyStatus,
     GitState,
     IssueLocator,
+    IssueRef,
     IssueResult,
     ParsedAgentResponse,
     PersistenceStatus,
@@ -57,7 +58,13 @@ from opencode_tools.domain import (
     TargetRepository,
     Workspace,
 )
-from opencode_tools.errors import ConfigError, LoggingError, PreflightError
+from opencode_tools.errors import (
+    ConfigError,
+    LoggingError,
+    OpenCodeToolsError,
+    PreflightError,
+    ProtocolError,
+)
 from opencode_tools.opencode import classify_provider_signal, open_run_capture_sink
 from opencode_tools.ports import (
     AgentRunner,
@@ -405,13 +412,19 @@ def _git_state(*, target_root: Path, fingerprint: str = "fp-0") -> GitState:
     )
 
 
-def _git_check(*, sequence: int, purpose: str, state: GitState) -> GitCheckRecord:
+def _git_check(
+    *,
+    sequence: int,
+    purpose: str,
+    state: GitState,
+    safety_status: GitSafetyStatus = GitSafetyStatus.SAFE,
+) -> GitCheckRecord:
     return GitCheckRecord(
         sequence=sequence,
         purpose=purpose,
         process_results=(),
         state=state,
-        safety_status=GitSafetyStatus.SAFE,
+        safety_status=safety_status,
     )
 
 
@@ -454,13 +467,28 @@ class _FakeGitSafety:
     """`resolve_target` and `check_runtime_location` succeed; `check` hands
     back one clean `SAFE` checkpoint per call, in the fixed order bootstrap
     and a single failed architect invocation need (baseline, before, after).
+
+    `accepted_fingerprint_after_purpose`, when given, simulates a role's
+    own edit actually landing on the target's working tree: every `check`
+    call up to and including the one whose `purpose` matches it returns
+    `fingerprint="fp-0"`; every call after returns `fingerprint="fp-1"`
+    instead. A `role=None` call (the baseline, or a postflight-style probe)
+    additionally compares its own `baseline` argument against that current
+    fingerprint and reports `UNSAFE` on a mismatch -- exactly the real
+    `check_git_state` continuity check this fake otherwise always skips.
     """
 
     def __init__(
-        self, *, target: TargetRepository, resolve_error: PreflightError | None = None
+        self,
+        *,
+        target: TargetRepository,
+        resolve_error: PreflightError | None = None,
+        accepted_fingerprint_after_purpose: str | None = None,
     ) -> None:
         self._target = target
         self._resolve_error = resolve_error
+        self._accepted_fingerprint_after_purpose = accepted_fingerprint_after_purpose
+        self._fingerprint_changed = False
         self.check_calls: list[str] = []
 
     def check_runtime_location(self, runtime_root: Path) -> None:
@@ -483,10 +511,21 @@ class _FakeGitSafety:
         baseline: GitState | None = None,
     ) -> GitCheckRecord:
         self.check_calls.append(purpose)
+        if purpose == self._accepted_fingerprint_after_purpose:
+            self._fingerprint_changed = True
+        current_fingerprint = "fp-1" if self._fingerprint_changed else "fp-0"
+        safety_status = GitSafetyStatus.SAFE
+        if (
+            role is None
+            and baseline is not None
+            and baseline.fingerprint != current_fingerprint
+        ):
+            safety_status = GitSafetyStatus.UNSAFE
         return _git_check(
             sequence=sequence,
             purpose=purpose,
-            state=_git_state(target_root=target.root),
+            state=_git_state(target_root=target.root, fingerprint=current_fingerprint),
+            safety_status=safety_status,
         )
 
 
@@ -503,9 +542,20 @@ class _FakeIssueResolver:
 
 
 class _FakeRunStore:
-    def __init__(self, *, initialize_error: LoggingError | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        initialize_error: LoggingError | None = None,
+        fail_persist_on_call: int | None = None,
+        fail_persist_exactly_on_call: int | None = None,
+        raise_on_persist_call: tuple[int, OpenCodeToolsError] | None = None,
+    ) -> None:
         self._initialize_error = initialize_error
+        self._fail_persist_on_call = fail_persist_on_call
+        self._fail_persist_exactly_on_call = fail_persist_exactly_on_call
+        self._raise_on_persist_call = raise_on_persist_call
         self.persist_calls = 0
+        self.persisted_records: list[RunRecord] = []
 
     def initialize(self, workspace: Workspace, run_id: str) -> Path:
         if self._initialize_error is not None:
@@ -519,6 +569,19 @@ class _FakeRunStore:
 
     def persist(self, record: object) -> PersistenceStatus:
         self.persist_calls += 1
+        self.persisted_records.append(cast("RunRecord", record))
+        if (
+            self._raise_on_persist_call is not None
+            and self.persist_calls == self._raise_on_persist_call[0]
+        ):
+            raise self._raise_on_persist_call[1]
+        if self.persist_calls == self._fail_persist_exactly_on_call:
+            return PersistenceStatus.FAILED
+        if (
+            self._fail_persist_on_call is not None
+            and self.persist_calls >= self._fail_persist_on_call
+        ):
+            return PersistenceStatus.FAILED
         return PersistenceStatus.OK
 
 
@@ -531,7 +594,10 @@ class _FakeOpenCodePreflight:
 
 
 def _agent_process_result(
-    *, workspace_root: Path, outcome: RunOutcome
+    *,
+    workspace_root: Path,
+    outcome: RunOutcome,
+    termination_confirmed: bool | None = True,
 ) -> ProcessResult:
     return ProcessResult(
         command=("/usr/bin/opencode", "run"),
@@ -541,7 +607,7 @@ def _agent_process_result(
         duration_ns=1_000_000_000,
         return_code=0 if outcome is RunOutcome.SUCCEEDED else 1,
         timed_out=False,
-        termination_confirmed=True,
+        termination_confirmed=termination_confirmed,
         log_path=Path("architect.log"),
         stdout_byte_count=0,
         stdout_sha256="digest",
@@ -557,8 +623,16 @@ class _FakeAgentRunner:
     pipeline -> finalize composition without needing a 3-role choreography.
     """
 
-    def __init__(self, *, workspace_root: Path) -> None:
+    def __init__(
+        self,
+        *,
+        workspace_root: Path,
+        termination_confirmed: bool | None = True,
+        process_outcome: RunOutcome | None = None,
+    ) -> None:
         self._workspace_root = workspace_root
+        self._termination_confirmed = termination_confirmed
+        self._process_outcome = process_outcome
         self.bind_issue_locator_calls: list[IssueLocator] = []
         self.run_calls: list[tuple[object, int | None, int]] = []
 
@@ -577,10 +651,26 @@ class _FakeAgentRunner:
     ) -> object:
 
         self.run_calls.append((role, review_cycle, provider_attempt))
-        response = ParsedAgentResponse(
-            role=AgentRole.ARCHITECT,
-            body="Could not access the issue.",
-            agent_status=AgentStatus.FAILED,
+        outcome = self._process_outcome
+        if outcome is None:
+            # `ProcessResult` forbids an unconfirmed termination on a
+            # `SUCCEEDED` outcome (domain.py's own invariant), so an
+            # unconfirmed run here is reported as a `PROCESS_ERROR` instead
+            # -- the realistic shape of a process group whose termination
+            # could not be confirmed.
+            outcome = (
+                RunOutcome.SUCCEEDED
+                if self._termination_confirmed is True
+                else RunOutcome.PROCESS_ERROR
+            )
+        terminal_response = (
+            ParsedAgentResponse(
+                role=AgentRole.ARCHITECT,
+                body="Could not access the issue.",
+                agent_status=AgentStatus.FAILED,
+            )
+            if outcome is RunOutcome.SUCCEEDED
+            else None
         )
         return AgentResult(
             role=AgentRole.ARCHITECT,
@@ -588,14 +678,44 @@ class _FakeAgentRunner:
             review_cycle=review_cycle,
             provider_attempt=provider_attempt,
             process=_agent_process_result(
-                workspace_root=self._workspace_root, outcome=RunOutcome.SUCCEEDED
+                workspace_root=self._workspace_root,
+                outcome=outcome,
+                termination_confirmed=self._termination_confirmed,
             ),
-            terminal_response=response,
+            terminal_response=terminal_response,
             session_id="session-architect-1",
             verified_agent="architect",
             provider_diagnostic=None,
-            outcome=RunOutcome.AGENT_REPORTED_FAILURE,
+            outcome=(
+                RunOutcome.AGENT_REPORTED_FAILURE
+                if outcome is RunOutcome.SUCCEEDED
+                else outcome
+            ),
         )
+
+
+class _SequencedAgentRunner:
+    """An `AgentRunner` fake returning one pre-built `AgentResult` per call,
+    in order -- for exercising more than one role/cycle in a single run
+    (e.g. an architect that succeeds followed by a coder whose own attempt
+    is what a test cares about)."""
+
+    def __init__(self, results: list[AgentResult]) -> None:
+        self._results = list(results)
+        self.calls: list[tuple[object, int | None, int]] = []
+
+    def run(
+        self,
+        role: object,
+        prompt: str,
+        workspace: Workspace,
+        *,
+        review_cycle: int | None,
+        provider_attempt: int,
+        sink: AttemptLogSink,
+    ) -> object:
+        self.calls.append((role, review_cycle, provider_attempt))
+        return self._results.pop(0)
 
 
 def test_pre_init_failure_returns_the_error_without_an_artifact(tmp_path: Path) -> None:
@@ -723,6 +843,440 @@ def test_a_full_bootstrap_binds_the_issue_locator_and_runs_the_pipeline(
     assert result.final_status is FinalStatus.FAILED
     assert result.trigger_outcome is RunOutcome.AGENT_REPORTED_FAILURE
     assert lease.released is True
+
+
+def test_a_mid_pipeline_logging_error_still_converges_through_finalize_run(
+    tmp_path: Path,
+) -> None:
+    """A `LoggingError` raised by `IssueOrchestrator.run_logical_invocation`
+    after bootstrap has already persisted `run.json` (here: the architect's
+    own post-attempt persist call) must not escape `run_composed_pipeline`
+    uncaught -- `main` would otherwise mistake an already-initialized run
+    for a pre-init failure (#109). It must converge through the same
+    `finalize_run` every other terminal path does, still releasing the
+    lease and still returning an `IssueResult`, never the raw error -- and
+    the caught error itself must survive onto the persisted `RunRecord.
+    errors`, exactly like `bootstrap_run`'s own late-stage except-handler
+    already preserves its own caught error, so the terminal artifact and
+    `_render_issue_result`'s stderr summary keep the actual diagnosis
+    instead of only the bare `LOGGING_ERROR` outcome."""
+
+    workspace, target = _workspace_and_target(tmp_path)
+    runtime_root = tmp_path / "runtime"
+    app_config = _app_config(runtime_root=runtime_root)
+    run_request = RunRequest(
+        issue_number=42, workspace=workspace, target_root=workspace.root
+    )
+
+    git_safety = _FakeGitSafety(target=target)
+    lease = _FakeLease()
+    lease_factory = _FakeLeaseFactory(lease)
+    # Bootstrap persists twice (the initial record, then the PREFLIGHT ->
+    # ARCHITECT-ready record) before any agent ever runs; failing the 3rd
+    # call instead fails the architect's own post-attempt persist -- a
+    # genuinely mid-pipeline failure, not a bootstrap one.
+    run_store = _FakeRunStore(fail_persist_on_call=3)
+    agent_runner = _FakeAgentRunner(workspace_root=workspace.root)
+
+    result = run_composed_pipeline(
+        run_request=run_request,
+        app_config=app_config,
+        run_id="20260915T090000.000000Z-abcdefabcdef",
+        process_runner=cast("ProcessRunner", None),
+        clock=_SteppingClock(),
+        sleeper=_RecordingSleeper(),
+        git_safety_port=cast("GitSafetyPort", git_safety),
+        issue_resolver=cast("IssueResolver", _FakeIssueResolver()),
+        run_store=cast("RunStorePort", run_store),
+        lease_factory=cast("TargetLeaseFactory", lease_factory),
+        opencode_preflight=cast("OpenCodePreflightPort", _FakeOpenCodePreflight()),
+        agent_runner=cast("AgentRunner", agent_runner),
+    )
+
+    assert [call[0] for call in agent_runner.run_calls] == [AgentRole.ARCHITECT]
+    assert isinstance(result, IssueResult)
+    assert result.trigger_outcome is RunOutcome.LOGGING_ERROR
+    assert result.final_status is FinalStatus.FAILED
+    assert lease.released is True
+
+    final_record = run_store.persisted_records[-1]
+    assert [error.code for error in final_record.errors] == [
+        "orchestrator.run_record_persist_failed"
+    ]
+    assert final_record.errors[-1].outcome is RunOutcome.LOGGING_ERROR
+    assert final_record.errors[-1].phase is PipelinePhase.ARCHITECT
+
+
+def test_a_mid_pipeline_logging_error_marks_the_artifact_incomplete_even_when_finalize_run_writes_cleanly(
+    tmp_path: Path,
+) -> None:
+    """The architect's own post-attempt `persist` fails exactly once (a
+    transient fault, e.g. `sink.close()` or `persist` itself); by the time
+    `finalize_run` makes its own, separate write of `run.json`, the fault
+    has cleared and that write succeeds. A persisted `run.json` this clean
+    must still say the artifact is incomplete -- the interrupted attempt's
+    own record never reached `record.attempts` -- rather than letting a
+    merely-successful final write erase that fact: `_render_issue_result`'s
+    incomplete-artifact warning depends on `IssueResult.persistence_status`
+    staying non-`OK` here, not on `finalize_run`'s own write outcome."""
+
+    workspace, target = _workspace_and_target(tmp_path)
+    runtime_root = tmp_path / "runtime"
+    app_config = _app_config(runtime_root=runtime_root)
+    run_request = RunRequest(
+        issue_number=42, workspace=workspace, target_root=workspace.root
+    )
+
+    git_safety = _FakeGitSafety(target=target)
+    lease = _FakeLease()
+    lease_factory = _FakeLeaseFactory(lease)
+    # Bootstrap persists twice; the architect's own post-attempt persist
+    # (call 3) fails exactly once and then clears -- `finalize_run`'s own
+    # later write (call 4) is never made to fail.
+    run_store = _FakeRunStore(fail_persist_exactly_on_call=3)
+    agent_runner = _FakeAgentRunner(workspace_root=workspace.root)
+
+    result = run_composed_pipeline(
+        run_request=run_request,
+        app_config=app_config,
+        run_id="20260915T090000.000000Z-abcdefabcdef",
+        process_runner=cast("ProcessRunner", None),
+        clock=_SteppingClock(),
+        sleeper=_RecordingSleeper(),
+        git_safety_port=cast("GitSafetyPort", git_safety),
+        issue_resolver=cast("IssueResolver", _FakeIssueResolver()),
+        run_store=cast("RunStorePort", run_store),
+        lease_factory=cast("TargetLeaseFactory", lease_factory),
+        opencode_preflight=cast("OpenCodePreflightPort", _FakeOpenCodePreflight()),
+        agent_runner=cast("AgentRunner", agent_runner),
+    )
+
+    assert run_store.persist_calls == 4
+    assert isinstance(result, IssueResult)
+    assert result.trigger_outcome is RunOutcome.LOGGING_ERROR
+    # The point of the fix: `finalize_run`'s own write of `run.json`
+    # succeeded (it is never made to fail here), yet the result must not
+    # report a clean `OK` -- that would silently drop the incomplete-
+    # artifact warning `_render_issue_result` owes the operator.
+    assert result.persistence_status is PersistenceStatus.INCOMPLETE
+
+    final_record = run_store.persisted_records[-1]
+    assert final_record.persistence_status is PersistenceStatus.INCOMPLETE
+    assert final_record.artifact_incomplete is True
+
+
+def test_a_mid_pipeline_logging_error_still_quarantines_an_unconfirmed_termination(
+    tmp_path: Path,
+) -> None:
+    """The architect's attempt itself observes `termination_confirmed=
+    False` (a possibly still-live child) right before its own post-attempt
+    `persist` call fails and raises `LoggingError` -- losing that
+    observation to `IssueOrchestrator.record`, which never advances past
+    the pre-attempt snapshot. `run_composed_pipeline`'s except-handler must
+    still recover it via `IssueOrchestrator.last_observed_termination_
+    confirmed` and pass `False` through to `finalize_run`, so postflight is
+    forced `INDETERMINATE` and the lease is quarantined -- not silently
+    released for another run to acquire -- exactly as it would have been
+    had persistence never failed at all."""
+
+    workspace, target = _workspace_and_target(tmp_path)
+    runtime_root = tmp_path / "runtime"
+    app_config = _app_config(runtime_root=runtime_root)
+    run_request = RunRequest(
+        issue_number=42, workspace=workspace, target_root=workspace.root
+    )
+
+    git_safety = _FakeGitSafety(target=target)
+    lease = _FakeLease()
+    lease_factory = _FakeLeaseFactory(lease)
+    # Bootstrap persists twice before any agent ever runs; failing the 3rd
+    # call fails the architect's own post-attempt persist instead.
+    run_store = _FakeRunStore(fail_persist_on_call=3)
+    agent_runner = _FakeAgentRunner(
+        workspace_root=workspace.root, termination_confirmed=False
+    )
+
+    result = run_composed_pipeline(
+        run_request=run_request,
+        app_config=app_config,
+        run_id="20260915T090000.000000Z-abcdefabcdef",
+        process_runner=cast("ProcessRunner", None),
+        clock=_SteppingClock(),
+        sleeper=_RecordingSleeper(),
+        git_safety_port=cast("GitSafetyPort", git_safety),
+        issue_resolver=cast("IssueResolver", _FakeIssueResolver()),
+        run_store=cast("RunStorePort", run_store),
+        lease_factory=cast("TargetLeaseFactory", lease_factory),
+        opencode_preflight=cast("OpenCodePreflightPort", _FakeOpenCodePreflight()),
+        agent_runner=cast("AgentRunner", agent_runner),
+    )
+
+    assert [call[0] for call in agent_runner.run_calls] == [AgentRole.ARCHITECT]
+    assert isinstance(result, IssueResult)
+    assert result.termination_confirmed is False
+    assert result.git_safety_status is GitSafetyStatus.INDETERMINATE
+    assert result.final_status is FinalStatus.FAILED
+    assert lease.quarantine_reasons
+    assert lease.released is True
+
+
+def test_an_observed_interruption_still_wins_over_an_unrelated_secondary_error(
+    tmp_path: Path,
+) -> None:
+    """The architect's own attempt already observed `process.outcome is
+    INTERRUPTED` before a *different*, later `OpenCodeToolsError` -- here a
+    `ProtocolError` a scripted `run_store.persist` raises directly, standing
+    in for whatever non-`LoggingError` an attempt's own tail could still
+    raise -- is what `run_composed_pipeline` actually catches.
+    `isinstance(error, RunInterruptedError)` alone is `False` for that
+    error, so without `IssueOrchestrator.cancellation_requested` the
+    already-observed interruption is lost and `resolve_terminal_outcome`
+    reports the unrelated `PROTOCOL_ERROR` instead of `INTERRUPTED`."""
+
+    workspace, target = _workspace_and_target(tmp_path)
+    runtime_root = tmp_path / "runtime"
+    app_config = _app_config(runtime_root=runtime_root)
+    run_request = RunRequest(
+        issue_number=42, workspace=workspace, target_root=workspace.root
+    )
+
+    git_safety = _FakeGitSafety(target=target)
+    lease = _FakeLease()
+    lease_factory = _FakeLeaseFactory(lease)
+    # Bootstrap persists twice before any agent ever runs; the architect's
+    # own post-attempt persist (call 3) raises directly instead of merely
+    # reporting a failed status.
+    secondary_error = ProtocolError(
+        "opencode.export_agent_mismatch", "unrelated protocol failure"
+    )
+    run_store = _FakeRunStore(raise_on_persist_call=(3, secondary_error))
+    agent_runner = _FakeAgentRunner(
+        workspace_root=workspace.root,
+        process_outcome=RunOutcome.INTERRUPTED,
+        termination_confirmed=True,
+    )
+
+    result = run_composed_pipeline(
+        run_request=run_request,
+        app_config=app_config,
+        run_id="20260915T090000.000000Z-abcdefabcdef",
+        process_runner=cast("ProcessRunner", None),
+        clock=_SteppingClock(),
+        sleeper=_RecordingSleeper(),
+        git_safety_port=cast("GitSafetyPort", git_safety),
+        issue_resolver=cast("IssueResolver", _FakeIssueResolver()),
+        run_store=cast("RunStorePort", run_store),
+        lease_factory=cast("TargetLeaseFactory", lease_factory),
+        opencode_preflight=cast("OpenCodePreflightPort", _FakeOpenCodePreflight()),
+        agent_runner=cast("AgentRunner", agent_runner),
+    )
+
+    assert [call[0] for call in agent_runner.run_calls] == [AgentRole.ARCHITECT]
+    assert isinstance(result, IssueResult)
+    assert result.trigger_outcome is RunOutcome.INTERRUPTED
+    assert result.final_status is FinalStatus.FAILED
+    assert lease.released is True
+
+
+def test_a_coder_persist_failure_is_tagged_with_the_coder_phase_not_the_architect(
+    tmp_path: Path,
+) -> None:
+    """The architect's own attempt succeeds and persists (advancing
+    `record` only as far as `PipelinePhase.ARCHITECT`); the *coder's* own
+    post-attempt persist is what then fails. `record.current_phase` still
+    names `ARCHITECT` -- the last role that happened to persist --  so the
+    `ErrorRecord` this failure is folded into must instead be tagged via
+    `IssueOrchestrator.last_attempted_phase`, which names the invocation
+    actually failing: `CODER`."""
+
+    workspace, target = _workspace_and_target(tmp_path)
+    runtime_root = tmp_path / "runtime"
+    app_config = _app_config(runtime_root=runtime_root)
+    run_request = RunRequest(
+        issue_number=42, workspace=workspace, target_root=workspace.root
+    )
+
+    git_safety = _FakeGitSafety(target=target)
+    lease = _FakeLease()
+    lease_factory = _FakeLeaseFactory(lease)
+    # Bootstrap persists twice, then the architect's own successful attempt
+    # persists once more (call 3); failing the 4th call fails the coder's
+    # own post-attempt persist instead.
+    run_store = _FakeRunStore(fail_persist_on_call=4)
+
+    issue_ref = IssueRef(
+        locator=_issue_locator(),
+        url="https://github.com/octocat/hello-world/issues/42",
+        title="Fix the thing",
+    )
+    architect_result = AgentResult(
+        role=AgentRole.ARCHITECT,
+        phase=PipelinePhase.ARCHITECT,
+        review_cycle=None,
+        provider_attempt=1,
+        process=_agent_process_result(
+            workspace_root=workspace.root, outcome=RunOutcome.SUCCEEDED
+        ),
+        terminal_response=ParsedAgentResponse(
+            role=AgentRole.ARCHITECT,
+            body="Handoff.",
+            agent_status=AgentStatus.READY,
+            issue_ref=issue_ref,
+        ),
+        session_id="session-architect-1",
+        verified_agent="architect",
+        provider_diagnostic=None,
+        outcome=RunOutcome.SUCCEEDED,
+    )
+    coder_result = AgentResult(
+        role=AgentRole.CODER,
+        phase=PipelinePhase.CODER,
+        review_cycle=1,
+        provider_attempt=1,
+        process=_agent_process_result(
+            workspace_root=workspace.root, outcome=RunOutcome.SUCCEEDED
+        ),
+        terminal_response=ParsedAgentResponse(
+            role=AgentRole.CODER,
+            body="Implemented the fix.",
+            agent_status=AgentStatus.COMPLETED,
+        ),
+        session_id="session-coder-1-1",
+        verified_agent="coder",
+        provider_diagnostic=None,
+        outcome=RunOutcome.SUCCEEDED,
+    )
+    agent_runner = _SequencedAgentRunner([architect_result, coder_result])
+
+    result = run_composed_pipeline(
+        run_request=run_request,
+        app_config=app_config,
+        run_id="20260915T090000.000000Z-abcdefabcdef",
+        process_runner=cast("ProcessRunner", None),
+        clock=_SteppingClock(),
+        sleeper=_RecordingSleeper(),
+        git_safety_port=cast("GitSafetyPort", git_safety),
+        issue_resolver=cast("IssueResolver", _FakeIssueResolver()),
+        run_store=cast("RunStorePort", run_store),
+        lease_factory=cast("TargetLeaseFactory", lease_factory),
+        opencode_preflight=cast("OpenCodePreflightPort", _FakeOpenCodePreflight()),
+        agent_runner=cast("AgentRunner", agent_runner),
+    )
+
+    assert [call[0] for call in agent_runner.calls] == [
+        AgentRole.ARCHITECT,
+        AgentRole.CODER,
+    ]
+    assert isinstance(result, IssueResult)
+    assert result.trigger_outcome is RunOutcome.LOGGING_ERROR
+
+    final_record = run_store.persisted_records[-1]
+    assert [error.code for error in final_record.errors] == [
+        "orchestrator.run_record_persist_failed"
+    ]
+    assert final_record.errors[-1].phase is PipelinePhase.CODER
+
+
+def test_a_coder_persist_failure_still_uses_the_coders_own_accepted_checkpoint(
+    tmp_path: Path,
+) -> None:
+    """The coder's own attempt makes a permitted edit -- its `after` check
+    is `SAFE` and advances `IssueOrchestrator`'s own live `_last_accepted_
+    git_state` -- strictly *before* that same attempt's own post-attempt
+    `persist` then fails. `record` never advances past the architect's own
+    checkpoint, so deriving the postflight baseline from `record` alone
+    would compare `finalize_run`'s postflight probe against the *pre-coder*
+    state and falsely report the coder's already-accepted edit as `UNSAFE`.
+    `IssueOrchestrator.last_accepted_git_state` must survive that loss."""
+
+    workspace, target = _workspace_and_target(tmp_path)
+    runtime_root = tmp_path / "runtime"
+    app_config = _app_config(runtime_root=runtime_root)
+    run_request = RunRequest(
+        issue_number=42, workspace=workspace, target_root=workspace.root
+    )
+
+    # The coder's own `after` check (`CODER:1:1:after`) is where the edit
+    # actually lands on the target's working tree; postflight's own probe
+    # (`role=None`) then observes that same, already-landed state.
+    git_safety = _FakeGitSafety(
+        target=target, accepted_fingerprint_after_purpose="CODER:1:1:after"
+    )
+    lease = _FakeLease()
+    lease_factory = _FakeLeaseFactory(lease)
+    # Bootstrap persists twice, then the architect's own successful attempt
+    # persists once more (call 3); failing the 4th call fails the coder's
+    # own post-attempt persist instead.
+    run_store = _FakeRunStore(fail_persist_on_call=4)
+
+    issue_ref = IssueRef(
+        locator=_issue_locator(),
+        url="https://github.com/octocat/hello-world/issues/42",
+        title="Fix the thing",
+    )
+    architect_result = AgentResult(
+        role=AgentRole.ARCHITECT,
+        phase=PipelinePhase.ARCHITECT,
+        review_cycle=None,
+        provider_attempt=1,
+        process=_agent_process_result(
+            workspace_root=workspace.root, outcome=RunOutcome.SUCCEEDED
+        ),
+        terminal_response=ParsedAgentResponse(
+            role=AgentRole.ARCHITECT,
+            body="Handoff.",
+            agent_status=AgentStatus.READY,
+            issue_ref=issue_ref,
+        ),
+        session_id="session-architect-1",
+        verified_agent="architect",
+        provider_diagnostic=None,
+        outcome=RunOutcome.SUCCEEDED,
+    )
+    coder_result = AgentResult(
+        role=AgentRole.CODER,
+        phase=PipelinePhase.CODER,
+        review_cycle=1,
+        provider_attempt=1,
+        process=_agent_process_result(
+            workspace_root=workspace.root, outcome=RunOutcome.SUCCEEDED
+        ),
+        terminal_response=ParsedAgentResponse(
+            role=AgentRole.CODER,
+            body="Implemented the fix.",
+            agent_status=AgentStatus.COMPLETED,
+        ),
+        session_id="session-coder-1-1",
+        verified_agent="coder",
+        provider_diagnostic=None,
+        outcome=RunOutcome.SUCCEEDED,
+    )
+    agent_runner = _SequencedAgentRunner([architect_result, coder_result])
+
+    result = run_composed_pipeline(
+        run_request=run_request,
+        app_config=app_config,
+        run_id="20260915T090000.000000Z-abcdefabcdef",
+        process_runner=cast("ProcessRunner", None),
+        clock=_SteppingClock(),
+        sleeper=_RecordingSleeper(),
+        git_safety_port=cast("GitSafetyPort", git_safety),
+        issue_resolver=cast("IssueResolver", _FakeIssueResolver()),
+        run_store=cast("RunStorePort", run_store),
+        lease_factory=cast("TargetLeaseFactory", lease_factory),
+        opencode_preflight=cast("OpenCodePreflightPort", _FakeOpenCodePreflight()),
+        agent_runner=cast("AgentRunner", agent_runner),
+    )
+
+    assert [call[0] for call in agent_runner.calls] == [
+        AgentRole.ARCHITECT,
+        AgentRole.CODER,
+    ]
+    assert isinstance(result, IssueResult)
+    # The point of the fix: nothing changed *after* the coder's own already-
+    # accepted edit, so postflight must still be `SAFE` -- comparing against
+    # the stale, pre-coder checkpoint would report it `UNSAFE` instead.
+    assert result.git_safety_status is GitSafetyStatus.SAFE
 
 
 # --- _CliAgentRunner: decode/classify/parse/identity-verify composition --
@@ -1364,7 +1918,32 @@ def test_render_issue_result_warns_when_final_persistence_failed(
 
     _render_issue_result(result, last_record=None)
 
-    assert "may be incomplete" in capsys.readouterr().err
+    err = capsys.readouterr().err
+    assert "may be incomplete" in err
+    assert "final persistence failed" in err
+
+
+def test_render_issue_result_distinguishes_an_incomplete_artifact_from_a_failed_final_write(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """`PersistenceStatus.INCOMPLETE` means `run.json` itself was written
+    successfully -- only an *earlier* attempt's own record or log never
+    became durable -- unlike `PersistenceStatus.FAILED`, where this final
+    write is what failed. Claiming "final persistence failed" for
+    `INCOMPLETE` would be factually wrong and could make an operator
+    distrust a terminal artifact that was, in fact, written cleanly."""
+
+    result = _issue_result(
+        trigger_outcome=RunOutcome.LOGGING_ERROR,
+        expected_exit_code=40,
+        persistence_status=PersistenceStatus.INCOMPLETE,
+    )
+
+    _render_issue_result(result, last_record=None)
+
+    err = capsys.readouterr().err
+    assert "incomplete" in err
+    assert "final persistence failed" not in err
 
 
 def test_render_issue_result_omits_the_change_summary_without_a_last_record(

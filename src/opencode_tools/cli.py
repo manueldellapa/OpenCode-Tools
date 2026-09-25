@@ -41,6 +41,7 @@ import platform
 import sys
 import time
 from collections.abc import Mapping, Sequence
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Protocol, cast, runtime_checkable
@@ -84,7 +85,13 @@ from opencode_tools.domain import (
     TargetRepository,
     Workspace,
 )
-from opencode_tools.errors import LoggingError, OpenCodeToolsError, ProtocolError
+from opencode_tools.errors import (
+    LoggingError,
+    OpenCodeToolsError,
+    ProtocolError,
+    RunInterruptedError,
+    to_error_records,
+)
 from opencode_tools.orchestrator import (
     IssuePipelineResult,
     LogicalInvocationResult,
@@ -909,13 +916,107 @@ def run_composed_pipeline(
     if isinstance(agent_runner, _AcceptsTargetRepository):
         agent_runner.bind_target(target)
 
-    pipeline_result = run_issue_pipeline(
-        orchestrator=outcome.orchestrator,
-        issue_locator=outcome.issue_locator,
-        workspace=run_request.workspace,
-        target=target,
-        max_review_cycles=app_config.execution.max_review_cycles,
-    )
+    try:
+        pipeline_result = run_issue_pipeline(
+            orchestrator=outcome.orchestrator,
+            issue_locator=outcome.issue_locator,
+            workspace=run_request.workspace,
+            target=target,
+            max_review_cycles=app_config.execution.max_review_cycles,
+        )
+    except OpenCodeToolsError as error:
+        # A `LoggingError`/`RunInterruptedError` raised mid-pipeline (System
+        # Design SS15.4: a broken persistence layer or a caught signal)
+        # propagates out of `run_issue_pipeline` by design, uncaught by any
+        # intermediate layer -- but a run directory already exists at this
+        # point (bootstrap already succeeded), so this is a terminal path
+        # "successivo alla run init" exactly like `bootstrap_run`'s own
+        # late-stage failures, and must converge through the same
+        # `finalize_run` rather than escape to `main`'s pre-init handler.
+        # The caught error itself is folded into `errors` first (mirroring
+        # `bootstrap_run`'s own late-stage except-handler and `finalize_run`'s
+        # own quarantine-failure handling), so both the persisted artifact
+        # and `_render_issue_result`'s stderr summary keep the actual
+        # diagnosis instead of only the bare terminal outcome.
+        last_record = outcome.orchestrator.record
+        record_with_error = replace(
+            last_record,
+            errors=(
+                *last_record.errors,
+                *to_error_records(
+                    error,
+                    # `last_record.current_phase` would still name the last
+                    # role that happened to persist (e.g. `ARCHITECT`) when
+                    # a *later* role's own `open_attempt_sink`/`persist` is
+                    # what actually raised -- `last_attempted_phase` always
+                    # names the invocation this error truly belongs to.
+                    phase=outcome.orchestrator.last_attempted_phase,
+                    timestamp=clock.now(),
+                    first_sequence=(
+                        last_record.errors[-1].sequence + 1 if last_record.errors else 0
+                    ),
+                ),
+            ),
+            # `last_record` was the last snapshot durably persisted *before*
+            # this invocation -- it carries `persistence_status=OK` and
+            # `artifact_incomplete=False` verbatim, even though a
+            # `LoggingError` here means the interrupted attempt's own
+            # record/log never became durable either. Marking the artifact
+            # incomplete (rather than leaving it `OK`) is what lets
+            # `finalize_run` still report it as such even when its own
+            # later write of `run.json` itself succeeds -- scoped to
+            # `LoggingError` specifically (not every `OpenCodeToolsError`
+            # this branch can catch) so an unrelated secondary error, e.g.
+            # after an already-observed interruption, never gets outranked
+            # by a spurious `LOGGING_ERROR` cause in `resolve_terminal_
+            # outcome`'s precedence.
+            persistence_status=(
+                PersistenceStatus.INCOMPLETE
+                if isinstance(error, LoggingError)
+                else last_record.persistence_status
+            ),
+            artifact_incomplete=(
+                True
+                if isinstance(error, LoggingError)
+                else last_record.artifact_incomplete
+            ),
+        )
+        return finalize_run(
+            record=record_with_error,
+            target=target,
+            trigger_outcome=error.outcome,
+            review_status=None,
+            # A plain `isinstance(error, RunInterruptedError)` would miss an
+            # interruption already observed on this same invocation (the
+            # agent's own process outcome was `INTERRUPTED`) when a
+            # *different* `OpenCodeToolsError` is what a later operation in
+            # that same invocation -- the after-attempt Git check, the sink
+            # close, or the post-attempt `persist` itself -- went on to
+            # raise; `cancellation_requested` still reflects that fact.
+            interrupted=(
+                isinstance(error, RunInterruptedError)
+                or outcome.orchestrator.cancellation_requested
+            ),
+            # `record` alone would lose the failed attempt's own
+            # termination evidence when a post-attempt `persist` is exactly
+            # what raised `error` -- `last_observed_termination_confirmed`
+            # survives that loss, so a possibly still-live child still
+            # forces postflight `INDETERMINATE` and quarantines the lease.
+            termination_confirmed=outcome.orchestrator.last_observed_termination_confirmed,
+            git_safety=git_safety_port,
+            run_store=run_store,
+            lease=outcome.lease,
+            clock=clock,
+            max_review_cycles=app_config.execution.max_review_cycles,
+            # `record_with_error` is the last *durably persisted* snapshot
+            # -- missing exactly the attempt whose own `open_attempt_sink`/
+            # `persist` failure is why we are here, even though that
+            # attempt's `SAFE` `after` checkpoint was already accepted
+            # first. Deriving the checkpoint from `record_with_error` alone
+            # would compare postflight against a checkpoint one attempt too
+            # old, falsely reporting an authorized Git delta as `UNSAFE`.
+            last_accepted_git_state=outcome.orchestrator.last_accepted_git_state,
+        )
 
     return finalize_run(
         record=outcome.orchestrator.record,
@@ -1066,9 +1167,18 @@ def _render_issue_result(result: IssueResult, *, last_record: RunRecord | None) 
         f"terminal outcome: {result.trigger_outcome.value}",
         f"artifact: {result.artifact_path}",
     ]
-    if result.persistence_status is not PersistenceStatus.OK:
+    if result.persistence_status is PersistenceStatus.FAILED:
         lines.append(
             "warning: final persistence failed; the run artifact may be incomplete."
+        )
+    elif result.persistence_status is PersistenceStatus.INCOMPLETE:
+        # Distinct from `FAILED`: `run.json` itself was written -- an
+        # *earlier* attempt's own record or log is what never became
+        # durable, not this final write, so a caller must not read this as
+        # "the final write failed" (it did not).
+        lines.append(
+            "warning: the run artifact is incomplete; an earlier attempt's "
+            "own record or log was not safely finalized."
         )
 
     git_state: GitState | None = None

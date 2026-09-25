@@ -17,6 +17,50 @@ loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   captured right after the sandbox was created, and passes
   `--no-ext-diff --no-textconv` to the diff itself as defense in depth.
 
+### Fixed
+
+- Stopped a mid-pipeline `LoggingError` from escaping `run_composed_pipeline`
+  uncaught (issue #109): once bootstrap has already persisted `run.json`, a
+  later persistence failure (e.g. `open_attempt_sink`/`persist` failing on a
+  full disk or a permissions change) is now caught and converged through
+  `finalize_run`, exactly like `bootstrap_run`'s own late-stage failures.
+  Previously it escaped to `main`'s pre-init handler, which wrongly reported
+  "artifact: none", printed no `FINAL_STATUS` line, and left the target
+  lease held forever since `finalize_run` was never reached. The caught
+  error is also folded into `RunRecord.errors` before finalization, so the
+  persisted artifact and stderr summary keep the actual diagnosis instead
+  of only the bare `LOGGING_ERROR` terminal outcome. `IssueOrchestrator`
+  now also exposes the last observed `termination_confirmed` independently
+  of `record` (which stops advancing once persistence is blocked), so a
+  `persist` failure right after an attempt with a possibly still-live
+  child no longer loses that fact -- `finalize_run` still forces postflight
+  `INDETERMINATE` and quarantines the target lease instead of releasing it
+  for another run to acquire. `IssueOrchestrator` likewise exposes
+  `cancellation_requested` and `last_attempted_phase` independently of
+  `record`: an interruption already observed on the failing attempt is no
+  longer lost behind an unrelated secondary `OpenCodeToolsError` (it still
+  outranks that error in `resolve_terminal_outcome`'s precedence), and the
+  preserved `ErrorRecord` is tagged with the role actually failing (e.g.
+  `CODER`) rather than the last role that happened to persist (e.g.
+  `ARCHITECT`). A caught `LoggingError` specifically also marks the
+  converged record `persistence_status=INCOMPLETE`/`artifact_incomplete=
+  True`, and `finalize_run`'s own success path no longer overwrites an
+  incoming non-`OK` `persistence_status` back to `OK` just because *its
+  own* later write of `run.json` succeeds -- so a transient fault (e.g. the
+  attempt-log sink) that clears before `finalize_run` runs still leaves
+  `_render_issue_result`'s incomplete-artifact warning intact instead of
+  reporting the run as a clean success -- rendered as its own, distinct
+  warning ("the run artifact is incomplete"), never the "final persistence
+  failed" wording reserved for `PersistenceStatus.FAILED`, since `run.json`
+  itself was genuinely written. `IssueOrchestrator` also exposes its own
+  live `last_accepted_git_state`, independent of `record`: a coder's
+  permitted edit is accepted (`after` check `SAFE`) before that same
+  attempt's own `persist` can fail, and `finalize_run` now takes this
+  checkpoint explicitly instead of only ever reconstructing it from
+  `record.attempts` -- which would compare postflight against the
+  *pre-coder* state and falsely report an already-accepted edit as
+  `UNSAFE`.
+
 ## [0.1.2] - 2026-09-22
 
 ### Security
