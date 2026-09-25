@@ -799,6 +799,37 @@ def test_run_honors_a_signal_delivered_the_instant_popen_returns(
     assert result.termination_confirmed is True
 
 
+def test_run_preserves_a_caught_cancellation_when_the_spawn_itself_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Issue #112 (Codex review, P2): if SIGTERM/SIGINT is caught while
+    `Popen()` is running but the spawn itself then raises `OSError` (e.g.
+    an invalid executable races with shutdown), the cancellation must still
+    win -- not be silently swallowed into an ordinary `PROCESS_ERROR`,
+    which would hide from the orchestrator that a shutdown was already
+    requested."""
+
+    def _self_signal_then_fail(
+        *args: object, **kwargs: object
+    ) -> subprocess.Popen[bytes]:
+        os.kill(os.getpid(), signal.SIGTERM)
+        raise OSError("simulated spawn failure racing with shutdown")
+
+    monkeypatch.setattr(subprocess, "Popen", _self_signal_then_fail)
+
+    runner = SubprocessRunner(RealClock())
+    sink = RecordingAttemptLogSink()
+    spec = _spec(_helper_argv(), tmp_path)
+
+    result = runner.run(spec, sink=sink)
+
+    assert result.outcome is RunOutcome.INTERRUPTED
+    assert result.return_code is None
+    assert result.termination_confirmed is True
+    assert sink.writes == []
+
+
 def test_run_terminates_the_child_and_reports_logging_error_on_a_sink_fault(
     tmp_path: Path,
 ) -> None:

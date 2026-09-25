@@ -413,6 +413,7 @@ class SubprocessRunner:
                     duration_ns=duration_ns,
                     return_code=None,
                     termination_confirmed=True,
+                    interrupted=cancelled.is_set(),
                     stdout_byte_count=0,
                     stdout_sha256=_EMPTY_SHA256,
                     stderr_byte_count=0,
