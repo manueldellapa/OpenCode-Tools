@@ -167,23 +167,27 @@ def _wait_for_exit_or_deadline(
     comes first.
 
     Returns `(return_code, timed_out, interrupted, logging_error)`:
-    `return_code` is set only when the child had already exited on its own.
-    A sink fault is checked *before* the child's own exit status: a faulted
-    reader keeps draining (rather than closing its pipe) precisely so the
-    child is not incidentally broken-piped into its own unrelated exit code
-    while we are still noticing the fault, so once a fault is observed it
-    must win the race regardless of what `process.poll()` reports next
-    (M05-04).
+    `return_code` is set only when the child had already exited on its own
+    with neither a fault nor a cancellation observed. A sink fault and a
+    cancellation are both checked *before* the child's own exit status: a
+    faulted reader keeps draining (rather than closing its pipe) precisely
+    so the child is not incidentally broken-piped into its own unrelated
+    exit code while we are still noticing the fault (M05-04), and a
+    SIGINT/SIGTERM already caught (`cancelled` set, issue #112) must win
+    the same way -- otherwise a short-lived child that happens to finish at
+    the same moment would silently report its own exit code instead of
+    `INTERRUPTED`, swallowing the shutdown request the `SIGTERM -> grace ->
+    SIGKILL -> grace` escalation (SH-001) is supposed to always trigger.
     """
 
     while True:
         if sink_fault.is_set():
             return None, False, False, True
+        if cancelled.is_set():
+            return None, False, True, False
         return_code = process.poll()
         if return_code is not None:
             return return_code, False, False, False
-        if cancelled.is_set():
-            return None, False, True, False
         if clock.monotonic_ns() >= deadline:
             return None, True, False, False
         time.sleep(_POLL_INTERVAL_SECONDS)
