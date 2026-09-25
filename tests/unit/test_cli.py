@@ -503,8 +503,14 @@ class _FakeIssueResolver:
 
 
 class _FakeRunStore:
-    def __init__(self, *, initialize_error: LoggingError | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        initialize_error: LoggingError | None = None,
+        fail_persist_on_call: int | None = None,
+    ) -> None:
         self._initialize_error = initialize_error
+        self._fail_persist_on_call = fail_persist_on_call
         self.persist_calls = 0
 
     def initialize(self, workspace: Workspace, run_id: str) -> Path:
@@ -519,6 +525,11 @@ class _FakeRunStore:
 
     def persist(self, record: object) -> PersistenceStatus:
         self.persist_calls += 1
+        if (
+            self._fail_persist_on_call is not None
+            and self.persist_calls >= self._fail_persist_on_call
+        ):
+            return PersistenceStatus.FAILED
         return PersistenceStatus.OK
 
 
@@ -722,6 +733,56 @@ def test_a_full_bootstrap_binds_the_issue_locator_and_runs_the_pipeline(
     assert isinstance(result, IssueResult)
     assert result.final_status is FinalStatus.FAILED
     assert result.trigger_outcome is RunOutcome.AGENT_REPORTED_FAILURE
+    assert lease.released is True
+
+
+def test_a_mid_pipeline_logging_error_still_converges_through_finalize_run(
+    tmp_path: Path,
+) -> None:
+    """A `LoggingError` raised by `IssueOrchestrator.run_logical_invocation`
+    after bootstrap has already persisted `run.json` (here: the architect's
+    own post-attempt persist call) must not escape `run_composed_pipeline`
+    uncaught -- `main` would otherwise mistake an already-initialized run
+    for a pre-init failure (#109). It must converge through the same
+    `finalize_run` every other terminal path does, still releasing the
+    lease and still returning an `IssueResult`, never the raw error."""
+
+    workspace, target = _workspace_and_target(tmp_path)
+    runtime_root = tmp_path / "runtime"
+    app_config = _app_config(runtime_root=runtime_root)
+    run_request = RunRequest(
+        issue_number=42, workspace=workspace, target_root=workspace.root
+    )
+
+    git_safety = _FakeGitSafety(target=target)
+    lease = _FakeLease()
+    lease_factory = _FakeLeaseFactory(lease)
+    # Bootstrap persists twice (the initial record, then the PREFLIGHT ->
+    # ARCHITECT-ready record) before any agent ever runs; failing the 3rd
+    # call instead fails the architect's own post-attempt persist -- a
+    # genuinely mid-pipeline failure, not a bootstrap one.
+    run_store = _FakeRunStore(fail_persist_on_call=3)
+    agent_runner = _FakeAgentRunner(workspace_root=workspace.root)
+
+    result = run_composed_pipeline(
+        run_request=run_request,
+        app_config=app_config,
+        run_id="20260915T090000.000000Z-abcdefabcdef",
+        process_runner=cast("ProcessRunner", None),
+        clock=_SteppingClock(),
+        sleeper=_RecordingSleeper(),
+        git_safety_port=cast("GitSafetyPort", git_safety),
+        issue_resolver=cast("IssueResolver", _FakeIssueResolver()),
+        run_store=cast("RunStorePort", run_store),
+        lease_factory=cast("TargetLeaseFactory", lease_factory),
+        opencode_preflight=cast("OpenCodePreflightPort", _FakeOpenCodePreflight()),
+        agent_runner=cast("AgentRunner", agent_runner),
+    )
+
+    assert [call[0] for call in agent_runner.run_calls] == [AgentRole.ARCHITECT]
+    assert isinstance(result, IssueResult)
+    assert result.trigger_outcome is RunOutcome.LOGGING_ERROR
+    assert result.final_status is FinalStatus.FAILED
     assert lease.released is True
 
 

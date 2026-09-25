@@ -17,6 +17,17 @@ loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   captured right after the sandbox was created, and passes
   `--no-ext-diff --no-textconv` to the diff itself as defense in depth.
 
+### Fixed
+
+- Stopped a mid-pipeline `LoggingError` from escaping `run_composed_pipeline`
+  uncaught (issue #109): once bootstrap has already persisted `run.json`, a
+  later persistence failure (e.g. `open_attempt_sink`/`persist` failing on a
+  full disk or a permissions change) is now caught and converged through
+  `finalize_run`, exactly like `bootstrap_run`'s own late-stage failures.
+  Previously it escaped to `main`'s pre-init handler, which wrongly reported
+  "artifact: none", printed no `FINAL_STATUS` line, and left the target
+  lease held forever since `finalize_run` was never reached.
+
 ## [0.1.2] - 2026-09-22
 
 ### Security

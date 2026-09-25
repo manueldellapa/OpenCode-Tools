@@ -84,7 +84,12 @@ from opencode_tools.domain import (
     TargetRepository,
     Workspace,
 )
-from opencode_tools.errors import LoggingError, OpenCodeToolsError, ProtocolError
+from opencode_tools.errors import (
+    LoggingError,
+    OpenCodeToolsError,
+    ProtocolError,
+    RunInterruptedError,
+)
 from opencode_tools.orchestrator import (
     IssuePipelineResult,
     LogicalInvocationResult,
@@ -909,13 +914,36 @@ def run_composed_pipeline(
     if isinstance(agent_runner, _AcceptsTargetRepository):
         agent_runner.bind_target(target)
 
-    pipeline_result = run_issue_pipeline(
-        orchestrator=outcome.orchestrator,
-        issue_locator=outcome.issue_locator,
-        workspace=run_request.workspace,
-        target=target,
-        max_review_cycles=app_config.execution.max_review_cycles,
-    )
+    try:
+        pipeline_result = run_issue_pipeline(
+            orchestrator=outcome.orchestrator,
+            issue_locator=outcome.issue_locator,
+            workspace=run_request.workspace,
+            target=target,
+            max_review_cycles=app_config.execution.max_review_cycles,
+        )
+    except OpenCodeToolsError as error:
+        # A `LoggingError`/`RunInterruptedError` raised mid-pipeline (System
+        # Design SS15.4: a broken persistence layer or a caught signal)
+        # propagates out of `run_issue_pipeline` by design, uncaught by any
+        # intermediate layer -- but a run directory already exists at this
+        # point (bootstrap already succeeded), so this is a terminal path
+        # "successivo alla run init" exactly like `bootstrap_run`'s own
+        # late-stage failures, and must converge through the same
+        # `finalize_run` rather than escape to `main`'s pre-init handler.
+        return finalize_run(
+            record=outcome.orchestrator.record,
+            target=target,
+            trigger_outcome=error.outcome,
+            review_status=None,
+            interrupted=isinstance(error, RunInterruptedError),
+            termination_confirmed=None,
+            git_safety=git_safety_port,
+            run_store=run_store,
+            lease=outcome.lease,
+            clock=clock,
+            max_review_cycles=app_config.execution.max_review_cycles,
+        )
 
     return finalize_run(
         record=outcome.orchestrator.record,
