@@ -846,6 +846,82 @@ def test_a_full_bootstrap_binds_the_issue_locator_and_runs_the_pipeline(
     assert lease.released is True
 
 
+def test_the_cancellation_handler_stays_installed_through_finalize_run(
+    tmp_path: Path,
+) -> None:
+    """Issue #111 follow-up: on the ordinary success path (`run_issue_
+    pipeline` returns without raising), `run_composed_pipeline` used to
+    restore the previous SIGINT/SIGTERM handler in a `finally` attached
+    only to the `try`/`except` around `run_issue_pipeline`, *before* the
+    trailing `finalize_run` call that follows it -- reopening the exact
+    post-bootstrap idle window the original fix closed. A SIGINT arriving
+    during `finalize_run`'s own work (here: its postflight Git probe) would
+    again unwind as a raw `KeyboardInterrupt` past this function, caught
+    only by `main`'s pre-init handler, even though the run had already
+    finished. This sends a real SIGINT from inside a `GitSafetyPort.check`
+    fake exactly when it is called for the `postflight` purpose -- i.e.
+    strictly after `run_issue_pipeline` has already returned -- and
+    asserts `run_composed_pipeline` still returns a normal `IssueResult`
+    instead of letting the signal escape."""
+
+    workspace, target = _workspace_and_target(tmp_path)
+    runtime_root = tmp_path / "runtime"
+    app_config = _app_config(runtime_root=runtime_root)
+    run_request = RunRequest(
+        issue_number=42, workspace=workspace, target_root=workspace.root
+    )
+
+    class _SigintDuringPostflight(_FakeGitSafety):
+        def check(
+            self,
+            target: TargetRepository,
+            *,
+            sequence: int,
+            purpose: str,
+            role: object | None = None,
+            baseline: GitState | None = None,
+        ) -> GitCheckRecord:
+            if purpose == "postflight":
+                os.kill(os.getpid(), signal.SIGINT)
+            return super().check(
+                target,
+                sequence=sequence,
+                purpose=purpose,
+                role=role,
+                baseline=baseline,
+            )
+
+    git_safety = _SigintDuringPostflight(target=target)
+    lease = _FakeLease()
+    lease_factory = _FakeLeaseFactory(lease)
+    run_store = _FakeRunStore()
+    # The default `_FakeAgentRunner` reports the architect `AGENT_STATUS:
+    # FAILED`, so `run_issue_pipeline` returns normally (no exception) --
+    # exactly the success path whose `finalize_run` call is at issue here.
+    agent_runner = _FakeAgentRunner(workspace_root=workspace.root)
+
+    result = run_composed_pipeline(
+        run_request=run_request,
+        app_config=app_config,
+        run_id="20260915T090000.000000Z-abcdefabcdef",
+        process_runner=cast("ProcessRunner", None),
+        clock=_SteppingClock(),
+        sleeper=_RecordingSleeper(),
+        git_safety_port=cast("GitSafetyPort", git_safety),
+        issue_resolver=cast("IssueResolver", _FakeIssueResolver()),
+        run_store=cast("RunStorePort", run_store),
+        lease_factory=cast("TargetLeaseFactory", lease_factory),
+        opencode_preflight=cast("OpenCodePreflightPort", _FakeOpenCodePreflight()),
+        agent_runner=cast("AgentRunner", agent_runner),
+    )
+
+    assert "postflight" in git_safety.check_calls
+    assert isinstance(result, IssueResult)
+    assert result.final_status is FinalStatus.FAILED
+    assert result.trigger_outcome is RunOutcome.AGENT_REPORTED_FAILURE
+    assert lease.released is True
+
+
 def test_a_mid_pipeline_logging_error_still_converges_through_finalize_run(
     tmp_path: Path,
 ) -> None:

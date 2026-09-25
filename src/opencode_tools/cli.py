@@ -1009,7 +1009,7 @@ def run_composed_pipeline(
                 else last_record.artifact_incomplete
             ),
         )
-        return finalize_run(
+        result = finalize_run(
             record=record_with_error,
             target=target,
             trigger_outcome=error.outcome,
@@ -1045,28 +1045,35 @@ def run_composed_pipeline(
             # old, falsely reporting an authorized Git delta as `UNSAFE`.
             last_accepted_git_state=outcome.orchestrator.last_accepted_git_state,
         )
+    else:
+        result = finalize_run(
+            record=outcome.orchestrator.record,
+            target=target,
+            trigger_outcome=_trigger_outcome(pipeline_result),
+            review_status=_last_review_status(pipeline_result),
+            interrupted=_interrupted(pipeline_result),
+            termination_confirmed=_termination_confirmed(pipeline_result),
+            git_safety=git_safety_port,
+            run_store=run_store,
+            lease=outcome.lease,
+            clock=clock,
+            max_review_cycles=app_config.execution.max_review_cycles,
+        )
     finally:
-        # Restored as soon as `run_issue_pipeline` itself has returned or
-        # raised -- there is no further idle window between logical
-        # invocations past this point for this handler to guard, and
-        # `finalize_run` below runs no agent, so it needs no cancellation
-        # handling of its own.
+        # Kept installed through *both* branches' own `finalize_run` call
+        # above, not just `run_issue_pipeline` -- `finalize_run` still does
+        # real, non-instant work afterward (a postflight Git probe,
+        # persisting the terminal record, releasing/quarantining the
+        # lease), and restoring the handler any earlier would reopen the
+        # exact post-bootstrap idle window issue #111 closed: a SIGINT
+        # there would again unwind as a raw `KeyboardInterrupt` past this
+        # function, misreported by `main`'s pre-init handler even though
+        # the run is fully finalized. Only once this function is entirely
+        # done with `orchestrator` is the previous handler restored.
         signal.signal(signal.SIGINT, previous_sigint)
         signal.signal(signal.SIGTERM, previous_sigterm)
 
-    return finalize_run(
-        record=outcome.orchestrator.record,
-        target=target,
-        trigger_outcome=_trigger_outcome(pipeline_result),
-        review_status=_last_review_status(pipeline_result),
-        interrupted=_interrupted(pipeline_result),
-        termination_confirmed=_termination_confirmed(pipeline_result),
-        git_safety=git_safety_port,
-        run_store=run_store,
-        lease=outcome.lease,
-        clock=clock,
-        max_review_cycles=app_config.execution.max_review_cycles,
-    )
+    return result
 
 
 def _flatten_error_causes(
