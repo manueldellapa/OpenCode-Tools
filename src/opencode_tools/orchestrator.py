@@ -1819,7 +1819,13 @@ def finalize_run(
             expected_exit_code=expected_exit_code,
             trigger_outcome=terminal_precedence.terminal_outcome,
             git_safety_status=effective_git_safety_status,
-            persistence_status=PersistenceStatus.OK,
+            # `record` may already have carried a non-`OK` persistence
+            # status into this call (an attempt whose own `AttemptRecord`
+            # or log never became durable, though `run.json` itself was
+            # still writable) -- that fact must not be erased just because
+            # *this* write of `run.json` succeeds; `_render_issue_result`'s
+            # incomplete-artifact warning depends on it surviving here.
+            persistence_status=final_record.persistence_status,
             changes_preserved=True,
             termination_confirmed=termination_confirmed,
         )

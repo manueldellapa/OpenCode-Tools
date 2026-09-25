@@ -515,10 +515,12 @@ class _FakeRunStore:
         *,
         initialize_error: LoggingError | None = None,
         fail_persist_on_call: int | None = None,
+        fail_persist_exactly_on_call: int | None = None,
         raise_on_persist_call: tuple[int, OpenCodeToolsError] | None = None,
     ) -> None:
         self._initialize_error = initialize_error
         self._fail_persist_on_call = fail_persist_on_call
+        self._fail_persist_exactly_on_call = fail_persist_exactly_on_call
         self._raise_on_persist_call = raise_on_persist_call
         self.persist_calls = 0
         self.persisted_records: list[RunRecord] = []
@@ -541,6 +543,8 @@ class _FakeRunStore:
             and self.persist_calls == self._raise_on_persist_call[0]
         ):
             raise self._raise_on_persist_call[1]
+        if self.persist_calls == self._fail_persist_exactly_on_call:
+            return PersistenceStatus.FAILED
         if (
             self._fail_persist_on_call is not None
             and self.persist_calls >= self._fail_persist_on_call
@@ -869,6 +873,64 @@ def test_a_mid_pipeline_logging_error_still_converges_through_finalize_run(
     ]
     assert final_record.errors[-1].outcome is RunOutcome.LOGGING_ERROR
     assert final_record.errors[-1].phase is PipelinePhase.ARCHITECT
+
+
+def test_a_mid_pipeline_logging_error_marks_the_artifact_incomplete_even_when_finalize_run_writes_cleanly(
+    tmp_path: Path,
+) -> None:
+    """The architect's own post-attempt `persist` fails exactly once (a
+    transient fault, e.g. `sink.close()` or `persist` itself); by the time
+    `finalize_run` makes its own, separate write of `run.json`, the fault
+    has cleared and that write succeeds. A persisted `run.json` this clean
+    must still say the artifact is incomplete -- the interrupted attempt's
+    own record never reached `record.attempts` -- rather than letting a
+    merely-successful final write erase that fact: `_render_issue_result`'s
+    incomplete-artifact warning depends on `IssueResult.persistence_status`
+    staying non-`OK` here, not on `finalize_run`'s own write outcome."""
+
+    workspace, target = _workspace_and_target(tmp_path)
+    runtime_root = tmp_path / "runtime"
+    app_config = _app_config(runtime_root=runtime_root)
+    run_request = RunRequest(
+        issue_number=42, workspace=workspace, target_root=workspace.root
+    )
+
+    git_safety = _FakeGitSafety(target=target)
+    lease = _FakeLease()
+    lease_factory = _FakeLeaseFactory(lease)
+    # Bootstrap persists twice; the architect's own post-attempt persist
+    # (call 3) fails exactly once and then clears -- `finalize_run`'s own
+    # later write (call 4) is never made to fail.
+    run_store = _FakeRunStore(fail_persist_exactly_on_call=3)
+    agent_runner = _FakeAgentRunner(workspace_root=workspace.root)
+
+    result = run_composed_pipeline(
+        run_request=run_request,
+        app_config=app_config,
+        run_id="20260915T090000.000000Z-abcdefabcdef",
+        process_runner=cast("ProcessRunner", None),
+        clock=_SteppingClock(),
+        sleeper=_RecordingSleeper(),
+        git_safety_port=cast("GitSafetyPort", git_safety),
+        issue_resolver=cast("IssueResolver", _FakeIssueResolver()),
+        run_store=cast("RunStorePort", run_store),
+        lease_factory=cast("TargetLeaseFactory", lease_factory),
+        opencode_preflight=cast("OpenCodePreflightPort", _FakeOpenCodePreflight()),
+        agent_runner=cast("AgentRunner", agent_runner),
+    )
+
+    assert run_store.persist_calls == 4
+    assert isinstance(result, IssueResult)
+    assert result.trigger_outcome is RunOutcome.LOGGING_ERROR
+    # The point of the fix: `finalize_run`'s own write of `run.json`
+    # succeeded (it is never made to fail here), yet the result must not
+    # report a clean `OK` -- that would silently drop the incomplete-
+    # artifact warning `_render_issue_result` owes the operator.
+    assert result.persistence_status is PersistenceStatus.INCOMPLETE
+
+    final_record = run_store.persisted_records[-1]
+    assert final_record.persistence_status is PersistenceStatus.INCOMPLETE
+    assert final_record.artifact_incomplete is True
 
 
 def test_a_mid_pipeline_logging_error_still_quarantines_an_unconfirmed_termination(

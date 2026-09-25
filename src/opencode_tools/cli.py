@@ -957,6 +957,29 @@ def run_composed_pipeline(
                     ),
                 ),
             ),
+            # `last_record` was the last snapshot durably persisted *before*
+            # this invocation -- it carries `persistence_status=OK` and
+            # `artifact_incomplete=False` verbatim, even though a
+            # `LoggingError` here means the interrupted attempt's own
+            # record/log never became durable either. Marking the artifact
+            # incomplete (rather than leaving it `OK`) is what lets
+            # `finalize_run` still report it as such even when its own
+            # later write of `run.json` itself succeeds -- scoped to
+            # `LoggingError` specifically (not every `OpenCodeToolsError`
+            # this branch can catch) so an unrelated secondary error, e.g.
+            # after an already-observed interruption, never gets outranked
+            # by a spurious `LOGGING_ERROR` cause in `resolve_terminal_
+            # outcome`'s precedence.
+            persistence_status=(
+                PersistenceStatus.INCOMPLETE
+                if isinstance(error, LoggingError)
+                else last_record.persistence_status
+            ),
+            artifact_incomplete=(
+                True
+                if isinstance(error, LoggingError)
+                else last_record.artifact_incomplete
+            ),
         )
         return finalize_run(
             record=record_with_error,

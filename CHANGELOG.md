@@ -42,7 +42,14 @@ loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   outranks that error in `resolve_terminal_outcome`'s precedence), and the
   preserved `ErrorRecord` is tagged with the role actually failing (e.g.
   `CODER`) rather than the last role that happened to persist (e.g.
-  `ARCHITECT`).
+  `ARCHITECT`). A caught `LoggingError` specifically also marks the
+  converged record `persistence_status=INCOMPLETE`/`artifact_incomplete=
+  True`, and `finalize_run`'s own success path no longer overwrites an
+  incoming non-`OK` `persistence_status` back to `OK` just because *its
+  own* later write of `run.json` succeeds -- so a transient fault (e.g. the
+  attempt-log sink) that clears before `finalize_run` runs still leaves
+  `_render_issue_result`'s incomplete-artifact warning intact instead of
+  reporting the run as a clean success.
 
 ## [0.1.2] - 2026-09-22
 
