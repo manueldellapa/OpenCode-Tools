@@ -36,6 +36,7 @@ than ever reporting an unpersisted `APPROVED`.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Self
@@ -111,24 +112,30 @@ class RecordingAttemptLogSink:
 
 
 class SequencedRunStorePort:
-    """A `RunStorePort` fake: one fresh sink per attempt. `persist` returns
-    `OK` unless `persist_results` scripts otherwise for that call; `order_log`,
-    when given, records a tag per call so a test can assert this port's
-    calls interleave correctly with every other port's own."""
+    """A `RunStorePort` fake with explicit terminal stage/commit support."""
 
     def __init__(
         self,
         *,
         persist_results: list[PersistenceStatus] | None = None,
         order_log: list[str] | None = None,
+        on_stage_final: Callable[[], None] | None = None,
+        commit_result: PersistenceStatus = PersistenceStatus.OK,
     ) -> None:
         self.sink_calls: list[tuple[AgentRole, int | None, int]] = []
         self.opened_sinks: list[RecordingAttemptLogSink] = []
         self.persist_calls: list[RunRecord] = []
+        self.stage_calls: list[RunRecord] = []
+        self.committed_records: list[RunRecord] = []
+        self.commit_calls = 0
+        self.abort_calls = 0
+        self._staged_record: RunRecord | None = None
         self._persist_results = (
             list(persist_results) if persist_results is not None else None
         )
         self._order_log = order_log
+        self._on_stage_final = on_stage_final
+        self._commit_result = commit_result
 
     def initialize(self, workspace: Workspace, run_id: str) -> Path:
         raise AssertionError("bootstrap concern, not exercised here")
@@ -151,6 +158,36 @@ class SequencedRunStorePort:
         if self._persist_results is not None:
             return self._persist_results.pop(0)
         return PersistenceStatus.OK
+
+    def stage_final(self, record: RunRecord) -> PersistenceStatus:
+        if self._order_log is not None:
+            self._order_log.append(f"stage_final:{record.current_phase.value}")
+        self.persist_calls.append(record)
+        self.stage_calls.append(record)
+        self._staged_record = record
+        if self._on_stage_final is not None:
+            self._on_stage_final()
+        if self._persist_results is not None:
+            return self._persist_results.pop(0)
+        return PersistenceStatus.OK
+
+    def commit_final(self) -> PersistenceStatus:
+        if self._order_log is not None:
+            self._order_log.append("commit_final")
+        self.commit_calls += 1
+        if self._commit_result is not PersistenceStatus.OK:
+            return self._commit_result
+        if self._staged_record is None:
+            raise AssertionError("stage_final must precede commit_final")
+        self.committed_records.append(self._staged_record)
+        self._staged_record = None
+        return PersistenceStatus.OK
+
+    def abort_final(self) -> None:
+        if self._order_log is not None:
+            self._order_log.append("abort_final")
+        self.abort_calls += 1
+        self._staged_record = None
 
 
 class SequencedAgentRunner:
@@ -295,11 +332,13 @@ class RecordingTargetLease:
         *,
         quarantine_error: LoggingError | None = None,
         order_log: list[str] | None = None,
+        on_exit: Callable[[], None] | None = None,
     ) -> None:
         self.released = False
         self.quarantine_reasons: list[str] = []
         self._quarantine_error = quarantine_error
         self._order_log = order_log
+        self._on_exit = on_exit
 
     def __enter__(self) -> Self:
         return self
@@ -307,6 +346,8 @@ class RecordingTargetLease:
     def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
         if self._order_log is not None:
             self._order_log.append("lease_release")
+        if self._on_exit is not None:
+            self._on_exit()
         self.released = True
 
     def quarantine(self, reason: str) -> None:
@@ -3224,11 +3265,149 @@ def test_finalize_run_approves_after_a_clean_reviewer_approval_in_the_correct_or
 
     # The postflight probe, the final persist, and the lease release happen
     # strictly after every pipeline-owned call, and in exactly that order.
-    assert order_log[-3:] == [
+    assert order_log[-4:] == [
         "git_check:postflight",
-        "persist:FINISHED",
+        "stage_final:FINISHED",
         "lease_release",
+        "commit_final",
     ]
+    assert run_store.commit_calls == 1
+    assert len(run_store.committed_records) == 1
+    assert lease.released is True
+
+
+def test_issue_129_cancellation_during_final_stage_commits_one_failed_record(
+    tmp_path: Path,
+) -> None:
+    """Cancellation during terminal staging changes the unpublished candidate."""
+
+    workspace, target = _workspace_and_target(tmp_path)
+    git_baseline = _git_state(target_root=target.root, fingerprint="fp-0")
+    cancelled = False
+
+    def _cancel_during_stage() -> None:
+        nonlocal cancelled
+        cancelled = True
+
+    checks = _happy_path_git_checks(target.root)
+    checks.append(
+        _git_check(
+            target_root=target.root,
+            sequence=6,
+            purpose="postflight",
+            state=_git_state(target_root=target.root, fingerprint="fp-9"),
+        )
+    )
+    git_safety = SequencedGitSafetyPort(checks)
+    run_store = SequencedRunStorePort(on_stage_final=_cancel_during_stage)
+    lease = RecordingTargetLease()
+
+    orchestrator, pipeline_result = _run_happy_path(
+        workspace=workspace,
+        target=target,
+        git_baseline=git_baseline,
+        git_safety=git_safety,
+        run_store=run_store,
+    )
+
+    issue_result = finalize_run(
+        record=orchestrator.record,
+        target=target,
+        trigger_outcome=_trigger_outcome(pipeline_result),
+        review_status=_last_review_status(pipeline_result),
+        interrupted=False,
+        termination_confirmed=True,
+        git_safety=git_safety,
+        run_store=run_store,
+        lease=lease,
+        clock=SteppingClock(),
+        max_review_cycles=MAX_REVIEW_CYCLES,
+        late_cancellation_check=lambda: cancelled,
+        seal_cancellation=lambda: cancelled,
+    )
+
+    assert len(run_store.stage_calls) == 2
+    assert run_store.commit_calls == 1
+    assert len(run_store.committed_records) == 1
+    committed = run_store.committed_records[0]
+    assert committed.final_status is FinalStatus.FAILED
+    assert committed.terminal_outcome is RunOutcome.INTERRUPTED
+    assert committed.expected_exit_code == 20
+    assert issue_result.final_status is committed.final_status
+    assert issue_result.trigger_outcome is committed.terminal_outcome
+    assert issue_result.expected_exit_code == committed.expected_exit_code
+    assert lease.released is True
+
+
+def test_issue_129_cancellation_during_lease_release_is_committed_as_failed(
+    tmp_path: Path,
+) -> None:
+    """Cancellation injected inside lease release is observed before commit."""
+
+    workspace, target = _workspace_and_target(tmp_path)
+    git_baseline = _git_state(target_root=target.root, fingerprint="fp-0")
+    cancelled = False
+
+    def _cancel_during_release() -> None:
+        nonlocal cancelled
+        cancelled = True
+
+    checks = _happy_path_git_checks(target.root)
+    checks.append(
+        _git_check(
+            target_root=target.root,
+            sequence=6,
+            purpose="postflight",
+            state=_git_state(target_root=target.root, fingerprint="fp-9"),
+        )
+    )
+    order_log: list[str] = []
+    git_safety = SequencedGitSafetyPort(checks, order_log=order_log)
+    run_store = SequencedRunStorePort(order_log=order_log)
+    lease = RecordingTargetLease(
+        order_log=order_log,
+        on_exit=_cancel_during_release,
+    )
+
+    orchestrator, pipeline_result = _run_happy_path(
+        workspace=workspace,
+        target=target,
+        git_baseline=git_baseline,
+        git_safety=git_safety,
+        run_store=run_store,
+    )
+
+    issue_result = finalize_run(
+        record=orchestrator.record,
+        target=target,
+        trigger_outcome=_trigger_outcome(pipeline_result),
+        review_status=_last_review_status(pipeline_result),
+        interrupted=False,
+        termination_confirmed=True,
+        git_safety=git_safety,
+        run_store=run_store,
+        lease=lease,
+        clock=SteppingClock(),
+        max_review_cycles=MAX_REVIEW_CYCLES,
+        late_cancellation_check=lambda: cancelled,
+        seal_cancellation=lambda: cancelled,
+    )
+
+    assert order_log[-4:] == [
+        "stage_final:FINISHED",
+        "lease_release",
+        "stage_final:FINISHED",
+        "commit_final",
+    ]
+    assert run_store.commit_calls == 1
+    assert len(run_store.committed_records) == 1
+    committed = run_store.committed_records[0]
+    assert committed.final_status is FinalStatus.FAILED
+    assert committed.terminal_outcome is RunOutcome.INTERRUPTED
+    assert committed.expected_exit_code == 20
+    assert issue_result.final_status is committed.final_status
+    assert issue_result.trigger_outcome is committed.terminal_outcome
+    assert issue_result.expected_exit_code == committed.expected_exit_code
     assert lease.released is True
 
 

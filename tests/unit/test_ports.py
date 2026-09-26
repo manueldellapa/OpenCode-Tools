@@ -349,6 +349,9 @@ class RecordingRunStorePort:
         self.initialize_calls: list[tuple[Workspace, str]] = []
         self.sink_calls: list[tuple[AgentRole, int | None, int]] = []
         self.persisted: list[RunRecord] = []
+        self.staged: list[RunRecord] = []
+        self.committed = 0
+        self.aborted = 0
 
     def initialize(self, workspace: Workspace, run_id: str) -> Path:
         self.initialize_calls.append((workspace, run_id))
@@ -366,6 +369,17 @@ class RecordingRunStorePort:
     def persist(self, record: RunRecord) -> PersistenceStatus:
         self.persisted.append(record)
         return self._persistence
+
+    def stage_final(self, record: RunRecord) -> PersistenceStatus:
+        self.staged.append(record)
+        return self._persistence
+
+    def commit_final(self) -> PersistenceStatus:
+        self.committed += 1
+        return self._persistence
+
+    def abort_final(self) -> None:
+        self.aborted += 1
 
 
 class FakeTargetLease:
@@ -566,13 +580,21 @@ def test_run_store_port_initializes_opens_sinks_and_persists_records() -> None:
     path = store.initialize(workspace, "run-001")
     sink = store.open_attempt_sink(AgentRole.ARCHITECT, None, 1)
     status = store.persist(record)
+    staged_status = store.stage_final(record)
+    committed_status = store.commit_final()
+    store.abort_final()
 
     assert path == artifact_root
     assert isinstance(sink, RecordingAttemptLogSink)
     assert status is PersistenceStatus.OK
+    assert staged_status is PersistenceStatus.OK
+    assert committed_status is PersistenceStatus.OK
     assert fake.initialize_calls == [(workspace, "run-001")]
     assert fake.sink_calls == [(AgentRole.ARCHITECT, None, 1)]
     assert fake.persisted == [record]
+    assert fake.staged == [record]
+    assert fake.committed == 1
+    assert fake.aborted == 1
 
 
 def test_target_lease_factory_port_acquires_a_context_managed_lease() -> None:
