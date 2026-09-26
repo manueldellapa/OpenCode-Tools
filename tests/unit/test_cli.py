@@ -7,8 +7,11 @@ from __future__ import annotations
 
 import hashlib
 import os
+import signal
 import subprocess
 import sys
+import threading
+import time
 import tomllib
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -22,6 +25,7 @@ from opencode_tools.cli import (
     _render_issue_result,
     _render_pre_init_failure,
     _render_preinit_interrupted,
+    _SystemSleeper,
     _TeeSink,
     build_parser,
     main,
@@ -845,6 +849,164 @@ def test_a_full_bootstrap_binds_the_issue_locator_and_runs_the_pipeline(
     assert lease.released is True
 
 
+def test_the_cancellation_handler_stays_installed_through_finalize_run(
+    tmp_path: Path,
+) -> None:
+    """Issue #111 follow-up: on the ordinary success path (`run_issue_
+    pipeline` returns without raising), `run_composed_pipeline` used to
+    restore the previous SIGINT/SIGTERM handler in a `finally` attached
+    only to the `try`/`except` around `run_issue_pipeline`, *before* the
+    trailing `finalize_run` call that follows it -- reopening the exact
+    post-bootstrap idle window the original fix closed. A SIGINT arriving
+    during `finalize_run`'s own work (here: its postflight Git probe) would
+    otherwise unwind as a raw `KeyboardInterrupt` past this function, caught
+    only by `main`'s pre-init handler, even though the run had already
+    finished. This sends a real SIGINT from inside a `GitSafetyPort.check`
+    fake exactly when it is called for the `postflight` purpose -- i.e.
+    strictly after `run_issue_pipeline` has already returned -- and asserts
+    two things: `run_composed_pipeline` still returns a normal `IssueResult`
+    instead of letting the signal escape, *and* the cancellation is actually
+    recorded (`RunOutcome.INTERRUPTED`, exit code 20) rather than merely
+    swallowed -- `finalize_run`'s own `late_cancellation_check` is what
+    lets a signal arriving during its postflight probe still upgrade the
+    `interrupted` decision it makes, instead of being silently absorbed
+    once this handler stopped it from crashing the process outright."""
+
+    workspace, target = _workspace_and_target(tmp_path)
+    runtime_root = tmp_path / "runtime"
+    app_config = _app_config(runtime_root=runtime_root)
+    run_request = RunRequest(
+        issue_number=42, workspace=workspace, target_root=workspace.root
+    )
+
+    class _SigintDuringPostflight(_FakeGitSafety):
+        def check(
+            self,
+            target: TargetRepository,
+            *,
+            sequence: int,
+            purpose: str,
+            role: object | None = None,
+            baseline: GitState | None = None,
+        ) -> GitCheckRecord:
+            if purpose == "postflight":
+                os.kill(os.getpid(), signal.SIGINT)
+            return super().check(
+                target,
+                sequence=sequence,
+                purpose=purpose,
+                role=role,
+                baseline=baseline,
+            )
+
+    git_safety = _SigintDuringPostflight(target=target)
+    lease = _FakeLease()
+    lease_factory = _FakeLeaseFactory(lease)
+    run_store = _FakeRunStore()
+    # The default `_FakeAgentRunner` reports the architect `AGENT_STATUS:
+    # FAILED`, so `run_issue_pipeline` returns normally (no exception) --
+    # exactly the success path whose `finalize_run` call is at issue here.
+    agent_runner = _FakeAgentRunner(workspace_root=workspace.root)
+
+    result = run_composed_pipeline(
+        run_request=run_request,
+        app_config=app_config,
+        run_id="20260915T090000.000000Z-abcdefabcdef",
+        process_runner=cast("ProcessRunner", None),
+        clock=_SteppingClock(),
+        sleeper=_RecordingSleeper(),
+        git_safety_port=cast("GitSafetyPort", git_safety),
+        issue_resolver=cast("IssueResolver", _FakeIssueResolver()),
+        run_store=cast("RunStorePort", run_store),
+        lease_factory=cast("TargetLeaseFactory", lease_factory),
+        opencode_preflight=cast("OpenCodePreflightPort", _FakeOpenCodePreflight()),
+        agent_runner=cast("AgentRunner", agent_runner),
+    )
+
+    assert "postflight" in git_safety.check_calls
+    assert isinstance(result, IssueResult)
+    assert result.final_status is FinalStatus.FAILED
+    assert result.trigger_outcome is RunOutcome.INTERRUPTED
+    assert result.expected_exit_code == 20
+    assert lease.released is True
+
+
+def test_a_cancellation_after_the_terminal_attempts_own_agent_process_is_still_honored(
+    tmp_path: Path,
+) -> None:
+    """Issue #111 follow-up: `_interrupted(pipeline_result)` only sees a
+    live child's own `INTERRUPTED` process outcome -- it has no way to
+    notice a cancellation requested *after* the terminal attempt's own
+    agent process already returned (e.g. during that same attempt's
+    after-attempt Git check, sink close, or `persist`), since `process.py`'s
+    own per-subprocess handler has already been restored by then and this
+    module's own persistent handler is the one active instead. Before this
+    fix, such a cancellation was recorded on `IssueOrchestrator.
+    cancellation_requested` but never consulted on the success path, so the
+    run still converged as `AGENT_REPORTED_FAILURE` instead of
+    `INTERRUPTED`. This sends a real SIGINT from inside a `GitSafetyPort.
+    check` fake exactly when it is called for the architect's own
+    after-attempt purpose -- strictly after the (default, `AGENT_STATUS:
+    FAILED`) architect attempt has already returned, well before
+    `finalize_run` is ever called -- and asserts the result is
+    `RunOutcome.INTERRUPTED`, not the architect's own reported failure."""
+
+    workspace, target = _workspace_and_target(tmp_path)
+    runtime_root = tmp_path / "runtime"
+    app_config = _app_config(runtime_root=runtime_root)
+    run_request = RunRequest(
+        issue_number=42, workspace=workspace, target_root=workspace.root
+    )
+
+    class _SigintAfterTheAgentProcessReturns(_FakeGitSafety):
+        def check(
+            self,
+            target: TargetRepository,
+            *,
+            sequence: int,
+            purpose: str,
+            role: object | None = None,
+            baseline: GitState | None = None,
+        ) -> GitCheckRecord:
+            if purpose.endswith(":after"):
+                os.kill(os.getpid(), signal.SIGINT)
+            return super().check(
+                target,
+                sequence=sequence,
+                purpose=purpose,
+                role=role,
+                baseline=baseline,
+            )
+
+    git_safety = _SigintAfterTheAgentProcessReturns(target=target)
+    lease = _FakeLease()
+    lease_factory = _FakeLeaseFactory(lease)
+    run_store = _FakeRunStore()
+    agent_runner = _FakeAgentRunner(workspace_root=workspace.root)
+
+    result = run_composed_pipeline(
+        run_request=run_request,
+        app_config=app_config,
+        run_id="20260915T090000.000000Z-abcdefabcdef",
+        process_runner=cast("ProcessRunner", None),
+        clock=_SteppingClock(),
+        sleeper=_RecordingSleeper(),
+        git_safety_port=cast("GitSafetyPort", git_safety),
+        issue_resolver=cast("IssueResolver", _FakeIssueResolver()),
+        run_store=cast("RunStorePort", run_store),
+        lease_factory=cast("TargetLeaseFactory", lease_factory),
+        opencode_preflight=cast("OpenCodePreflightPort", _FakeOpenCodePreflight()),
+        agent_runner=cast("AgentRunner", agent_runner),
+    )
+
+    assert any(call.endswith(":after") for call in git_safety.check_calls)
+    assert isinstance(result, IssueResult)
+    assert result.final_status is FinalStatus.FAILED
+    assert result.trigger_outcome is RunOutcome.INTERRUPTED
+    assert result.expected_exit_code == 20
+    assert lease.released is True
+
+
 def test_a_mid_pipeline_logging_error_still_converges_through_finalize_run(
     tmp_path: Path,
 ) -> None:
@@ -1076,6 +1238,158 @@ def test_an_observed_interruption_still_wins_over_an_unrelated_secondary_error(
     assert result.trigger_outcome is RunOutcome.INTERRUPTED
     assert result.final_status is FinalStatus.FAILED
     assert lease.released is True
+
+
+def test_system_sleeper_cuts_a_long_sleep_short_once_cancellation_is_requested() -> (
+    None
+):
+    """Issue #111 follow-up (Codex review on PR #128): a plain `time.sleep
+    (seconds)` keeps running for its own full *remaining* duration even
+    after this process's SIGINT/SIGTERM handler sets a cancellation flag
+    and returns without raising -- CPython retries an interrupted blocking
+    call with the recomputed timeout rather than abandoning it (PEP 475).
+    Delegating an entire backoff delay -- up to `ProviderRetryConfig.
+    max_delay_seconds`, 1800 seconds -- to one such call would mean a
+    SIGINT arriving early in that delay has no visible effect for up to
+    half an hour. `_SystemSleeper` must instead sleep in short polled
+    increments so `request_cancellation` (called from a background thread
+    here, standing in for the signal handler) can cut a 60-second sleep
+    short almost immediately."""
+
+    sleeper = _SystemSleeper()
+
+    def _cancel_shortly() -> None:
+        time.sleep(0.05)
+        sleeper.request_cancellation()
+
+    canceller = threading.Thread(target=_cancel_shortly, daemon=True)
+    started = time.monotonic()
+    canceller.start()
+    sleeper.sleep(60.0)
+    elapsed = time.monotonic() - started
+    canceller.join(timeout=2.0)
+
+    assert elapsed < 2.0
+
+
+def test_system_sleeper_still_sleeps_the_full_duration_absent_cancellation() -> None:
+    """The polled-increment implementation above must not shortchange an
+    uncancelled sleep -- `run_provider_attempts`' own documented contract
+    (System Design SS12.2) is that a retry's backoff is honored in full
+    when nothing interrupts it."""
+
+    sleeper = _SystemSleeper()
+
+    started = time.monotonic()
+    sleeper.sleep(0.3)
+    elapsed = time.monotonic() - started
+
+    assert elapsed >= 0.3
+
+
+def test_a_sigint_during_provider_retry_backoff_converges_through_finalize_run(
+    tmp_path: Path,
+) -> None:
+    """Issue #111: unlike the "durante" case above (a live child's own
+    `INTERRUPTED` process outcome), a SIGINT arriving during
+    `run_provider_attempts`' own backoff sleep -- strictly between two
+    provider attempts, with no subprocess alive at all -- used to reach
+    Python's default disposition unhandled: `process.py`'s per-subprocess
+    handler had already been torn down, and nothing else installed one, so
+    it surfaced as a raw `KeyboardInterrupt` past `run_composed_pipeline`
+    (which only catches `OpenCodeToolsError`) into `main`'s pre-init
+    `except KeyboardInterrupt` -- misreporting an already-initialized run
+    (`run.json` exists; the `IssueOrchestrator` is live) as having failed
+    before it could ever start.
+
+    `run_composed_pipeline` now installs a persistent SIGINT/SIGTERM
+    handler, once `bootstrap_run` hands back the `IssueOrchestrator`, whose
+    only job is `request_cancellation()`. This sends itself a real SIGINT
+    from inside the injected `Sleeper.sleep()` -- exactly where the backoff
+    delay would be spent -- to prove that *actual* handler is what is
+    installed and fires, not a simulated flag flip. The architect's own
+    retry attempt 2 is consequently never invoked: the next
+    `run_logical_invocation` raises `RunInterruptedError` immediately, which
+    the existing (#109) except-handler converges through the very same
+    `finalize_run` any other terminal path uses -- `RunOutcome.INTERRUPTED`,
+    exit code 20, and a released lease -- never `main`'s pre-init 130 path.
+    """
+
+    workspace, target = _workspace_and_target(tmp_path)
+    runtime_root = tmp_path / "runtime"
+    app_config = _app_config(runtime_root=runtime_root)
+    run_request = RunRequest(
+        issue_number=42, workspace=workspace, target_root=workspace.root
+    )
+
+    git_safety = _FakeGitSafety(target=target)
+    lease = _FakeLease()
+    lease_factory = _FakeLeaseFactory(lease)
+    run_store = _FakeRunStore()
+
+    # A trusted, budgeted, retryable `PROVIDER_ERROR` on attempt 1 -- the
+    # underlying process itself terminated cleanly (`SUCCEEDED`); only the
+    # provider diagnostic marks it retryable -- authorizes exactly one
+    # retry (System Design SS12.2), which is what schedules the backoff
+    # sleep this test's `Sleeper` fake hijacks.
+    diagnostic = ProviderDiagnostic(
+        source="opencode-stdout",
+        signature="rate_limited",
+        retryable=True,
+        status_code=429,
+    )
+    first_attempt = AgentResult(
+        role=AgentRole.ARCHITECT,
+        phase=PipelinePhase.ARCHITECT,
+        review_cycle=None,
+        provider_attempt=1,
+        process=_agent_process_result(
+            workspace_root=workspace.root, outcome=RunOutcome.SUCCEEDED
+        ),
+        terminal_response=None,
+        session_id="session-architect-1",
+        verified_agent="architect",
+        provider_diagnostic=diagnostic,
+        outcome=RunOutcome.PROVIDER_ERROR,
+    )
+    # A second element would mean the cancellation was *not* honored (the
+    # retried attempt 2 ran anyway); `_SequencedAgentRunner.run` popping
+    # from an exhausted list would itself fail the test loudly.
+    agent_runner = _SequencedAgentRunner([first_attempt])
+
+    class _SigintDuringBackoffSleep:
+        """Sends this process a real SIGINT instead of actually sleeping --
+        the same signal an operator's Ctrl-C would deliver mid-backoff."""
+
+        def sleep(self, seconds: float) -> None:
+            del seconds
+            os.kill(os.getpid(), signal.SIGINT)
+
+    result = run_composed_pipeline(
+        run_request=run_request,
+        app_config=app_config,
+        run_id="20260915T090000.000000Z-abcdefabcdef",
+        process_runner=cast("ProcessRunner", None),
+        clock=_SteppingClock(),
+        sleeper=_SigintDuringBackoffSleep(),
+        git_safety_port=cast("GitSafetyPort", git_safety),
+        issue_resolver=cast("IssueResolver", _FakeIssueResolver()),
+        run_store=cast("RunStorePort", run_store),
+        lease_factory=cast("TargetLeaseFactory", lease_factory),
+        opencode_preflight=cast("OpenCodePreflightPort", _FakeOpenCodePreflight()),
+        agent_runner=cast("AgentRunner", agent_runner),
+    )
+
+    assert [call[0] for call in agent_runner.calls] == [AgentRole.ARCHITECT]
+    assert isinstance(result, IssueResult)
+    assert result.trigger_outcome is RunOutcome.INTERRUPTED
+    assert result.expected_exit_code == 20
+    assert result.final_status is FinalStatus.FAILED
+    assert lease.released is True
+
+    final_record = run_store.persisted_records[-1]
+    assert final_record.errors[-1].outcome is RunOutcome.INTERRUPTED
+    assert final_record.errors[-1].phase is PipelinePhase.ARCHITECT
 
 
 def test_a_coder_persist_failure_is_tagged_with_the_coder_phase_not_the_architect(
@@ -2312,11 +2626,16 @@ def test_main_returns_130_on_a_sigint_before_the_run_could_be_initialized(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     """A `KeyboardInterrupt` reaching `main` can only ever originate before a
-    run directory exists -- once one exists, `process.py`'s own signal
-    handling (installed only around a live subprocess) turns a SIGINT into
-    `RunOutcome.INTERRUPTED` on the pipeline itself, never a raw Python
-    exception -- so `main` maps it to exit 130 with no `FINAL_STATUS`
-    promise, per FR-047 and System Design SS13.4."""
+    run directory exists: this one is raised by `runlog.check_platform_
+    baseline` itself, strictly before `run_composed_pipeline` -- and so
+    before `bootstrap_run` -- is ever even called, so no persistent
+    cancellation handler (issue #111) has been installed yet either. Once a
+    run directory exists, `run_composed_pipeline`'s own persistent SIGINT/
+    SIGTERM handler and `process.py`'s per-subprocess one between them turn
+    a SIGINT into `RunOutcome.INTERRUPTED` on the pipeline itself, never a
+    raw Python exception reaching this far -- so `main` maps *this*,
+    genuinely pre-init case to exit 130 with no `FINAL_STATUS` promise, per
+    FR-047 and System Design SS13.4."""
 
     from opencode_tools import runlog
 

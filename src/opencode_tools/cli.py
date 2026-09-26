@@ -38,12 +38,15 @@ from __future__ import annotations
 import argparse
 import hashlib
 import platform
+import signal
 import sys
+import threading
 import time
 from collections.abc import Mapping, Sequence
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
+from types import FrameType
 from typing import Protocol, cast, runtime_checkable
 
 from opencode_tools import (
@@ -213,11 +216,58 @@ class _SystemClock:
         return time.monotonic_ns()
 
 
+_SLEEPER_POLL_INTERVAL_SECONDS = 0.5
+
+
 class _SystemSleeper:
-    """The real `Sleeper`: an actual blocking `time.sleep`."""
+    """The real `Sleeper`: a blocking `time.sleep`, polled in short
+    increments rather than made in one call.
+
+    A single `time.sleep(seconds)` would keep running for its own full
+    *remaining* duration even after this process's SIGINT/SIGTERM handler
+    observes a signal and returns without raising: per PEP 475, CPython
+    retries an interrupted blocking call with the recomputed timeout rather
+    than abandoning it, so setting a cancellation flag alone never actually
+    shortens an in-progress `time.sleep`. Since `ProviderRetryConfig.
+    max_delay_seconds` can be configured up to 1800 seconds (System Design
+    SS12.2), a SIGINT arriving early in a long backoff delay would
+    otherwise take up to that long to have any visible effect (issue
+    #111). Sleeping in bounded `_SLEEPER_POLL_INTERVAL_SECONDS` chunks and
+    checking `request_cancellation`'s flag between each one instead caps
+    that latency at one poll interval, while still blocking for the full
+    requested `seconds` -- the exact planned backoff delay -- when no
+    cancellation ever arrives.
+    """
+
+    def __init__(self) -> None:
+        self._cancelled = threading.Event()
+
+    def request_cancellation(self) -> None:
+        """Cut any `sleep` call already in progress short (issue #111)."""
+
+        self._cancelled.set()
 
     def sleep(self, seconds: float) -> None:
-        time.sleep(seconds)
+        deadline = time.monotonic() + seconds
+        while not self._cancelled.is_set():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return
+            time.sleep(min(remaining, _SLEEPER_POLL_INTERVAL_SECONDS))
+
+
+@runtime_checkable
+class _AcceptsCancellationRequest(Protocol):
+    """A `Sleeper` (only `_SystemSleeper` in practice) that can cut a
+    `sleep` already in progress short, given a live cancellation request --
+    checked structurally so `run_composed_pipeline`'s signal handler can
+    forward the request to whichever concrete `Sleeper` it was actually
+    given without depending on `_SystemSleeper` by name, and without every
+    test fake (a `RecordingSleeper` that never really sleeps) needing to
+    implement a method it has no use for.
+    """
+
+    def request_cancellation(self) -> None: ...
 
 
 # --- GitSafetyPort: binds process/executable/clock/timeouts to the three
@@ -910,15 +960,50 @@ def run_composed_pipeline(
             "bootstrap_run must set orchestrator/issue_locator/record when error is None"
         )
 
+    orchestrator = outcome.orchestrator
     target = outcome.record.target
     if isinstance(agent_runner, _AcceptsIssueLocator):
         agent_runner.bind_issue_locator(outcome.issue_locator)
     if isinstance(agent_runner, _AcceptsTargetRepository):
         agent_runner.bind_target(target)
 
+    def _request_pipeline_cancellation(
+        signal_number: int, frame: FrameType | None
+    ) -> None:
+        del signal_number, frame
+        orchestrator.request_cancellation()
+        # A plain `time.sleep` already in progress (`run_provider_attempts`'
+        # own backoff delay) would otherwise keep running for its own full
+        # remaining duration regardless -- up to `ProviderRetryConfig.
+        # max_delay_seconds`, 1800s -- since setting `cancellation_
+        # requested` above has no effect on a blocking call already under
+        # way. `sleeper` is only ever `_SystemSleeper` in production; a
+        # test fake with no use for this simply does not implement it.
+        if isinstance(sleeper, _AcceptsCancellationRequest):
+            sleeper.request_cancellation()
+
+    # A SIGINT/SIGTERM arriving anywhere in `run_issue_pipeline` -- most
+    # notably during `run_provider_attempts`' own backoff sleep between
+    # provider retries, but equally any other idle window between one
+    # logical invocation and the next -- must not unwind as a raw Python
+    # `KeyboardInterrupt`/default `SIGTERM` disposition (System Design
+    # SH-001): `run.json` already exists by this point (`bootstrap_run`
+    # returned), so that would be misreported by `main`'s own pre-init
+    # handlers exactly like issue #111 describes. Installing this handler
+    # here, once `orchestrator` exists, makes it the "previous" handler
+    # `SubprocessRunner.run` itself saves and restores around each child
+    # call (`process.py`), so the two compose without any change there:
+    # during a live child, `process.py`'s own escalation still applies;
+    # between children, this handler simply records the request so the
+    # next `run_logical_invocation` raises `RunInterruptedError` (or, if a
+    # retry's backoff sleep is what is interrupted, so that its next
+    # attempt does) instead of a bare `KeyboardInterrupt` ever reaching
+    # `main`.
+    previous_sigint = signal.signal(signal.SIGINT, _request_pipeline_cancellation)
+    previous_sigterm = signal.signal(signal.SIGTERM, _request_pipeline_cancellation)
     try:
         pipeline_result = run_issue_pipeline(
-            orchestrator=outcome.orchestrator,
+            orchestrator=orchestrator,
             issue_locator=outcome.issue_locator,
             workspace=run_request.workspace,
             target=target,
@@ -981,7 +1066,7 @@ def run_composed_pipeline(
                 else last_record.artifact_incomplete
             ),
         )
-        return finalize_run(
+        result = finalize_run(
             record=record_with_error,
             target=target,
             trigger_outcome=error.outcome,
@@ -1016,21 +1101,54 @@ def run_composed_pipeline(
             # would compare postflight against a checkpoint one attempt too
             # old, falsely reporting an authorized Git delta as `UNSAFE`.
             last_accepted_git_state=outcome.orchestrator.last_accepted_git_state,
+            # A SIGINT/SIGTERM can still arrive during *this* `finalize_run`
+            # call's own postflight probe, after `interrupted` above was
+            # already decided -- `late_cancellation_check` lets it upgrade
+            # that decision instead of being silently absorbed (issue #111).
+            late_cancellation_check=lambda: orchestrator.cancellation_requested,
         )
+    else:
+        result = finalize_run(
+            record=outcome.orchestrator.record,
+            target=target,
+            trigger_outcome=_trigger_outcome(pipeline_result),
+            review_status=_last_review_status(pipeline_result),
+            # `_interrupted(pipeline_result)` alone only sees a live child's
+            # own `INTERRUPTED` process outcome -- it misses a cancellation
+            # requested *after* the terminal attempt's own agent process
+            # already returned (e.g. during that attempt's after-attempt
+            # Git check, sink close, or `persist`, all of which run past
+            # `process.py`'s own per-subprocess handler, with this
+            # function's own handler active instead); `cancellation_
+            # requested` still reflects that fact (issue #111).
+            interrupted=(
+                _interrupted(pipeline_result) or orchestrator.cancellation_requested
+            ),
+            termination_confirmed=_termination_confirmed(pipeline_result),
+            git_safety=git_safety_port,
+            run_store=run_store,
+            lease=outcome.lease,
+            clock=clock,
+            max_review_cycles=app_config.execution.max_review_cycles,
+            # See the except-branch call above: a SIGINT/SIGTERM can still
+            # arrive during this `finalize_run` call's own postflight probe.
+            late_cancellation_check=lambda: orchestrator.cancellation_requested,
+        )
+    finally:
+        # Kept installed through *both* branches' own `finalize_run` call
+        # above, not just `run_issue_pipeline` -- `finalize_run` still does
+        # real, non-instant work afterward (a postflight Git probe,
+        # persisting the terminal record, releasing/quarantining the
+        # lease), and restoring the handler any earlier would reopen the
+        # exact post-bootstrap idle window issue #111 closed: a SIGINT
+        # there would again unwind as a raw `KeyboardInterrupt` past this
+        # function, misreported by `main`'s pre-init handler even though
+        # the run is fully finalized. Only once this function is entirely
+        # done with `orchestrator` is the previous handler restored.
+        signal.signal(signal.SIGINT, previous_sigint)
+        signal.signal(signal.SIGTERM, previous_sigterm)
 
-    return finalize_run(
-        record=outcome.orchestrator.record,
-        target=target,
-        trigger_outcome=_trigger_outcome(pipeline_result),
-        review_status=_last_review_status(pipeline_result),
-        interrupted=_interrupted(pipeline_result),
-        termination_confirmed=_termination_confirmed(pipeline_result),
-        git_safety=git_safety_port,
-        run_store=run_store,
-        lease=outcome.lease,
-        clock=clock,
-        max_review_cycles=app_config.execution.max_review_cycles,
-    )
+    return result
 
 
 def _flatten_error_causes(

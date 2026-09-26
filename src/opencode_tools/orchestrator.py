@@ -170,7 +170,7 @@ The `cli.py` composition root -- parsing argv, sequencing `bootstrap_run` /
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 from enum import StrEnum
@@ -1681,6 +1681,7 @@ def finalize_run(
     clock: Clock,
     max_review_cycles: int,
     last_accepted_git_state: GitState | None = None,
+    late_cancellation_check: Callable[[], bool] | None = None,
 ) -> IssueResult:
     """Converge one terminal path into postflight and finalization (M13-04).
 
@@ -1744,6 +1745,19 @@ def finalize_run(
     (`bootstrap_run`'s own late-stage failures, before any orchestrator
     exists, and every existing caller unaffected by this) reconstructs it
     from `record` exactly as before.
+
+    `late_cancellation_check`, when given, is called exactly once, right
+    before the terminal outcome is resolved -- i.e. after the postflight
+    Git probe above, the slowest and only externally-observable step this
+    function takes. A caller with a live `IssueOrchestrator` (again, every
+    `run_composed_pipeline` path) should pass its own `cancellation_
+    requested` reader here: `interrupted` alone is whatever the caller
+    already knew *before* calling this function, but a SIGINT/SIGTERM can
+    still arrive during this function's own postflight probe (issue #111).
+    A `True` result upgrades `interrupted` for the rest of this call,
+    exactly as if the caller had observed it in time. Left `None`
+    (`bootstrap_run`'s own late-stage failures, before any orchestrator
+    exists) skips the check entirely, preserving existing behavior.
     """
 
     if type(record) is not RunRecord:
@@ -1795,6 +1809,13 @@ def finalize_run(
                     first_sequence=(errors[-1].sequence + 1 if errors else 0),
                 ),
             )
+
+    # A SIGINT/SIGTERM arriving during the postflight probe above -- the
+    # one externally-observable step this function takes -- would otherwise
+    # be silently absorbed: `interrupted` above is only what the caller
+    # already knew before calling this function (issue #111).
+    if late_cancellation_check is not None and late_cancellation_check():
+        interrupted = True
 
     terminal_precedence = resolve_terminal_outcome(
         trigger_outcome=trigger_outcome,
