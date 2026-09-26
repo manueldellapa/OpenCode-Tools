@@ -552,6 +552,8 @@ def persist_run_record(record: RunRecord) -> None:
 
     temp_path = prepare_run_record(record)
     commit_prepared_run_record(record, temp_path)
+
+
 def _format_timestamp(value: datetime) -> str:
     if not isinstance(value, datetime):
         raise TypeError("timestamp must be a datetime")
