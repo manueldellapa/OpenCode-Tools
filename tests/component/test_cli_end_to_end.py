@@ -18,6 +18,7 @@ produces, on both the happy and the failure path.
 
 from __future__ import annotations
 
+import base64
 import json
 import os
 import subprocess
@@ -179,6 +180,36 @@ def test_architect_reported_failure_writes_a_failed_run_via_real_git_and_faked_g
     # Exactly one logical invocation (the architect) ran -- never a coder.
     assert len(record["attempts"]) == 1
     assert record["attempts"][0]["role"] == "ARCHITECT"
+
+    # Issue #117 regression: the production `_CliAgentRunner` must wrap the
+    # real process execution with the runner-channel records that
+    # `AttemptLogFileSink` already supports.
+    process = record["attempts"][0]["agent_result"]["process"]
+    attempt_log_path = run_json_paths[0].parent / process["log_path"]
+    attempt_log_records = [
+        json.loads(line)
+        for line in attempt_log_path.read_text(encoding="utf-8").splitlines()
+    ]
+    assert attempt_log_records[0]["channel"] == "runner"
+    assert attempt_log_records[-1]["channel"] == "runner"
+
+    runner_events = [
+        json.loads(base64.b64decode(log_record["payload_base64"]))
+        for log_record in attempt_log_records
+        if log_record["channel"] == "runner"
+    ]
+    assert runner_events == [
+        {
+            "event": "header",
+            "command": [*process["command"], "<PROMPT_REDACTED>"],
+            "cwd": process["cwd"],
+        },
+        {
+            "event": "footer",
+            "outcome": process["outcome"],
+            "duration_ns": process["duration_ns"],
+        },
+    ]
 
     # `opencode` only ever saw `run --agent architect ...` and the matching
     # `export ... --sanitize`; never `--auto`, `--share`, or `--model`.

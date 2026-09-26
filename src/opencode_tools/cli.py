@@ -766,9 +766,22 @@ class _CliAgentRunner:
             capture = opencode_adapter.open_run_capture_sink(
                 f"{role.value.lower()}-{cycle_component}-{provider_attempt}-capture"
             )
+            if isinstance(sink, runlog.AttemptLogFileSink):
+                sink.write_header(
+                    command=opencode_adapter.redact_command_for_display(spec),
+                    cwd=spec.cwd,
+                )
             process_result = self._process_runner.run(
                 spec, sink=_TeeSink(sink, capture)
             )
+            if (
+                isinstance(sink, runlog.AttemptLogFileSink)
+                and process_result.outcome is not RunOutcome.LOGGING_ERROR
+            ):
+                sink.write_footer(
+                    outcome=process_result.outcome,
+                    duration_ns=process_result.duration_ns,
+                )
 
             stdout_bytes = capture.bytes_for("stdout")
             stdout_text = _decode_utf8_lenient(stdout_bytes)
