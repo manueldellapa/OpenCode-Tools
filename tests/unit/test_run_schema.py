@@ -22,6 +22,7 @@ from typing import cast
 
 import pytest
 
+from opencode_tools.cli import _environment_snapshot
 from opencode_tools.config import sanitize_app_config
 from opencode_tools.domain import (
     AgentResult,
@@ -388,13 +389,16 @@ def test_serialize_run_record_preserves_multiple_ordered_errors() -> None:
     assert codes == ["git.branch_drift", "git.uncommitted_change"]
 
 
-def test_serialize_run_record_never_leaks_a_credential_or_full_environment() -> None:
+def test_serialize_run_record_never_leaks_a_credential_or_full_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     secret = "ghp_run_schema_literal_secret_0123456789"
     credential_url = f"https://oauth2:{secret}@github.com/example/backend.git"
-    raw_environment = {
-        "GH_TOKEN": secret,
-        "OPENCODE_TOOLS_FULL_ENV_SENTINEL": "full-environment-value-118",
-    }
+    environment_sentinel_key = "OPENCODE_TOOLS_FULL_ENV_SENTINEL"
+    environment_sentinel_value = "full-environment-value-118"
+    monkeypatch.setenv("GH_TOKEN", secret)
+    monkeypatch.setenv(environment_sentinel_key, environment_sentinel_value)
+    environment_snapshot = _environment_snapshot()
 
     app_config = AppConfig(
         source=ConfigSource.DEFAULTS,
@@ -455,6 +459,7 @@ def test_serialize_run_record_never_leaks_a_credential_or_full_environment() -> 
     record = replace(
         _full_run_record(),
         config=cast(dict[str, FrozenJsonValue], sanitized),
+        environment=environment_snapshot,
         git_checks=(git_check,),
         attempts=(attempt,),
         errors=(error,),
@@ -463,9 +468,10 @@ def test_serialize_run_record_never_leaks_a_credential_or_full_environment() -> 
     payload = serialize_run_record(record)
     parsed = json.loads(payload)
 
+    assert "GH_TOKEN" not in parsed["environment"]
+    assert environment_sentinel_key not in parsed["environment"]
     assert secret.encode("utf-8") not in payload
-    for raw_environment_value in raw_environment.values():
-        assert raw_environment_value.encode("utf-8") not in payload
+    assert environment_sentinel_value.encode("utf-8") not in payload
 
     expected_redacted_url = "https://REDACTED@github.com/example/backend.git"
     assert (
