@@ -14,7 +14,7 @@ Due run conformi sullo stesso checkout renderebbero impossibile attribuire i cam
 SH-002 è promosso nel baseline v0.1. Ogni run acquisisce un lock advisory POSIX non bloccante per target canonico:
 
 - il lock vive sotto il Git directory del checkout, ad esempio `<git-dir>/opencode-tools/target.lock`;
-- usa `fcntl.flock(LOCK_EX | LOCK_NB)` e resta detenuto da prima della baseline fino a dopo la finalizzazione;
+- usa `fcntl.flock(LOCK_EX | LOCK_NB)` e resta detenuto da prima della baseline attraverso postflight, eventuale quarantine e preparazione durabile del candidato terminale; viene rilasciato soltanto quando ogni operazione target-sensitive è conclusa, prima del commit canonico runtime-only di `run.json`;
 - due checkout/worktree con Git directory distinte hanno lease distinti; target diversi possono procedere in parallelo;
 - directory, lock e metadata usano mode restrittivi; i metadata del nuovo holder sono scritti soltanto dopo l'acquisizione e sono diagnostici;
 - la presenza del file non equivale a un lock attivo e non viene applicata alcuna euristica stale basata su PID o tempo;
@@ -23,6 +23,8 @@ SH-002 è promosso nel baseline v0.1. Ogni run acquisisce un lock advisory POSIX
 Se il lease è già detenuto, il contender termina immediatamente con `PREFLIGHT_ERROR/TARGET_LOCKED`, non invoca agenti e mostra i metadata disponibili del holder. La recovery consiste nell'attendere il run attivo; il file non va cancellato come presunto stale.
 
 Se la terminazione di un process group non è confermata, prima di rilasciare il lease viene scritto atomicamente `<git-dir>/opencode-tools/quarantine-v1.json`. La quarantine blocca run successive anche senza lock attivo e non viene rimossa automaticamente. L'utente deve fermare eventuali processi, ispezionare Git e working tree e rimuoverla consapevolmente. Se la quarantine non può essere scritta, il final status resta `FAILED` e stderr avverte che l'esclusione futura non è garantita.
+
+La finalizzazione terminale è a due fasi. Mentre il lease è ancora detenuto, `stage_final` prepara e rende durabile un temp privato ma non modifica la `run.json` canonica. Dopo che postflight e quarantine hanno concluso ogni accesso al target, il lease viene rilasciato e la cancellazione viene osservata ancora una volta; un segnale accettato durante il rilascio aggiorna soltanto il candidato non pubblicato. `seal_cancellation` è quindi il punto di linearizzazione del ciclo di vita, seguito da un solo `commit_final` atomico. In questo modo non serve un secondo overwrite terminale e nessuna operazione target-sensitive avviene dopo il rilascio del lock.
 
 ## Conseguenze
 

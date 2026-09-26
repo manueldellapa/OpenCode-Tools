@@ -425,19 +425,17 @@ def write_private_file_atomically(path: Path, payload: bytes) -> None:
     """Atomically replace `path` with `payload` (System Design SS15.4;
     ADR-008; M10-03).
 
-    The same mechanism `persist_run_record` uses inline for `run.json`,
-    factored out so another artifact -- `locking.py`'s persistent
-    quarantine marker -- gets the identical atomicity and failure-cleanup
-    guarantee without duplicating it: a fresh, unpredictable, exclusive,
+    The same private-temp / flush / fsync / atomic-replace mechanism used
+    by the run-record prepare/commit primitives, factored out so another
+    artifact -- `locking.py`'s persistent quarantine marker -- gets the
+    identical atomicity and failure-cleanup guarantee without coupling its
+    error taxonomy to `RunRecord`: a fresh, unpredictable, exclusive,
     mode-`0600` temp file in the same directory (`open_private_exclusive`),
     `flush` and `fsync`, `os.replace()` onto `path`, then a best-effort
     directory `fsync`. A previously persisted file at `path` is left
     untouched on any failure -- only this call's own temp file is
     best-effort removed. Raises `OSError` unwrapped so each caller maps
-    it onto its own error taxonomy and code; `persist_run_record` keeps
-    its own inline sequence rather than calling this, to preserve its two
-    already-shipped, separately coded write-phase and replace-phase
-    failures unchanged.
+    it onto its own error taxonomy and code.
     """
 
     directory = path.parent

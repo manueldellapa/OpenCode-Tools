@@ -615,17 +615,18 @@ class IssueOrchestrator:
 
     @property
     def cancellation_requested(self) -> bool:
-        """Whether this run has ever been cancelled -- externally, via
-        `request_cancellation`, or because some already-observed
-        `AgentResult.process.outcome` was itself `INTERRUPTED` -- regardless
-        of whether that particular attempt's own `AttemptRecord` ever
-        reached `record`. A caller that only had `record` to fall back to
-        would lose an interruption already observed on an attempt whose own
-        `persist` (or a later operation in the same invocation, such as the
-        after-attempt Git check or the sink close) then raised a
-        *different* `OpenCodeToolsError` -- `error.outcome` alone would
-        then outrank `INTERRUPTED` in `resolve_terminal_outcome`'s
-        precedence, which is wrong: the cancellation was still real.
+        """Whether cancellation was accepted before this run's commit seal.
+
+        Before `seal_cancellation`, this covers both external
+        `request_cancellation` calls and an already-observed
+        `AgentResult.process.outcome == INTERRUPTED`, regardless of whether
+        that attempt's own `AttemptRecord` ever reached `record`. After the
+        seal, new external requests are intentionally outside this run's
+        lifecycle and cannot reopen its terminal decision (issue #129).
+        A caller that only had `record` to fall back to would otherwise
+        lose an interruption already observed on an attempt whose own
+        `persist` (or a later operation in the same invocation) raised a
+        different `OpenCodeToolsError`.
         """
 
         return self._cancellation_requested
@@ -664,15 +665,17 @@ class IssueOrchestrator:
     def request_cancellation(self) -> None:
         """Record an external cancellation request (System Design SH-001).
 
-        Idempotent. Every subsequent `run_logical_invocation` call then
-        raises `RunInterruptedError` immediately, before opening a sink (the
-        "prima"/idle case); a still-running attempt is unaffected by this
-        call alone (the "durante"/active case is instead driven by the
-        child's own `INTERRUPTED` process outcome), and any later attempt
-        that would otherwise authorize a provider retry has that retry
-        suppressed by `retry.decide_retry`'s own `cancellation_requested`
-        guard, so no backoff sleep is ever scheduled either (the
-        "nel sleep" case).
+        Idempotent while cancellation acceptance is open. Every subsequent
+        `run_logical_invocation` call then raises `RunInterruptedError`
+        immediately, before opening a sink (the "prima"/idle case); a
+        still-running attempt is unaffected by this call alone (the
+        "durante"/active case is instead driven by the child's own
+        `INTERRUPTED` process outcome), and any later attempt that would
+        otherwise authorize a provider retry has that retry suppressed by
+        `retry.decide_retry`'s own `cancellation_requested` guard, so no
+        backoff sleep is scheduled. Once `seal_cancellation` closes the
+        finalization boundary, later requests are deliberately ignored for
+        this already-committed lifecycle.
         """
 
         if not self._cancellation_sealed:
