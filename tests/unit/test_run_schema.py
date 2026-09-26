@@ -6,10 +6,10 @@ these tests instead cover `runlog.serialize_run_record()`, the function that
 turns a `RunRecord` into the exact on-disk `run.json` v1 bytes (System
 Design SS15.3): a golden fixture pinning the byte-for-byte format, stability
 across repeated calls, every canonical group surviving into the bytes,
-multiple ordered causes, RFC 3339 timestamps and `duration_ns`, and that a
-real sanitized `AppConfig` never leaks a credential or a full environment
-dump through it. Atomic replace and failure semantics are M08-03 and are not
-exercised here.
+multiple ordered causes, RFC 3339 timestamps and `duration_ns`, and that
+pre-sanitized config, process, Git-check, and error evidence never
+reintroduces a literal credential or a full environment dump. Atomic replace
+and failure semantics are M08-03 and are not exercised here.
 """
 
 from __future__ import annotations
@@ -50,6 +50,7 @@ from opencode_tools.domain import (
     Workspace,
     to_primitive,
 )
+from opencode_tools.process import sanitize_command
 from opencode_tools.runlog import persist_run_record, serialize_run_record
 
 WORKSPACE_ROOT = Path("/workspaces/opencode-tools")
@@ -388,6 +389,15 @@ def test_serialize_run_record_preserves_multiple_ordered_errors() -> None:
 
 
 def test_serialize_run_record_never_leaks_a_credential_or_full_environment() -> None:
+    secret = "ghp_run_schema_literal_secret_0123456789"
+    credential_url = (
+        f"https://oauth2:{secret}@github.com/example/backend.git"
+    )
+    raw_environment = {
+        "GH_TOKEN": secret,
+        "OPENCODE_TOOLS_FULL_ENV_SENTINEL": "full-environment-value-118",
+    }
+
     app_config = AppConfig(
         source=ConfigSource.DEFAULTS,
         execution=ExecutionConfig(
@@ -413,11 +423,63 @@ def test_serialize_run_record_never_leaks_a_credential_or_full_environment() -> 
         "github_targets",
     }
 
-    record = replace(
-        _minimal_run_record(),
-        config=cast(dict[str, FrozenJsonValue], sanitized),
+    sanitized_command = sanitize_command(
+        ("/usr/bin/git", "ls-remote", credential_url)
+    )
+    sanitized_detail = sanitize_command(
+        (f"remote probe failed for {credential_url}",)
+    )[0]
+
+    process_result = replace(
+        _process_result(log_path=Path("credential-bearing-command.log")),
+        command=sanitized_command,
+    )
+    git_check = replace(
+        _git_check(sequence=0, purpose="credential-regression"),
+        process_results=(process_result,),
     )
 
-    text = serialize_run_record(record).decode("utf-8").lower()
-    for forbidden in ("credential", "password", "secret", "api_key", "authorization"):
-        assert forbidden not in text
+    attempt = _attempt_record()
+    attempt = replace(
+        attempt,
+        agent_result=replace(
+            attempt.agent_result,
+            process=replace(
+                attempt.agent_result.process,
+                command=sanitized_command,
+            ),
+        ),
+    )
+
+    error = replace(
+        _error_record(sequence=4, code="git.remote_probe_failed"),
+        technical_detail=sanitized_detail,
+    )
+
+    record = replace(
+        _full_run_record(),
+        config=cast(dict[str, FrozenJsonValue], sanitized),
+        git_checks=(git_check,),
+        attempts=(attempt,),
+        errors=(error,),
+    )
+
+    payload = serialize_run_record(record)
+    parsed = json.loads(payload)
+
+    assert secret.encode("utf-8") not in payload
+    for raw_environment_value in raw_environment.values():
+        assert raw_environment_value.encode("utf-8") not in payload
+
+    expected_redacted_url = "https://REDACTED@github.com/example/backend.git"
+    assert (
+        parsed["git_checks"][0]["process_results"][0]["command"][-1]
+        == expected_redacted_url
+    )
+    assert (
+        parsed["attempts"][0]["agent_result"]["process"]["command"][-1]
+        == expected_redacted_url
+    )
+    assert parsed["errors"][0]["technical_detail"] == (
+        f"remote probe failed for {expected_redacted_url}"
+    )
