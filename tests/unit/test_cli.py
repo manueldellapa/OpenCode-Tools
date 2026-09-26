@@ -1933,7 +1933,9 @@ def test_coder_promotion_failure_diagnostic_precedes_runner_footer(
         if record["channel"] == "stderr"
     ]
     assert any(
-        payload.startswith(b"coder sandbox promotion blocked: simulated promotion failure")
+        payload.startswith(
+            b"coder sandbox promotion blocked: simulated promotion failure"
+        )
         for payload in stderr_payloads
     )
 
