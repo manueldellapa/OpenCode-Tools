@@ -399,6 +399,8 @@ class _CliRunStore:
         self._clock = clock
         self._run_directory: Path | None = None
         self._last_record: RunRecord | None = None
+        self._staged_final_record: RunRecord | None = None
+        self._staged_final_path: Path | None = None
 
     @property
     def last_record(self) -> RunRecord | None:
@@ -428,6 +430,49 @@ class _CliRunStore:
         except LoggingError:
             return PersistenceStatus.FAILED
         return PersistenceStatus.OK
+
+    def stage_final(self, record: RunRecord) -> PersistenceStatus:
+        """Prepare, but do not publish, the terminal record (issue #129)."""
+
+        try:
+            staged_path = runlog.prepare_run_record(record)
+        except LoggingError:
+            return PersistenceStatus.FAILED
+
+        previous_path = self._staged_final_path
+        self._staged_final_record = record
+        self._staged_final_path = staged_path
+        if previous_path is not None:
+            runlog.discard_prepared_run_record(previous_path)
+        return PersistenceStatus.OK
+
+    def commit_final(self) -> PersistenceStatus:
+        """Publish the staged terminal record with one canonical replace."""
+
+        record = self._staged_final_record
+        staged_path = self._staged_final_path
+        if record is None or staged_path is None:
+            raise AssertionError("stage_final must succeed before commit_final")
+
+        try:
+            runlog.commit_prepared_run_record(record, staged_path)
+        except LoggingError:
+            self._staged_final_record = None
+            self._staged_final_path = None
+            return PersistenceStatus.FAILED
+
+        self._last_record = record
+        self._staged_final_record = None
+        self._staged_final_path = None
+        return PersistenceStatus.OK
+
+    def abort_final(self) -> None:
+        """Discard an unpublished terminal candidate, idempotently."""
+
+        if self._staged_final_path is not None:
+            runlog.discard_prepared_run_record(self._staged_final_path)
+        self._staged_final_record = None
+        self._staged_final_path = None
 
 
 # --- OpenCodePreflightPort: caches the digest so a caller that also wants
@@ -1106,6 +1151,7 @@ def run_composed_pipeline(
             # already decided -- `late_cancellation_check` lets it upgrade
             # that decision instead of being silently absorbed (issue #111).
             late_cancellation_check=lambda: orchestrator.cancellation_requested,
+            seal_cancellation=orchestrator.seal_cancellation,
         )
     else:
         result = finalize_run(
@@ -1133,6 +1179,7 @@ def run_composed_pipeline(
             # See the except-branch call above: a SIGINT/SIGTERM can still
             # arrive during this `finalize_run` call's own postflight probe.
             late_cancellation_check=lambda: orchestrator.cancellation_requested,
+            seal_cancellation=orchestrator.seal_cancellation,
         )
     finally:
         # Kept installed through *both* branches' own `finalize_run` call

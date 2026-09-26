@@ -239,6 +239,29 @@ class RunStorePort(Protocol):
         """Atomically replace `run.json` with `record` and report the result."""
         ...
 
+    def stage_final(self, record: RunRecord) -> PersistenceStatus:
+        """Durably prepare a terminal `RunRecord` without publishing it.
+
+        The staged candidate is not the canonical `run.json` and may be
+        replaced by a newer terminal candidate before `commit_final`.
+        This is the cancellation-aware prepare half of issue #129's
+        finalization boundary.
+        """
+        ...
+
+    def commit_final(self) -> PersistenceStatus:
+        """Publish the most recently staged terminal record exactly once.
+
+        After the finalization cancellation boundary has been sealed, this
+        atomically replaces canonical `run.json`. A failed commit leaves
+        the previously durable `run.json` untouched.
+        """
+        ...
+
+    def abort_final(self) -> None:
+        """Best-effort discard of an uncommitted staged terminal record."""
+        ...
+
 
 class TargetLease(Protocol):
     """A held, non-blocking lock on one canonical target, released on exit.
