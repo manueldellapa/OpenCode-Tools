@@ -856,13 +856,18 @@ def test_the_cancellation_handler_stays_installed_through_finalize_run(
     trailing `finalize_run` call that follows it -- reopening the exact
     post-bootstrap idle window the original fix closed. A SIGINT arriving
     during `finalize_run`'s own work (here: its postflight Git probe) would
-    again unwind as a raw `KeyboardInterrupt` past this function, caught
+    otherwise unwind as a raw `KeyboardInterrupt` past this function, caught
     only by `main`'s pre-init handler, even though the run had already
     finished. This sends a real SIGINT from inside a `GitSafetyPort.check`
     fake exactly when it is called for the `postflight` purpose -- i.e.
-    strictly after `run_issue_pipeline` has already returned -- and
-    asserts `run_composed_pipeline` still returns a normal `IssueResult`
-    instead of letting the signal escape."""
+    strictly after `run_issue_pipeline` has already returned -- and asserts
+    two things: `run_composed_pipeline` still returns a normal `IssueResult`
+    instead of letting the signal escape, *and* the cancellation is actually
+    recorded (`RunOutcome.INTERRUPTED`, exit code 20) rather than merely
+    swallowed -- `finalize_run`'s own `late_cancellation_check` is what
+    lets a signal arriving during its postflight probe still upgrade the
+    `interrupted` decision it makes, instead of being silently absorbed
+    once this handler stopped it from crashing the process outright."""
 
     workspace, target = _workspace_and_target(tmp_path)
     runtime_root = tmp_path / "runtime"
@@ -918,7 +923,84 @@ def test_the_cancellation_handler_stays_installed_through_finalize_run(
     assert "postflight" in git_safety.check_calls
     assert isinstance(result, IssueResult)
     assert result.final_status is FinalStatus.FAILED
-    assert result.trigger_outcome is RunOutcome.AGENT_REPORTED_FAILURE
+    assert result.trigger_outcome is RunOutcome.INTERRUPTED
+    assert result.expected_exit_code == 20
+    assert lease.released is True
+
+
+def test_a_cancellation_after_the_terminal_attempts_own_agent_process_is_still_honored(
+    tmp_path: Path,
+) -> None:
+    """Issue #111 follow-up: `_interrupted(pipeline_result)` only sees a
+    live child's own `INTERRUPTED` process outcome -- it has no way to
+    notice a cancellation requested *after* the terminal attempt's own
+    agent process already returned (e.g. during that same attempt's
+    after-attempt Git check, sink close, or `persist`), since `process.py`'s
+    own per-subprocess handler has already been restored by then and this
+    module's own persistent handler is the one active instead. Before this
+    fix, such a cancellation was recorded on `IssueOrchestrator.
+    cancellation_requested` but never consulted on the success path, so the
+    run still converged as `AGENT_REPORTED_FAILURE` instead of
+    `INTERRUPTED`. This sends a real SIGINT from inside a `GitSafetyPort.
+    check` fake exactly when it is called for the architect's own
+    after-attempt purpose -- strictly after the (default, `AGENT_STATUS:
+    FAILED`) architect attempt has already returned, well before
+    `finalize_run` is ever called -- and asserts the result is
+    `RunOutcome.INTERRUPTED`, not the architect's own reported failure."""
+
+    workspace, target = _workspace_and_target(tmp_path)
+    runtime_root = tmp_path / "runtime"
+    app_config = _app_config(runtime_root=runtime_root)
+    run_request = RunRequest(
+        issue_number=42, workspace=workspace, target_root=workspace.root
+    )
+
+    class _SigintAfterTheAgentProcessReturns(_FakeGitSafety):
+        def check(
+            self,
+            target: TargetRepository,
+            *,
+            sequence: int,
+            purpose: str,
+            role: object | None = None,
+            baseline: GitState | None = None,
+        ) -> GitCheckRecord:
+            if purpose.endswith(":after"):
+                os.kill(os.getpid(), signal.SIGINT)
+            return super().check(
+                target,
+                sequence=sequence,
+                purpose=purpose,
+                role=role,
+                baseline=baseline,
+            )
+
+    git_safety = _SigintAfterTheAgentProcessReturns(target=target)
+    lease = _FakeLease()
+    lease_factory = _FakeLeaseFactory(lease)
+    run_store = _FakeRunStore()
+    agent_runner = _FakeAgentRunner(workspace_root=workspace.root)
+
+    result = run_composed_pipeline(
+        run_request=run_request,
+        app_config=app_config,
+        run_id="20260915T090000.000000Z-abcdefabcdef",
+        process_runner=cast("ProcessRunner", None),
+        clock=_SteppingClock(),
+        sleeper=_RecordingSleeper(),
+        git_safety_port=cast("GitSafetyPort", git_safety),
+        issue_resolver=cast("IssueResolver", _FakeIssueResolver()),
+        run_store=cast("RunStorePort", run_store),
+        lease_factory=cast("TargetLeaseFactory", lease_factory),
+        opencode_preflight=cast("OpenCodePreflightPort", _FakeOpenCodePreflight()),
+        agent_runner=cast("AgentRunner", agent_runner),
+    )
+
+    assert any(call.endswith(":after") for call in git_safety.check_calls)
+    assert isinstance(result, IssueResult)
+    assert result.final_status is FinalStatus.FAILED
+    assert result.trigger_outcome is RunOutcome.INTERRUPTED
+    assert result.expected_exit_code == 20
     assert lease.released is True
 
 

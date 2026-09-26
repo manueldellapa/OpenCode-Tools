@@ -1044,6 +1044,11 @@ def run_composed_pipeline(
             # would compare postflight against a checkpoint one attempt too
             # old, falsely reporting an authorized Git delta as `UNSAFE`.
             last_accepted_git_state=outcome.orchestrator.last_accepted_git_state,
+            # A SIGINT/SIGTERM can still arrive during *this* `finalize_run`
+            # call's own postflight probe, after `interrupted` above was
+            # already decided -- `late_cancellation_check` lets it upgrade
+            # that decision instead of being silently absorbed (issue #111).
+            late_cancellation_check=lambda: orchestrator.cancellation_requested,
         )
     else:
         result = finalize_run(
@@ -1051,13 +1056,26 @@ def run_composed_pipeline(
             target=target,
             trigger_outcome=_trigger_outcome(pipeline_result),
             review_status=_last_review_status(pipeline_result),
-            interrupted=_interrupted(pipeline_result),
+            # `_interrupted(pipeline_result)` alone only sees a live child's
+            # own `INTERRUPTED` process outcome -- it misses a cancellation
+            # requested *after* the terminal attempt's own agent process
+            # already returned (e.g. during that attempt's after-attempt
+            # Git check, sink close, or `persist`, all of which run past
+            # `process.py`'s own per-subprocess handler, with this
+            # function's own handler active instead); `cancellation_
+            # requested` still reflects that fact (issue #111).
+            interrupted=(
+                _interrupted(pipeline_result) or orchestrator.cancellation_requested
+            ),
             termination_confirmed=_termination_confirmed(pipeline_result),
             git_safety=git_safety_port,
             run_store=run_store,
             lease=outcome.lease,
             clock=clock,
             max_review_cycles=app_config.execution.max_review_cycles,
+            # See the except-branch call above: a SIGINT/SIGTERM can still
+            # arrive during this `finalize_run` call's own postflight probe.
+            late_cancellation_check=lambda: orchestrator.cancellation_requested,
         )
     finally:
         # Kept installed through *both* branches' own `finalize_run` call

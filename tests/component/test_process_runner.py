@@ -756,6 +756,13 @@ def test_run_saves_and_restores_a_caller_installed_handler_verbatim(
     def _caller_handler(signal_number: int, frame: object) -> None:
         del signal_number, frame
 
+    # Capture whatever was actually installed before this test -- pytest's
+    # own SIGINT disposition is `signal.default_int_handler`, not `SIG_DFL`
+    # -- so the `finally` below restores exactly that, rather than leaking
+    # process-wide signal state into later tests in this same process.
+    sentinel_sigterm = signal.getsignal(signal.SIGTERM)
+    sentinel_sigint = signal.getsignal(signal.SIGINT)
+
     signal.signal(signal.SIGTERM, _caller_handler)
     signal.signal(signal.SIGINT, _caller_handler)
     try:
@@ -768,8 +775,8 @@ def test_run_saves_and_restores_a_caller_installed_handler_verbatim(
         assert signal.getsignal(signal.SIGTERM) is _caller_handler
         assert signal.getsignal(signal.SIGINT) is _caller_handler
     finally:
-        signal.signal(signal.SIGTERM, signal.SIG_DFL)
-        signal.signal(signal.SIGINT, signal.SIG_DFL)
+        signal.signal(signal.SIGTERM, sentinel_sigterm)
+        signal.signal(signal.SIGINT, sentinel_sigint)
 
 
 def test_run_honors_a_signal_delivered_the_instant_popen_returns(
