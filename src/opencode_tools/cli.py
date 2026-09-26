@@ -1174,10 +1174,7 @@ def run_composed_pipeline(
             interrupted=(
                 isinstance(error, RunInterruptedError)
                 or outcome.orchestrator.cancellation_requested
-                or (
-                    isinstance(error, _AttemptLogFooterError)
-                    and error.interrupted
-                )
+                or (isinstance(error, _AttemptLogFooterError) and error.interrupted)
             ),
             # `record` alone would lose the failed attempt's own
             # termination evidence when a post-attempt `persist` is exactly
