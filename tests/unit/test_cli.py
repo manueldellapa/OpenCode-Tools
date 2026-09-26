@@ -73,7 +73,6 @@ from opencode_tools.errors import (
     ProtocolError,
 )
 from opencode_tools.opencode import classify_provider_signal, open_run_capture_sink
-from opencode_tools.runlog import AttemptLogFileSink
 from opencode_tools.ports import (
     AgentRunner,
     AttemptLogSink,
@@ -85,6 +84,7 @@ from opencode_tools.ports import (
     RunStorePort,
     TargetLeaseFactory,
 )
+from opencode_tools.runlog import AttemptLogFileSink
 
 PROJECT_ROOT: Final = Path(__file__).resolve().parents[2]
 SOURCE_ROOT: Final = PROJECT_ROOT / "src"
