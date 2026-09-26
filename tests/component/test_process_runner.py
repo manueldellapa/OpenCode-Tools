@@ -696,12 +696,14 @@ def test_footer_stays_last_when_a_descendant_keeps_the_pipe_open(
     sink = AttemptLogFileSink(tmp_path, "attempt.log", RealClock())
     late_payload = b"late descendant output\n"
     child_script = (
-        "import os,time;"
-        "pid=os.fork();"
-        "exec("
-        "'os.setsid();time.sleep(0.35);"
-        "os.write(1," + repr(late_payload) + ");os._exit(0)'"
-        ") if pid==0 else os._exit(0)"
+        "import os,time\n"
+        "pid=os.fork()\n"
+        "if pid == 0:\n"
+        "    os.setsid()\n"
+        "    time.sleep(0.35)\n"
+        f"    os.write(1, {late_payload!r})\n"
+        "    os._exit(0)\n"
+        "os._exit(0)\n"
     )
     spec = ProcessSpec(
         argv=(sys.executable, "-c", child_script),
