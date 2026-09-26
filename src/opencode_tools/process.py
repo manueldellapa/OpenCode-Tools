@@ -87,45 +87,40 @@ def build_process_result(
 
     - `timed_out=True` -> `TIMEOUT` (the deadline was missed, System Design
       SS10.2), always, regardless of the return code.
-    - `logging_error=True` -> `LOGGING_ERROR` (a sink write faulted, e.g.
-      disk full or permission denied; M05-04), including when cancellation
-      was already observed and must remain available as concurrent evidence.
     - `interrupted=True` -> `INTERRUPTED` (a SIGINT/SIGTERM cancellation,
-      SH-001) when no higher-precedence logging failure is present.
+      SH-001), always.
+    - `logging_error=True` -> `LOGGING_ERROR` (a sink write faulted, e.g.
+      disk full or permission denied; the child was already terminated,
+      M05-04), always.
     - otherwise `SUCCEEDED` requires both a zero return code *and*
       confirmed termination (the domain invariant); everything else,
       including a `None` return code from a spawn failure (AC-015) or a
       return code of 0 whose reader threads never confirmed a clean join,
       is `PROCESS_ERROR`.
 
-    `interrupted` may coexist only with `logging_error`: the latter wins the
-    outcome while the former remains runtime evidence for finalization.
-    `timed_out` stays mutually exclusive with both. This never touches
-    `subprocess` or the filesystem, and never retries.
+    Exactly zero or one of `timed_out`/`interrupted`/`logging_error` may be
+    `True`. This never touches `subprocess` or the filesystem, and never
+    retries -- a caller mapping any of these three into a provider retry
+    would be a policy bug elsewhere, not something this function permits.
     """
 
-    if timed_out and (interrupted or logging_error):
+    if sum((timed_out, interrupted, logging_error)) > 1:
         raise ValueError(
-            "timed_out cannot coexist with interrupted or logging_error"
+            "timed_out, interrupted, and logging_error are mutually exclusive"
         )
 
-    if logging_error:
-        outcome = RunOutcome.LOGGING_ERROR
-    elif timed_out:
+    if timed_out:
         outcome = RunOutcome.TIMEOUT
     elif interrupted:
         outcome = RunOutcome.INTERRUPTED
+    elif logging_error:
+        outcome = RunOutcome.LOGGING_ERROR
     elif return_code == 0 and termination_confirmed:
         outcome = RunOutcome.SUCCEEDED
     else:
         outcome = RunOutcome.PROCESS_ERROR
 
-    result_type: type[ProcessResult] = (
-        _InterruptedLoggingProcessResult
-        if logging_error and interrupted
-        else ProcessResult
-    )
-    return result_type(
+    return ProcessResult(
         command=command,
         cwd=cwd,
         started_at=started_at,
@@ -503,6 +498,7 @@ class SubprocessRunner:
             signal.signal(signal.SIGTERM, previous_sigterm)
             signal.signal(signal.SIGINT, previous_sigint)
 
+        interruption_observed = interrupted
         join_bound = spec.termination_grace_seconds
         stdin_writer.join(timeout=join_bound)
         stdout_reader.join(timeout=join_bound)
@@ -530,6 +526,7 @@ class SubprocessRunner:
             # later logging failure supersedes the process-level signal.
             termination_confirmed = False
             timed_out = False
+            interrupted = False
             logging_error = True
 
         finished_at = self._clock.now()
@@ -538,7 +535,7 @@ class SubprocessRunner:
         stdout_byte_count, stdout_sha256 = stdout_reader.snapshot()
         stderr_byte_count, stderr_sha256 = stderr_reader.snapshot()
 
-        return build_process_result(
+        result = build_process_result(
             command=command,
             cwd=spec.cwd,
             started_at=started_at,
@@ -555,6 +552,24 @@ class SubprocessRunner:
             stderr_sha256=stderr_sha256,
             log_path=sink.path,
         )
+        if interruption_observed and result.outcome is RunOutcome.LOGGING_ERROR:
+            return _InterruptedLoggingProcessResult(
+                command=result.command,
+                cwd=result.cwd,
+                started_at=result.started_at,
+                finished_at=result.finished_at,
+                duration_ns=result.duration_ns,
+                return_code=result.return_code,
+                timed_out=result.timed_out,
+                termination_confirmed=result.termination_confirmed,
+                log_path=result.log_path,
+                stdout_byte_count=result.stdout_byte_count,
+                stdout_sha256=result.stdout_sha256,
+                stderr_byte_count=result.stderr_byte_count,
+                stderr_sha256=result.stderr_sha256,
+                outcome=result.outcome,
+            )
+        return result
 
 
 __all__ = (
