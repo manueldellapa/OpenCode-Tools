@@ -10,6 +10,8 @@ import os
 import signal
 import subprocess
 import sys
+import threading
+import time
 import tomllib
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -23,6 +25,7 @@ from opencode_tools.cli import (
     _render_issue_result,
     _render_pre_init_failure,
     _render_preinit_interrupted,
+    _SystemSleeper,
     _TeeSink,
     build_parser,
     main,
@@ -1235,6 +1238,53 @@ def test_an_observed_interruption_still_wins_over_an_unrelated_secondary_error(
     assert result.trigger_outcome is RunOutcome.INTERRUPTED
     assert result.final_status is FinalStatus.FAILED
     assert lease.released is True
+
+
+def test_system_sleeper_cuts_a_long_sleep_short_once_cancellation_is_requested() -> (
+    None
+):
+    """Issue #111 follow-up (Codex review on PR #128): a plain `time.sleep
+    (seconds)` keeps running for its own full *remaining* duration even
+    after this process's SIGINT/SIGTERM handler sets a cancellation flag
+    and returns without raising -- CPython retries an interrupted blocking
+    call with the recomputed timeout rather than abandoning it (PEP 475).
+    Delegating an entire backoff delay -- up to `ProviderRetryConfig.
+    max_delay_seconds`, 1800 seconds -- to one such call would mean a
+    SIGINT arriving early in that delay has no visible effect for up to
+    half an hour. `_SystemSleeper` must instead sleep in short polled
+    increments so `request_cancellation` (called from a background thread
+    here, standing in for the signal handler) can cut a 60-second sleep
+    short almost immediately."""
+
+    sleeper = _SystemSleeper()
+
+    def _cancel_shortly() -> None:
+        time.sleep(0.05)
+        sleeper.request_cancellation()
+
+    canceller = threading.Thread(target=_cancel_shortly, daemon=True)
+    started = time.monotonic()
+    canceller.start()
+    sleeper.sleep(60.0)
+    elapsed = time.monotonic() - started
+    canceller.join(timeout=2.0)
+
+    assert elapsed < 2.0
+
+
+def test_system_sleeper_still_sleeps_the_full_duration_absent_cancellation() -> None:
+    """The polled-increment implementation above must not shortchange an
+    uncancelled sleep -- `run_provider_attempts`' own documented contract
+    (System Design SS12.2) is that a retry's backoff is honored in full
+    when nothing interrupts it."""
+
+    sleeper = _SystemSleeper()
+
+    started = time.monotonic()
+    sleeper.sleep(0.3)
+    elapsed = time.monotonic() - started
+
+    assert elapsed >= 0.3
 
 
 def test_a_sigint_during_provider_retry_backoff_converges_through_finalize_run(

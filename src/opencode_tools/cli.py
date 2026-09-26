@@ -40,6 +40,7 @@ import hashlib
 import platform
 import signal
 import sys
+import threading
 import time
 from collections.abc import Mapping, Sequence
 from dataclasses import replace
@@ -215,11 +216,58 @@ class _SystemClock:
         return time.monotonic_ns()
 
 
+_SLEEPER_POLL_INTERVAL_SECONDS = 0.5
+
+
 class _SystemSleeper:
-    """The real `Sleeper`: an actual blocking `time.sleep`."""
+    """The real `Sleeper`: a blocking `time.sleep`, polled in short
+    increments rather than made in one call.
+
+    A single `time.sleep(seconds)` would keep running for its own full
+    *remaining* duration even after this process's SIGINT/SIGTERM handler
+    observes a signal and returns without raising: per PEP 475, CPython
+    retries an interrupted blocking call with the recomputed timeout rather
+    than abandoning it, so setting a cancellation flag alone never actually
+    shortens an in-progress `time.sleep`. Since `ProviderRetryConfig.
+    max_delay_seconds` can be configured up to 1800 seconds (System Design
+    SS12.2), a SIGINT arriving early in a long backoff delay would
+    otherwise take up to that long to have any visible effect (issue
+    #111). Sleeping in bounded `_SLEEPER_POLL_INTERVAL_SECONDS` chunks and
+    checking `request_cancellation`'s flag between each one instead caps
+    that latency at one poll interval, while still blocking for the full
+    requested `seconds` -- the exact planned backoff delay -- when no
+    cancellation ever arrives.
+    """
+
+    def __init__(self) -> None:
+        self._cancelled = threading.Event()
+
+    def request_cancellation(self) -> None:
+        """Cut any `sleep` call already in progress short (issue #111)."""
+
+        self._cancelled.set()
 
     def sleep(self, seconds: float) -> None:
-        time.sleep(seconds)
+        deadline = time.monotonic() + seconds
+        while not self._cancelled.is_set():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return
+            time.sleep(min(remaining, _SLEEPER_POLL_INTERVAL_SECONDS))
+
+
+@runtime_checkable
+class _AcceptsCancellationRequest(Protocol):
+    """A `Sleeper` (only `_SystemSleeper` in practice) that can cut a
+    `sleep` already in progress short, given a live cancellation request --
+    checked structurally so `run_composed_pipeline`'s signal handler can
+    forward the request to whichever concrete `Sleeper` it was actually
+    given without depending on `_SystemSleeper` by name, and without every
+    test fake (a `RecordingSleeper` that never really sleeps) needing to
+    implement a method it has no use for.
+    """
+
+    def request_cancellation(self) -> None: ...
 
 
 # --- GitSafetyPort: binds process/executable/clock/timeouts to the three
@@ -924,6 +972,15 @@ def run_composed_pipeline(
     ) -> None:
         del signal_number, frame
         orchestrator.request_cancellation()
+        # A plain `time.sleep` already in progress (`run_provider_attempts`'
+        # own backoff delay) would otherwise keep running for its own full
+        # remaining duration regardless -- up to `ProviderRetryConfig.
+        # max_delay_seconds`, 1800s -- since setting `cancellation_
+        # requested` above has no effect on a blocking call already under
+        # way. `sleeper` is only ever `_SystemSleeper` in production; a
+        # test fake with no use for this simply does not implement it.
+        if isinstance(sleeper, _AcceptsCancellationRequest):
+            sleeper.request_cancellation()
 
     # A SIGINT/SIGTERM arriving anywhere in `run_issue_pipeline` -- most
     # notably during `run_provider_attempts`' own backoff sleep between
