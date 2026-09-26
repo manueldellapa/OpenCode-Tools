@@ -36,6 +36,16 @@ _CHUNK_SIZE = 65536
 _POLL_INTERVAL_SECONDS = 0.01
 
 
+class _InterruptedLoggingProcessResult(ProcessResult):
+    """Runtime-only evidence that cancellation preceded a logging failure."""
+
+    __slots__ = ()
+
+    @property
+    def interrupted(self) -> bool:
+        return True
+
+
 def sanitize_command(argv: tuple[str, ...]) -> tuple[str, ...]:
     """Return `argv` with any URL-embedded credential replaced by a marker.
 
@@ -290,6 +300,7 @@ class _StreamReader(threading.Thread):
         sink: AttemptLogSink,
         sink_lock: threading.Lock,
         sink_fault: threading.Event,
+        sink_writes_closed: threading.Event,
         clock: Clock,
     ) -> None:
         super().__init__(daemon=True)
@@ -298,6 +309,7 @@ class _StreamReader(threading.Thread):
         self._sink = sink
         self._sink_lock = sink_lock
         self._sink_fault = sink_fault
+        self._sink_writes_closed = sink_writes_closed
         self._clock = clock
         self._state_lock = threading.Lock()
         self._byte_count = 0
@@ -319,11 +331,13 @@ class _StreamReader(threading.Thread):
                     # data once the sink itself has failed.
                     continue
                 timestamp = self._clock.now()
-                with self._state_lock:
-                    self._byte_count += len(chunk)
-                    self._digest.update(chunk)
                 try:
                     with self._sink_lock:
+                        if self._sink_writes_closed.is_set():
+                            continue
+                        with self._state_lock:
+                            self._byte_count += len(chunk)
+                            self._digest.update(chunk)
                         self._sink.write(self._channel, chunk, timestamp)
                 except OSError:
                     self._sink_fault.set()
@@ -440,6 +454,7 @@ class SubprocessRunner:
 
             sink_lock = threading.Lock()
             sink_fault = threading.Event()
+            sink_writes_closed = threading.Event()
             stdin_writer = _StdinWriter(stream=process.stdin, payload=stdin_payload)
             stdout_reader = _StreamReader(
                 channel="stdout",
@@ -447,6 +462,7 @@ class SubprocessRunner:
                 sink=sink,
                 sink_lock=sink_lock,
                 sink_fault=sink_fault,
+                sink_writes_closed=sink_writes_closed,
                 clock=self._clock,
             )
             stderr_reader = _StreamReader(
@@ -455,6 +471,7 @@ class SubprocessRunner:
                 sink=sink,
                 sink_lock=sink_lock,
                 sink_fault=sink_fault,
+                sink_writes_closed=sink_writes_closed,
                 clock=self._clock,
             )
 
@@ -481,6 +498,7 @@ class SubprocessRunner:
             signal.signal(signal.SIGTERM, previous_sigterm)
             signal.signal(signal.SIGINT, previous_sigint)
 
+        interruption_observed = interrupted
         join_bound = spec.termination_grace_seconds
         stdin_writer.join(timeout=join_bound)
         stdout_reader.join(timeout=join_bound)
@@ -492,13 +510,32 @@ class SubprocessRunner:
         ):
             termination_confirmed = False
 
+        # A reader may legitimately survive the bounded joins when a
+        # descendant keeps stdout/stderr open. Stop admitting new sink writes
+        # first, then wait at most the configured grace bound for any
+        # already-in-flight write to leave the shared lock. A stuck sink must
+        # never turn this post-join seal into an unbounded wait.
+        sink_writes_closed.set()
+        sink_quiesced = sink_lock.acquire(timeout=join_bound)
+        if sink_quiesced:
+            sink_lock.release()
+        else:
+            # The sink cannot be safely framed with a caller-owned terminal
+            # record while a prior write may still be in flight. Fail closed
+            # as LOGGING_ERROR so the caller will not append a footer; this
+            # later logging failure supersedes the process-level signal.
+            termination_confirmed = False
+            timed_out = False
+            interrupted = False
+            logging_error = True
+
         finished_at = self._clock.now()
         duration_ns = self._clock.monotonic_ns() - start_ns
 
         stdout_byte_count, stdout_sha256 = stdout_reader.snapshot()
         stderr_byte_count, stderr_sha256 = stderr_reader.snapshot()
 
-        return build_process_result(
+        result = build_process_result(
             command=command,
             cwd=spec.cwd,
             started_at=started_at,
@@ -515,6 +552,24 @@ class SubprocessRunner:
             stderr_sha256=stderr_sha256,
             log_path=sink.path,
         )
+        if interruption_observed and result.outcome is RunOutcome.LOGGING_ERROR:
+            return _InterruptedLoggingProcessResult(
+                command=result.command,
+                cwd=result.cwd,
+                started_at=result.started_at,
+                finished_at=result.finished_at,
+                duration_ns=result.duration_ns,
+                return_code=result.return_code,
+                timed_out=result.timed_out,
+                termination_confirmed=result.termination_confirmed,
+                log_path=result.log_path,
+                stdout_byte_count=result.stdout_byte_count,
+                stdout_sha256=result.stdout_sha256,
+                stderr_byte_count=result.stderr_byte_count,
+                stderr_sha256=result.stderr_sha256,
+                outcome=result.outcome,
+            )
+        return result
 
 
 __all__ = (

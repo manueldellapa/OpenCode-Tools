@@ -590,6 +590,26 @@ def _decode_utf8_lenient(payload: bytes) -> str | None:
     return payload.decode("utf-8", errors="replace")
 
 
+class _AttemptLogFooterError(LoggingError):
+    """Logging failure after a process result already supplied termination evidence."""
+
+    def __init__(
+        self,
+        *,
+        path: Path,
+        technical_detail: str,
+        termination_confirmed: bool | None,
+        interrupted: bool,
+    ) -> None:
+        super().__init__(
+            "runlog.attempt_log_write_failed",
+            f"failed to write attempt log runner footer: {path}",
+            technical_detail=technical_detail,
+        )
+        self.termination_confirmed = termination_confirmed
+        self.interrupted = interrupted
+
+
 class _CliAgentRunner:
     def __init__(
         self,
@@ -766,10 +786,21 @@ class _CliAgentRunner:
             capture = opencode_adapter.open_run_capture_sink(
                 f"{role.value.lower()}-{cycle_component}-{provider_attempt}-capture"
             )
+            if isinstance(sink, runlog.AttemptLogFileSink):
+                try:
+                    sink.write_header(
+                        command=opencode_adapter.redact_command_for_display(spec),
+                        cwd=spec.cwd,
+                    )
+                except OSError as error:
+                    raise LoggingError(
+                        "runlog.attempt_log_write_failed",
+                        f"failed to write attempt log runner header: {sink.path}",
+                        technical_detail=type(error).__name__,
+                    ) from None
             process_result = self._process_runner.run(
                 spec, sink=_TeeSink(sink, capture)
             )
-
             stdout_bytes = capture.bytes_for("stdout")
             stdout_text = _decode_utf8_lenient(stdout_bytes)
             provider_diagnostic = (
@@ -830,6 +861,23 @@ class _CliAgentRunner:
                         self._clock.now(),
                     )
                     terminal_response = None
+
+            if (
+                isinstance(sink, runlog.AttemptLogFileSink)
+                and process_result.outcome is not RunOutcome.LOGGING_ERROR
+            ):
+                try:
+                    sink.write_footer(
+                        outcome=process_result.outcome,
+                        duration_ns=process_result.duration_ns,
+                    )
+                except OSError as error:
+                    raise _AttemptLogFooterError(
+                        path=sink.path,
+                        technical_detail=type(error).__name__,
+                        termination_confirmed=process_result.termination_confirmed,
+                        interrupted=process_result.interrupted,
+                    ) from None
 
             timed_out = process_result.timed_out
             provider_error = provider_diagnostic is not None
@@ -1126,13 +1174,18 @@ def run_composed_pipeline(
             interrupted=(
                 isinstance(error, RunInterruptedError)
                 or outcome.orchestrator.cancellation_requested
+                or (isinstance(error, _AttemptLogFooterError) and error.interrupted)
             ),
             # `record` alone would lose the failed attempt's own
             # termination evidence when a post-attempt `persist` is exactly
             # what raised `error` -- `last_observed_termination_confirmed`
             # survives that loss, so a possibly still-live child still
             # forces postflight `INDETERMINATE` and quarantines the lease.
-            termination_confirmed=outcome.orchestrator.last_observed_termination_confirmed,
+            termination_confirmed=(
+                error.termination_confirmed
+                if isinstance(error, _AttemptLogFooterError)
+                else outcome.orchestrator.last_observed_termination_confirmed
+            ),
             git_safety=git_safety_port,
             run_store=run_store,
             lease=outcome.lease,

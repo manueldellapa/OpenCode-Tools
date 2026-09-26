@@ -13,8 +13,10 @@ timeout, and interrupted paths (AC-014, AC-015, AC-032).
 
 from __future__ import annotations
 
+import base64
 import dataclasses
 import hashlib
+import json
 import os
 import signal
 import subprocess
@@ -28,6 +30,7 @@ import pytest
 
 from opencode_tools.domain import ProcessSpec, RunOutcome
 from opencode_tools.process import SubprocessRunner
+from opencode_tools.runlog import AttemptLogFileSink
 
 HELPER = Path(__file__).resolve().parent / "helpers" / "echo_process.py"
 
@@ -80,6 +83,27 @@ class RecordingAttemptLogSink:
 
     def close(self) -> None:
         self.closed = True
+
+
+class BlockingAttemptLogSink:
+    """A sink whose write stays blocked until the test explicitly releases it."""
+
+    def __init__(self) -> None:
+        self._path = Path("attempt.log")
+        self.write_entered = threading.Event()
+        self.release_write = threading.Event()
+
+    @property
+    def path(self) -> Path:
+        return self._path
+
+    def write(self, channel: str, payload: bytes, timestamp: datetime) -> None:
+        del channel, payload, timestamp
+        self.write_entered.set()
+        self.release_write.wait(timeout=10.0)
+
+    def close(self) -> None:
+        return None
 
 
 class FaultingAttemptLogSink:
@@ -679,6 +703,124 @@ def test_run_reports_unconfirmed_termination_when_a_descendant_escapes_the_group
     assert elapsed < 3.0
     assert result.outcome is RunOutcome.TIMEOUT
     assert result.termination_confirmed is False
+
+
+def test_post_join_reader_seal_never_waits_forever_on_sink_lock(
+    tmp_path: Path,
+) -> None:
+    """Codex P1 on #133: a reader stuck inside sink.write() may still own
+    the shared lock after every bounded join expires; sealing must itself
+    remain bounded and fail closed instead of waiting indefinitely."""
+
+    runner = SubprocessRunner(RealClock())
+    sink = BlockingAttemptLogSink()
+    spec = ProcessSpec(
+        argv=_helper_argv("--stderr", "block-the-sink"),
+        cwd=tmp_path,
+        stdin=None,
+        timeout_seconds=30.0,
+        termination_grace_seconds=0.05,
+    )
+
+    started = time.monotonic()
+    result = runner.run(spec, sink=sink)
+    elapsed = time.monotonic() - started
+    sink.release_write.set()
+
+    assert sink.write_entered.is_set()
+    assert elapsed < 1.0
+    assert result.outcome is RunOutcome.LOGGING_ERROR
+    assert result.termination_confirmed is False
+
+
+def test_sink_quiescence_timeout_preserves_observed_cancellation(
+    tmp_path: Path,
+) -> None:
+    """Codex P2 on #133: if cancellation is observed before a stuck reader
+    makes sink quiescence time out, LOGGING_ERROR still wins but the
+    interruption evidence must survive for the run lifecycle."""
+
+    runner = SubprocessRunner(RealClock())
+    sink = BlockingAttemptLogSink()
+    spec = ProcessSpec(
+        argv=_helper_argv("--stderr", "block-the-sink", "--sleep", "10"),
+        cwd=tmp_path,
+        stdin=None,
+        timeout_seconds=30.0,
+        termination_grace_seconds=0.05,
+    )
+
+    def _cancel_after_sink_write_starts() -> None:
+        if sink.write_entered.wait(timeout=2.0):
+            os.kill(os.getpid(), signal.SIGINT)
+
+    canceller = threading.Thread(target=_cancel_after_sink_write_starts, daemon=True)
+    canceller.start()
+    result = runner.run(spec, sink=sink)
+    sink.release_write.set()
+    canceller.join(timeout=2.0)
+
+    assert sink.write_entered.is_set()
+    assert not canceller.is_alive()
+    assert result.outcome is RunOutcome.LOGGING_ERROR
+    assert result.interrupted is True
+    assert result.termination_confirmed is False
+
+
+def test_footer_stays_last_when_a_descendant_keeps_the_pipe_open(
+    tmp_path: Path,
+) -> None:
+    """Codex P2 on #133: a detached descendant can outlive the direct child
+    and keep stdout/stderr open beyond the bounded reader joins. Once
+    `run()` returns, surviving readers must be drain-only so the caller's
+    runner footer is guaranteed to remain the final attempt-log record."""
+
+    runner = SubprocessRunner(RealClock())
+    sink = AttemptLogFileSink(tmp_path, "attempt.log", RealClock())
+    late_payload = b"late descendant output\n"
+    child_script = (
+        "import os,time\n"
+        "pid=os.fork()\n"
+        "if pid == 0:\n"
+        "    os.setsid()\n"
+        "    time.sleep(0.35)\n"
+        f"    os.write(1, {late_payload!r})\n"
+        "    os._exit(0)\n"
+        "os._exit(0)\n"
+    )
+    spec = ProcessSpec(
+        argv=(sys.executable, "-c", child_script),
+        cwd=tmp_path,
+        stdin=None,
+        timeout_seconds=30.0,
+        termination_grace_seconds=0.05,
+    )
+
+    sink.write_header(command=spec.argv, cwd=spec.cwd)
+    result = runner.run(spec, sink=sink)
+
+    assert result.return_code == 0
+    assert result.termination_confirmed is False
+    assert result.outcome is RunOutcome.PROCESS_ERROR
+
+    sink.write_footer(outcome=result.outcome, duration_ns=result.duration_ns)
+    time.sleep(0.5)
+    sink.close()
+
+    records = [
+        json.loads(line)
+        for line in (tmp_path / "attempt.log").read_text(encoding="utf-8").splitlines()
+    ]
+    last_record = records[-1]
+    assert last_record["channel"] == "runner"
+    assert (
+        json.loads(base64.b64decode(last_record["payload_base64"]))["event"] == "footer"
+    )
+    assert all(
+        base64.b64decode(record["payload_base64"]) != late_payload
+        for record in records
+        if record["channel"] == "stdout"
+    )
 
 
 def test_run_applies_the_same_escalation_on_sigint_cancellation(
