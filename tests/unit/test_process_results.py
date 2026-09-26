@@ -285,6 +285,19 @@ def test_sanitize_command_redacts_credentials_embedded_in_a_url() -> None:
     assert sanitized[2] == "https://REDACTED@github.com/example/repo.git"
 
 
+def test_sanitize_command_redacts_credentials_when_secret_contains_at_sign() -> None:
+    argv = (
+        "/usr/bin/git",
+        "clone",
+        "https://user:p@ssw0rd@github.com/example/repo.git",
+    )
+
+    sanitized = sanitize_command(argv)
+
+    assert sanitized[2] == "https://REDACTED@github.com/example/repo.git"
+    assert "ssw0rd" not in sanitized[2]
+
+
 def test_sanitize_command_redacts_every_credential_bearing_argument() -> None:
     argv = (
         "/usr/bin/curl",
