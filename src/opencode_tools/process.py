@@ -500,13 +500,23 @@ class SubprocessRunner:
             termination_confirmed = False
 
         # A reader may legitimately survive the bounded joins when a
-        # descendant keeps stdout/stderr open. Seal reader forwarding under
-        # the same lock used by every sink write before returning: this waits
-        # for any in-flight write and makes every later chunk drain-only, so a
-        # caller can append a terminal runner record after run() and know no
-        # reader can race with it or write after it.
-        with sink_lock:
-            sink_writes_closed.set()
+        # descendant keeps stdout/stderr open. Stop admitting new sink writes
+        # first, then wait at most the configured grace bound for any
+        # already-in-flight write to leave the shared lock. A stuck sink must
+        # never turn this post-join seal into an unbounded wait.
+        sink_writes_closed.set()
+        sink_quiesced = sink_lock.acquire(timeout=join_bound)
+        if sink_quiesced:
+            sink_lock.release()
+        else:
+            # The sink cannot be safely framed with a caller-owned terminal
+            # record while a prior write may still be in flight. Fail closed
+            # as LOGGING_ERROR so the caller will not append a footer; this
+            # later logging failure supersedes the process-level signal.
+            termination_confirmed = False
+            timed_out = False
+            interrupted = False
+            logging_error = True
 
         finished_at = self._clock.now()
         duration_ns = self._clock.monotonic_ns() - start_ns

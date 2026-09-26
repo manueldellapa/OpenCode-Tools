@@ -590,6 +590,24 @@ def _decode_utf8_lenient(payload: bytes) -> str | None:
     return payload.decode("utf-8", errors="replace")
 
 
+class _AttemptLogFooterError(LoggingError):
+    """Logging failure after a process result already supplied termination evidence."""
+
+    def __init__(
+        self,
+        *,
+        path: Path,
+        technical_detail: str,
+        termination_confirmed: bool | None,
+    ) -> None:
+        super().__init__(
+            "runlog.attempt_log_write_failed",
+            f"failed to write attempt log runner footer: {path}",
+            technical_detail=technical_detail,
+        )
+        self.termination_confirmed = termination_confirmed
+
+
 class _CliAgentRunner:
     def __init__(
         self,
@@ -791,10 +809,10 @@ class _CliAgentRunner:
                         duration_ns=process_result.duration_ns,
                     )
                 except OSError as error:
-                    raise LoggingError(
-                        "runlog.attempt_log_write_failed",
-                        f"failed to write attempt log runner footer: {sink.path}",
+                    raise _AttemptLogFooterError(
+                        path=sink.path,
                         technical_detail=type(error).__name__,
+                        termination_confirmed=process_result.termination_confirmed,
                     ) from None
 
             stdout_bytes = capture.bytes_for("stdout")
@@ -1159,7 +1177,11 @@ def run_composed_pipeline(
             # what raised `error` -- `last_observed_termination_confirmed`
             # survives that loss, so a possibly still-live child still
             # forces postflight `INDETERMINATE` and quarantines the lease.
-            termination_confirmed=outcome.orchestrator.last_observed_termination_confirmed,
+            termination_confirmed=(
+                error.termination_confirmed
+                if isinstance(error, _AttemptLogFooterError)
+                else outcome.orchestrator.last_observed_termination_confirmed
+            ),
             git_safety=git_safety_port,
             run_store=run_store,
             lease=outcome.lease,

@@ -85,6 +85,27 @@ class RecordingAttemptLogSink:
         self.closed = True
 
 
+class BlockingAttemptLogSink:
+    """A sink whose write stays blocked until the test explicitly releases it."""
+
+    def __init__(self) -> None:
+        self._path = Path("attempt.log")
+        self.write_entered = threading.Event()
+        self.release_write = threading.Event()
+
+    @property
+    def path(self) -> Path:
+        return self._path
+
+    def write(self, channel: str, payload: bytes, timestamp: datetime) -> None:
+        del channel, payload, timestamp
+        self.write_entered.set()
+        self.release_write.wait(timeout=10.0)
+
+    def close(self) -> None:
+        return None
+
+
 class FaultingAttemptLogSink:
     """An `AttemptLogSink` fake whose `write()` raises `OSError` once at
     least `fail_after` writes have already succeeded, simulating a
@@ -681,6 +702,34 @@ def test_run_reports_unconfirmed_termination_when_a_descendant_escapes_the_group
 
     assert elapsed < 3.0
     assert result.outcome is RunOutcome.TIMEOUT
+    assert result.termination_confirmed is False
+
+
+def test_post_join_reader_seal_never_waits_forever_on_sink_lock(
+    tmp_path: Path,
+) -> None:
+    """Codex P1 on #133: a reader stuck inside sink.write() may still own
+    the shared lock after every bounded join expires; sealing must itself
+    remain bounded and fail closed instead of waiting indefinitely."""
+
+    runner = SubprocessRunner(RealClock())
+    sink = BlockingAttemptLogSink()
+    spec = ProcessSpec(
+        argv=_helper_argv("--stderr", "block-the-sink"),
+        cwd=tmp_path,
+        stdin=None,
+        timeout_seconds=30.0,
+        termination_grace_seconds=0.05,
+    )
+
+    started = time.monotonic()
+    result = runner.run(spec, sink=sink)
+    elapsed = time.monotonic() - started
+    sink.release_write.set()
+
+    assert sink.write_entered.is_set()
+    assert elapsed < 1.0
+    assert result.outcome is RunOutcome.LOGGING_ERROR
     assert result.termination_confirmed is False
 
 

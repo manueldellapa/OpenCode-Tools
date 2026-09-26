@@ -22,11 +22,14 @@ import base64
 import json
 import os
 import subprocess
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
 from opencode_tools.cli import main
+from opencode_tools.domain import ProcessSpec, RunOutcome
+from opencode_tools.process import SubprocessRunner
 from opencode_tools.runlog import AttemptLogFileSink
 
 HELPERS = Path(__file__).resolve().parent / "helpers"
@@ -302,6 +305,82 @@ def test_runner_record_write_faults_finalize_as_logging_error(
     captured = capsys.readouterr()
     assert captured.out == "FINAL_STATUS: FAILED\n"
     assert "terminal outcome: LOGGING_ERROR" in captured.err
+    assert "artifact is incomplete" in captured.err
+
+
+def test_footer_failure_preserves_unconfirmed_termination_for_quarantine(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Codex P1 on #133: a footer write fault happens after the process
+    result exists but before the orchestrator receives an AgentResult.
+    Unconfirmed termination evidence must still reach finalization so the
+    target is quarantined before its lease is released."""
+
+    workspace = tmp_path / "workspace"
+    _clean_repo(workspace)
+    runtime_root = tmp_path / "runtime"
+    config_path = tmp_path / "opencode-tools.toml"
+    _config_file(config_path, runtime_root=runtime_root)
+
+    monkeypatch.setenv("PATH", _shim_path(tmp_path / "bin"))
+    _set_opencode_debug_fixtures(monkeypatch)
+    monkeypatch.setenv(
+        "FAKE_OPENCODE_RUN_OUTPUT_FILE", str(RUN_FIXTURES / "architect-failed.ndjson")
+    )
+
+    original_run = SubprocessRunner.run
+
+    def _run_with_unconfirmed_agent(
+        runner: SubprocessRunner, spec: object, *, sink: object
+    ) -> object:
+        result = original_run(runner, spec, sink=sink)
+        if (
+            isinstance(spec, ProcessSpec)
+            and Path(spec.argv[0]).name == "opencode"
+            and len(spec.argv) > 1
+            and spec.argv[1] == "run"
+        ):
+            return replace(
+                result,
+                termination_confirmed=False,
+                outcome=RunOutcome.PROCESS_ERROR,
+            )
+        return result
+
+    def _fail_footer(sink: AttemptLogFileSink, **kwargs: object) -> None:
+        del sink, kwargs
+        raise OSError("simulated footer write failure")
+
+    monkeypatch.setattr(SubprocessRunner, "run", _run_with_unconfirmed_agent)
+    monkeypatch.setattr(AttemptLogFileSink, "write_footer", _fail_footer)
+
+    main(
+        [
+            "run",
+            "--workspace",
+            str(workspace),
+            "--target",
+            ".",
+            "--issue",
+            "42",
+            "--config",
+            str(config_path),
+        ]
+    )
+
+    run_json_paths = list(runtime_root.rglob("run.json"))
+    assert len(run_json_paths) == 1
+    record = json.loads(run_json_paths[0].read_text(encoding="utf-8"))
+    quarantine_path = workspace / ".git" / "opencode-tools" / "quarantine-v1.json"
+
+    assert record["artifact_incomplete"] is True
+    assert record["termination_confirmed"] is False
+    assert record["git_safety_status"] == "INDETERMINATE"
+    assert quarantine_path.is_file()
+
+    captured = capsys.readouterr()
     assert "artifact is incomplete" in captured.err
 
 
