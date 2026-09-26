@@ -834,7 +834,7 @@ class IssueOrchestrator:
         _record(InvocationEventKind.AGENT_RESULT_RECEIVED)
         self._last_agent_result = agent_result
 
-        if agent_result.process.outcome is RunOutcome.INTERRUPTED:
+        if agent_result.process.interrupted:
             self._cancellation_requested = True
         if agent_result.process.outcome is RunOutcome.LOGGING_ERROR:
             self._persistence_blocked = True

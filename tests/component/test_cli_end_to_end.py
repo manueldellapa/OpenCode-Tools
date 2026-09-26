@@ -27,11 +27,19 @@ from pathlib import Path
 
 import pytest
 
+from opencode_tools import orchestrator as orchestrator_module
 from opencode_tools.cli import main
-from opencode_tools.domain import ProcessResult, ProcessSpec, RunOutcome
+from opencode_tools.domain import (
+    GitSafetyStatus,
+    PersistenceStatus,
+    ProcessResult,
+    ProcessSpec,
+    RunOutcome,
+)
 from opencode_tools.ports import AttemptLogSink
 from opencode_tools.process import SubprocessRunner
 from opencode_tools.runlog import AttemptLogFileSink
+from opencode_tools.state_machine import TerminalPrecedence
 
 HELPERS = Path(__file__).resolve().parent / "helpers"
 FAKE_GH = HELPERS / "fake_gh.py"
@@ -378,6 +386,93 @@ def test_footer_failure_preserves_unconfirmed_termination_for_quarantine(
 
     captured = capsys.readouterr()
     assert "artifact is incomplete" in captured.err
+
+
+def test_footer_failure_preserves_interruption_for_finalization(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Codex P2 on #133: a footer fault occurs before the AgentResult reaches
+    the orchestrator, so interruption evidence from the completed process
+    must travel with the logging error into finalization."""
+
+    workspace = tmp_path / "workspace"
+    _clean_repo(workspace)
+    runtime_root = tmp_path / "runtime"
+    config_path = tmp_path / "opencode-tools.toml"
+    _config_file(config_path, runtime_root=runtime_root)
+
+    monkeypatch.setenv("PATH", _shim_path(tmp_path / "bin"))
+    _set_opencode_debug_fixtures(monkeypatch)
+    monkeypatch.setenv(
+        "FAKE_OPENCODE_RUN_OUTPUT_FILE", str(RUN_FIXTURES / "architect-failed.ndjson")
+    )
+
+    original_run = SubprocessRunner.run
+    original_resolve = orchestrator_module.resolve_terminal_outcome
+    observed_interrupted: list[bool] = []
+
+    def _run_with_interrupted_agent(
+        runner: SubprocessRunner, spec: ProcessSpec, *, sink: AttemptLogSink
+    ) -> ProcessResult:
+        result = original_run(runner, spec, sink=sink)
+        if len(spec.argv) > 1 and spec.argv[1] == "run" and "--agent" in spec.argv:
+            return replace(
+                result,
+                outcome=RunOutcome.INTERRUPTED,
+                timed_out=False,
+            )
+        return result
+
+    def _capture_terminal_precedence(
+        *,
+        trigger_outcome: RunOutcome,
+        git_safety_status: GitSafetyStatus,
+        interrupted: bool,
+        persistence_status: PersistenceStatus,
+    ) -> TerminalPrecedence:
+        observed_interrupted.append(interrupted)
+        return original_resolve(
+            trigger_outcome=trigger_outcome,
+            git_safety_status=git_safety_status,
+            interrupted=interrupted,
+            persistence_status=persistence_status,
+        )
+
+    def _fail_footer(sink: AttemptLogFileSink, **kwargs: object) -> None:
+        del sink, kwargs
+        raise OSError("simulated footer write failure")
+
+    monkeypatch.setattr(SubprocessRunner, "run", _run_with_interrupted_agent)
+    monkeypatch.setattr(AttemptLogFileSink, "write_footer", _fail_footer)
+    monkeypatch.setattr(
+        orchestrator_module,
+        "resolve_terminal_outcome",
+        _capture_terminal_precedence,
+    )
+
+    exit_code = main(
+        [
+            "run",
+            "--workspace",
+            str(workspace),
+            "--target",
+            ".",
+            "--issue",
+            "42",
+            "--config",
+            str(config_path),
+        ]
+    )
+
+    run_json_paths = list(runtime_root.rglob("run.json"))
+    assert len(run_json_paths) == 1
+    record = json.loads(run_json_paths[0].read_text(encoding="utf-8"))
+
+    assert exit_code == 40
+    assert record["trigger_outcome"] == "LOGGING_ERROR"
+    assert record["artifact_incomplete"] is True
+    assert True in observed_interrupted
 
 
 def test_a_dirty_target_fails_before_any_run_directory_or_artifact_exists(

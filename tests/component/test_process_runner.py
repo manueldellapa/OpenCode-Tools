@@ -733,6 +733,40 @@ def test_post_join_reader_seal_never_waits_forever_on_sink_lock(
     assert result.termination_confirmed is False
 
 
+def test_sink_quiescence_timeout_preserves_observed_cancellation(
+    tmp_path: Path,
+) -> None:
+    """Codex P2 on #133: if cancellation is observed before a stuck reader
+    makes sink quiescence time out, LOGGING_ERROR still wins but the
+    interruption evidence must survive for the run lifecycle."""
+
+    runner = SubprocessRunner(RealClock())
+    sink = BlockingAttemptLogSink()
+    spec = ProcessSpec(
+        argv=_helper_argv("--stderr", "block-the-sink", "--sleep", "10"),
+        cwd=tmp_path,
+        stdin=None,
+        timeout_seconds=30.0,
+        termination_grace_seconds=0.05,
+    )
+
+    def _cancel_after_sink_write_starts() -> None:
+        if sink.write_entered.wait(timeout=2.0):
+            os.kill(os.getpid(), signal.SIGINT)
+
+    canceller = threading.Thread(target=_cancel_after_sink_write_starts, daemon=True)
+    canceller.start()
+    result = runner.run(spec, sink=sink)
+    sink.release_write.set()
+    canceller.join(timeout=2.0)
+
+    assert sink.write_entered.is_set()
+    assert not canceller.is_alive()
+    assert result.outcome is RunOutcome.LOGGING_ERROR
+    assert result.interrupted is True
+    assert result.termination_confirmed is False
+
+
 def test_footer_stays_last_when_a_descendant_keeps_the_pipe_open(
     tmp_path: Path,
 ) -> None:

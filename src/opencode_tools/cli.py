@@ -599,6 +599,7 @@ class _AttemptLogFooterError(LoggingError):
         path: Path,
         technical_detail: str,
         termination_confirmed: bool | None,
+        interrupted: bool,
     ) -> None:
         super().__init__(
             "runlog.attempt_log_write_failed",
@@ -606,6 +607,7 @@ class _AttemptLogFooterError(LoggingError):
             technical_detail=technical_detail,
         )
         self.termination_confirmed = termination_confirmed
+        self.interrupted = interrupted
 
 
 class _CliAgentRunner:
@@ -874,6 +876,7 @@ class _CliAgentRunner:
                         path=sink.path,
                         technical_detail=type(error).__name__,
                         termination_confirmed=process_result.termination_confirmed,
+                        interrupted=process_result.interrupted,
                     ) from None
 
             timed_out = process_result.timed_out
@@ -1171,6 +1174,10 @@ def run_composed_pipeline(
             interrupted=(
                 isinstance(error, RunInterruptedError)
                 or outcome.orchestrator.cancellation_requested
+                or (
+                    isinstance(error, _AttemptLogFooterError)
+                    and error.interrupted
+                )
             ),
             # `record` alone would lose the failed attempt's own
             # termination evidence when a post-attempt `persist` is exactly

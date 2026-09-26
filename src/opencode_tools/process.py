@@ -36,6 +36,16 @@ _CHUNK_SIZE = 65536
 _POLL_INTERVAL_SECONDS = 0.01
 
 
+class _InterruptedLoggingProcessResult(ProcessResult):
+    """Runtime-only evidence that cancellation preceded a logging failure."""
+
+    __slots__ = ()
+
+    @property
+    def interrupted(self) -> bool:
+        return True
+
+
 def sanitize_command(argv: tuple[str, ...]) -> tuple[str, ...]:
     """Return `argv` with any URL-embedded credential replaced by a marker.
 
@@ -77,40 +87,45 @@ def build_process_result(
 
     - `timed_out=True` -> `TIMEOUT` (the deadline was missed, System Design
       SS10.2), always, regardless of the return code.
-    - `interrupted=True` -> `INTERRUPTED` (a SIGINT/SIGTERM cancellation,
-      SH-001), always.
     - `logging_error=True` -> `LOGGING_ERROR` (a sink write faulted, e.g.
-      disk full or permission denied; the child was already terminated,
-      M05-04), always.
+      disk full or permission denied; M05-04), including when cancellation
+      was already observed and must remain available as concurrent evidence.
+    - `interrupted=True` -> `INTERRUPTED` (a SIGINT/SIGTERM cancellation,
+      SH-001) when no higher-precedence logging failure is present.
     - otherwise `SUCCEEDED` requires both a zero return code *and*
       confirmed termination (the domain invariant); everything else,
       including a `None` return code from a spawn failure (AC-015) or a
       return code of 0 whose reader threads never confirmed a clean join,
       is `PROCESS_ERROR`.
 
-    Exactly zero or one of `timed_out`/`interrupted`/`logging_error` may be
-    `True`. This never touches `subprocess` or the filesystem, and never
-    retries -- a caller mapping any of these three into a provider retry
-    would be a policy bug elsewhere, not something this function permits.
+    `interrupted` may coexist only with `logging_error`: the latter wins the
+    outcome while the former remains runtime evidence for finalization.
+    `timed_out` stays mutually exclusive with both. This never touches
+    `subprocess` or the filesystem, and never retries.
     """
 
-    if sum((timed_out, interrupted, logging_error)) > 1:
+    if timed_out and (interrupted or logging_error):
         raise ValueError(
-            "timed_out, interrupted, and logging_error are mutually exclusive"
+            "timed_out cannot coexist with interrupted or logging_error"
         )
 
-    if timed_out:
+    if logging_error:
+        outcome = RunOutcome.LOGGING_ERROR
+    elif timed_out:
         outcome = RunOutcome.TIMEOUT
     elif interrupted:
         outcome = RunOutcome.INTERRUPTED
-    elif logging_error:
-        outcome = RunOutcome.LOGGING_ERROR
     elif return_code == 0 and termination_confirmed:
         outcome = RunOutcome.SUCCEEDED
     else:
         outcome = RunOutcome.PROCESS_ERROR
 
-    return ProcessResult(
+    result_type: type[ProcessResult] = (
+        _InterruptedLoggingProcessResult
+        if logging_error and interrupted
+        else ProcessResult
+    )
+    return result_type(
         command=command,
         cwd=cwd,
         started_at=started_at,
@@ -515,7 +530,6 @@ class SubprocessRunner:
             # later logging failure supersedes the process-level signal.
             termination_confirmed = False
             timed_out = False
-            interrupted = False
             logging_error = True
 
         finished_at = self._clock.now()

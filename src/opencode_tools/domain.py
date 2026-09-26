@@ -721,6 +721,17 @@ class ProcessResult:
             )
         object.__setattr__(self, "command", command)
 
+    @property
+    def interrupted(self) -> bool:
+        """Whether cancellation was observed while producing this result.
+
+        Normally this is equivalent to an INTERRUPTED outcome. A concrete
+        process runner may preserve the same runtime-only evidence when a
+        higher-precedence technical failure determines the persisted outcome.
+        """
+
+        return self.outcome is RunOutcome.INTERRUPTED
+
 
 @dataclass(frozen=True, slots=True)
 class ProviderDiagnostic:
