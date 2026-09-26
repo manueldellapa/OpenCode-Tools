@@ -460,7 +460,7 @@ La command shape v0.1 è `opencode-tools run --workspace <path> --target <relati
 5. Viene creata in modo esclusivo la run directory e persistito il primo `RunRecord`.
 6. Il preflight completo raccoglie versioni/capacità, effective agent config, GitHub identity/auth e Git baseline clean.
 
-Il lock è mantenuto dalla baseline fino alla conclusione della finalizzazione. Dopo l'inizializzazione, ogni uscita passa da `POSTFLIGHT` best effort e `FINALIZATION`, inclusi interrupt e persistence failure per quanto ancora possibile.
+Il lock è mantenuto dalla baseline attraverso tutte le operazioni target-sensitive di finalizzazione: postflight, eventuale quarantine e preparazione durabile del candidato terminale. Solo quando queste operazioni sono concluse il lease può essere rilasciato; dopo il rilascio restano esclusivamente la chiusura della boundary di cancellazione e la pubblicazione atomica del candidato già preparato nella runtime privata. Dopo l'inizializzazione, ogni uscita passa comunque da `POSTFLIGHT` best effort e `FINALIZATION`, inclusi interrupt e persistence failure per quanto ancora possibile.
 
 ### 8.3 Logical invocation e provider attempt
 
@@ -1039,7 +1039,7 @@ Timestamp sono RFC 3339 UTC con `Z` e microsecondi, per esempio `2026-09-11T14:2
 
 ### 15.4 Atomic write e failure semantics
 
-Ogni evento materiale produce un nuovo `RunRecord` immutabile. `RunStore`:
+Ogni evento materiale produce un nuovo `RunRecord` immutabile. Per gli eventi ordinari `RunStore`:
 
 1. serializza completamente in memoria una singola versione bounded;
 2. crea nella stessa run directory un temp name imprevedibile con `O_CREAT|O_EXCL` e mode `0600`;
@@ -1047,7 +1047,9 @@ Ogni evento materiale produce un nuovo `RunRecord` immutabile. `RunStore`:
 4. chiude e usa `os.replace(temp, run.json)` sullo stesso filesystem;
 5. esegue `fsync` della directory quando supportato.
 
-Un errore elimina best effort soltanto il proprio temp, non la precedente `run.json`. Interrompe nuove invocation, tenta di registrare in memoria `LOGGING_ERROR`, emette warning e final status FAILED; è ammesso che l'ultima JSON valida sia parziale e non contenga l'errore che ne ha impedito la sostituzione. Nessun sidecar viene presentato come source of truth alternativa (FR-044, FR-052, AC-033).
+La pubblicazione del record terminale usa la stessa primitive atomica ma separa **prepare** e **commit** per chiudere la race di cancellazione della issue #129. `stage_final(record)` serializza, scrive e `fsync` un candidato privato nella run directory senza sostituire `run.json`; tale temp non è una source of truth e può essere rimpiazzato da un candidato terminale più recente finché la boundary non è chiusa. Dopo postflight/quarantine e dopo il rilascio del lease, `seal_cancellation()` linearizza la decisione: una cancellazione accettata prima del seal deve essere incorporata nel candidato terminale come `INTERRUPTED`/FAILED; una richiesta successiva appartiene invece a dopo il commit logico della run. `commit_final()` esegue quindi un solo `os.replace` che rende canonico il candidato scelto. Non è ammesso pubblicare un record terminale e poi sovrascriverlo con un secondo record per correggere una cancellazione tardiva.
+
+Un errore elimina best effort soltanto il proprio temp, non la precedente `run.json`. Interrompe nuove invocation, tenta di registrare in memoria `LOGGING_ERROR`, emette warning e final status FAILED; è ammesso che l'ultima JSON valida sia parziale e non contenga l'errore che ne ha impedito la sostituzione. Nessun temp preparato viene presentato come source of truth alternativa (FR-044, FR-052, AC-033).
 
 ### 15.5 Attempt log
 
@@ -1078,7 +1080,7 @@ V0.1 non cancella automaticamente run: la retention è esplicita responsabilità
 
 Il lock vive sotto il Git directory del checkout, risolto con `git rev-parse --absolute-git-dir`, per esempio `<git-dir>/opencode-tools/target.lock`. Questo evita il working tree, non appare nello status e non può essere aggirato scegliendo un diverso runtime root. Linked worktree con Git directory distinta ottiene un lock distinto, coerente con un target fisico distinto.
 
-La coordination directory è `0700`; lock e quarantine sono `0600`. Il lock è mantenuto con `fcntl.flock(LOCK_EX | LOCK_NB)` dall'istante precedente alla baseline fino a dopo finalizzazione. Solo dopo l'acquisizione vengono sovrascritti metadati diagnostici minimali (`run_id`, PID, host, timestamp, target digest). Il file può restare sul disco: la presenza non significa lock attivo e il kernel rilascia il lease alla chiusura/crash. Non esiste euristica stale basata sul PID, quindi PID reuse non causa sblocco pericoloso. Un filesystem che non supporta lock advisory affidabile fallisce chiuso; v0.1 assume filesystem locale POSIX.
+La coordination directory è `0700`; lock e quarantine sono `0600`. Il lock è mantenuto con `fcntl.flock(LOCK_EX | LOCK_NB)` dall'istante precedente alla baseline attraverso l'ultimo accesso target-sensitive della finalizzazione: postflight, eventuale quarantine e preparazione durabile del candidato terminale. A quel punto il lease viene rilasciato **prima** della pubblicazione canonica di `run.json`, così una cancellazione gestita durante `TargetLease.__exit__()` può ancora aggiornare il candidato non pubblicato. Dopo il rilascio non sono più consentite operazioni sul target: restano solo runtime privata, seal della cancellazione e un unico commit atomico del candidato terminale. Solo dopo l'acquisizione vengono sovrascritti metadati diagnostici minimali (`run_id`, PID, host, timestamp, target digest). Il file può restare sul disco: la presenza non significa lock attivo e il kernel rilascia il lease alla chiusura/crash. Non esiste euristica stale basata sul PID, quindi PID reuse non causa sblocco pericoloso. Un filesystem che non supporta lock advisory affidabile fallisce chiuso; v0.1 assume filesystem locale POSIX.
 
 ### 16.3 Terminazione non confermata
 

@@ -560,6 +560,7 @@ class _FakeRunStore:
         self._raise_on_persist_call = raise_on_persist_call
         self.persist_calls = 0
         self.persisted_records: list[RunRecord] = []
+        self._staged_final: RunRecord | None = None
 
     def initialize(self, workspace: Workspace, run_id: str) -> Path:
         if self._initialize_error is not None:
@@ -571,9 +572,9 @@ class _FakeRunStore:
     ) -> _RecordingSink:
         return _RecordingSink(path=Path("attempt.log"))
 
-    def persist(self, record: object) -> PersistenceStatus:
+    def _persist_attempt(self, record: RunRecord) -> PersistenceStatus:
         self.persist_calls += 1
-        self.persisted_records.append(cast("RunRecord", record))
+        self.persisted_records.append(record)
         if (
             self._raise_on_persist_call is not None
             and self.persist_calls == self._raise_on_persist_call[0]
@@ -587,6 +588,23 @@ class _FakeRunStore:
         ):
             return PersistenceStatus.FAILED
         return PersistenceStatus.OK
+
+    def persist(self, record: object) -> PersistenceStatus:
+        return self._persist_attempt(cast("RunRecord", record))
+
+    def stage_final(self, record: RunRecord) -> PersistenceStatus:
+        status = self._persist_attempt(record)
+        self._staged_final = record if status is PersistenceStatus.OK else None
+        return status
+
+    def commit_final(self) -> PersistenceStatus:
+        if self._staged_final is None:
+            raise AssertionError("stage_final must precede commit_final")
+        self._staged_final = None
+        return PersistenceStatus.OK
+
+    def abort_final(self) -> None:
+        self._staged_final = None
 
 
 class _FakeOpenCodePreflight:

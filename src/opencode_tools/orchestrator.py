@@ -152,16 +152,17 @@ own, separate branch/HEAD-unchanged-for-the-whole-run comparison. Applies
 `APPROVED`, a `SAFE` postflight, an unchanged branch/HEAD since the run's
 original baseline, and `OK` persistence, and a Git/logging/interrupt cause
 already observed is never cancelled by a later, lower-precedence one --
-quarantines
-the target *before* releasing the lease whenever a child's termination
-could not be confirmed (treating the postflight itself as `INDETERMINATE`
-in that case, since a still-possibly-live process makes any fresh probe
-unreliable), and persists exactly one final, fully-resolved `RunRecord`.
-When even that last write fails, the `IssueResult` it returns falls back to
-the last snapshot already known durable (System Design SS15.4) rather than
-ever reporting an unpersisted `APPROVED` as genuine. The lease, whenever
-one was ever acquired, is always released here, and only after this last
-persist attempt -- never before, never left to a caller.
+quarantines the target *before* releasing the lease whenever a child's
+termination could not be confirmed (treating the postflight itself as
+`INDETERMINATE` in that case, since a still-possibly-live process makes
+any fresh probe unreliable), and publishes exactly one final, fully-resolved
+`RunRecord`. Final publication is two-phase: the candidate is staged while
+the lease is held, cancellation is observed again during lease release, then
+the cancellation boundary is sealed and the chosen candidate is atomically
+published. No target-sensitive operation occurs after lease release. When
+even that final publication fails, the `IssueResult` falls back to the last
+snapshot already known durable (System Design SS15.4), never reporting an
+unpersisted `APPROVED` as genuine.
 
 The `cli.py` composition root -- parsing argv, sequencing `bootstrap_run` /
 `run_issue_pipeline` / `finalize_run`, rendering console/exit-code output
@@ -580,6 +581,7 @@ class IssueOrchestrator:
             initial_record.persistence_status is not PersistenceStatus.OK
         )
         self._cancellation_requested = False
+        self._cancellation_sealed = False
         self._last_agent_result: AgentResult | None = None
         self._current_phase: PipelinePhase = initial_record.current_phase
 
@@ -613,17 +615,18 @@ class IssueOrchestrator:
 
     @property
     def cancellation_requested(self) -> bool:
-        """Whether this run has ever been cancelled -- externally, via
-        `request_cancellation`, or because some already-observed
-        `AgentResult.process.outcome` was itself `INTERRUPTED` -- regardless
-        of whether that particular attempt's own `AttemptRecord` ever
-        reached `record`. A caller that only had `record` to fall back to
-        would lose an interruption already observed on an attempt whose own
-        `persist` (or a later operation in the same invocation, such as the
-        after-attempt Git check or the sink close) then raised a
-        *different* `OpenCodeToolsError` -- `error.outcome` alone would
-        then outrank `INTERRUPTED` in `resolve_terminal_outcome`'s
-        precedence, which is wrong: the cancellation was still real.
+        """Whether cancellation was accepted before this run's commit seal.
+
+        Before `seal_cancellation`, this covers both external
+        `request_cancellation` calls and an already-observed
+        `AgentResult.process.outcome == INTERRUPTED`, regardless of whether
+        that attempt's own `AttemptRecord` ever reached `record`. After the
+        seal, new external requests are intentionally outside this run's
+        lifecycle and cannot reopen its terminal decision (issue #129).
+        A caller that only had `record` to fall back to would otherwise
+        lose an interruption already observed on an attempt whose own
+        `persist` (or a later operation in the same invocation) raised a
+        different `OpenCodeToolsError`.
         """
 
         return self._cancellation_requested
@@ -662,18 +665,33 @@ class IssueOrchestrator:
     def request_cancellation(self) -> None:
         """Record an external cancellation request (System Design SH-001).
 
-        Idempotent. Every subsequent `run_logical_invocation` call then
-        raises `RunInterruptedError` immediately, before opening a sink (the
-        "prima"/idle case); a still-running attempt is unaffected by this
-        call alone (the "durante"/active case is instead driven by the
-        child's own `INTERRUPTED` process outcome), and any later attempt
-        that would otherwise authorize a provider retry has that retry
-        suppressed by `retry.decide_retry`'s own `cancellation_requested`
-        guard, so no backoff sleep is ever scheduled either (the
-        "nel sleep" case).
+        Idempotent while cancellation acceptance is open. Every subsequent
+        `run_logical_invocation` call then raises `RunInterruptedError`
+        immediately, before opening a sink (the "prima"/idle case); a
+        still-running attempt is unaffected by this call alone (the
+        "durante"/active case is instead driven by the child's own
+        `INTERRUPTED` process outcome), and any later attempt that would
+        otherwise authorize a provider retry has that retry suppressed by
+        `retry.decide_retry`'s own `cancellation_requested` guard, so no
+        backoff sleep is scheduled. Once `seal_cancellation` closes the
+        finalization boundary, later requests are deliberately ignored for
+        this already-committed lifecycle.
         """
 
-        self._cancellation_requested = True
+        if not self._cancellation_sealed:
+            self._cancellation_requested = True
+
+    def seal_cancellation(self) -> bool:
+        """Close this run's cancellation acceptance at the commit point.
+
+        The assignment is the lifecycle linearization point for issue #129:
+        a signal handled before it is accepted and reflected by the returned
+        flag; a signal handled afterward belongs after this run's terminal
+        decision and cannot reopen an already-sealed commit.
+        """
+
+        self._cancellation_sealed = True
+        return self._cancellation_requested
 
     def run_logical_invocation(
         self,
@@ -1682,82 +1700,26 @@ def finalize_run(
     max_review_cycles: int,
     last_accepted_git_state: GitState | None = None,
     late_cancellation_check: Callable[[], bool] | None = None,
+    seal_cancellation: Callable[[], bool] | None = None,
 ) -> IssueResult:
-    """Converge one terminal path into postflight and finalization (M13-04).
+    """Converge one terminal path through a cancellation-aware commit.
 
-    Called once, whenever any terminal path -- `bootstrap_run`'s own
-    preflight failures once a run directory exists, or every stop
-    `run_issue_pipeline` reports -- has nothing left to do but reach
-    `FINISHED`; never invokes an agent role.
+    Finalization now has an explicit prepare/commit boundary (issue #129).
+    The terminal record is durably staged while the target lease is still
+    held but is *not* yet canonical `run.json`. Cancellation is checked
+    after that potentially slow staging write and again after lease release;
+    if observed, only the unpublished staged candidate is replaced with an
+    `INTERRUPTED`/FAILED candidate. A live orchestrator then seals
+    cancellation acceptance and the staged candidate is published exactly
+    once with `commit_final`.
 
-    Re-checks Git exactly once more (`GitSafetyPort.check`, `role=None`, as
-    a pure continuity probe) against the *last checkpoint the pipeline
-    itself accepted* -- never `record.git_baseline`, the run's original
-    baseline, which `evaluate_final_gate` still compares separately for the
-    run's own overall branch/HEAD inventory -- whenever such a checkpoint
-    exists; skipped, and treated as `GitSafetyStatus.INDETERMINATE`, when it
-    does not (System Design SS11.3). Since no further delta is authorized
-    once the last role has stopped running, `role=None` means even a
-    content-only change is `UNSAFE` here, unlike a role's own `after` check.
-    A `termination_confirmed` of `False` -- a child process
-    group that might still be alive -- likewise forces this postflight
-    determination to `INDETERMINATE` for gate/precedence purposes even when
-    the fresh probe itself came back clean (a live survivor makes any
-    contemporaneous probe unreliable); the real probe evidence, whatever it
-    was, is still preserved verbatim on the persisted `git_postflight`.
-    `False` also quarantines the target (`TargetLease.quarantine`) *before*
-    the lease is ever released (System Design SS16.3; ADR-006) -- a
-    quarantine write failure is folded into the persisted record's own
-    `errors` (System Design SS15.4) rather than raised or swallowed, so it
-    stays visible without masking `trigger_outcome`.
-
-    `state_machine.resolve_terminal_outcome` and `evaluate_final_gate` are
-    the only two places that decide the resolved terminal category and
-    `FinalStatus`, exactly as frozen elsewhere in this module (SS8.4,
-    SS13.3): `review_status` is the reviewer's own last, *historical* verdict
-    (never rewritten, never overridden by a later drift -- it is the gate,
-    not the record of what the reviewer said, that denies approval on
-    drift), and every already-observed cause (Git safety, persistence,
-    interruption) keeps its place in `resolve_terminal_outcome`'s precedence
-    without cancelling `trigger_outcome`, the technical reason this path
-    reached postflight in the first place.
-
-    Persists exactly one final `RunRecord`, advancing `current_phase`
-    through `POSTFLIGHT`/`FINALIZATION` to `FINISHED` via
-    `state_machine.transition` like any other phase change, and marking
-    `changes_preserved=True` unconditionally -- Python never mutates or
-    recovers the target, on success or failure alike (FR-050). The lease,
-    if there is one, is released only after this attempt, regardless of its
-    outcome. If it fails, the returned `IssueResult` falls back to `record`
-    -- the last snapshot already known durable -- with `FinalStatus.FAILED`
-    and the freshly-resolved `LOGGING_ERROR`-inclusive terminal outcome,
-    never reporting an unpersisted `APPROVED` as genuine (System Design
-    SS15.4).
-
-    `last_accepted_git_state`, when given, is used verbatim as this
-    checkpoint instead of reconstructing it from `record.attempts`. Every
-    caller with a live `IssueOrchestrator` still running (the normal
-    `run_issue_pipeline` path, and a caught mid-pipeline error alike) should
-    pass its own `last_accepted_git_state` here: `record` can be stale --
-    missing exactly the attempt whose own `persist` is what caused this
-    call -- even though that attempt's `SAFE` `after` checkpoint was
-    already accepted before the persist failure ever happened. Left `None`
-    (`bootstrap_run`'s own late-stage failures, before any orchestrator
-    exists, and every existing caller unaffected by this) reconstructs it
-    from `record` exactly as before.
-
-    `late_cancellation_check`, when given, is called exactly once, right
-    before the terminal outcome is resolved -- i.e. after the postflight
-    Git probe above, the slowest and only externally-observable step this
-    function takes. A caller with a live `IssueOrchestrator` (again, every
-    `run_composed_pipeline` path) should pass its own `cancellation_
-    requested` reader here: `interrupted` alone is whatever the caller
-    already knew *before* calling this function, but a SIGINT/SIGTERM can
-    still arrive during this function's own postflight probe (issue #111).
-    A `True` result upgrades `interrupted` for the rest of this call,
-    exactly as if the caller had observed it in time. Left `None`
-    (`bootstrap_run`'s own late-stage failures, before any orchestrator
-    exists) skips the check entirely, preserving existing behavior.
+    This keeps `run.json` and `IssueResult` coherent without a second
+    terminal overwrite. Releasing the target lease before publication is
+    safe because postflight, quarantine, and every target-sensitive action
+    have already completed; after release this function touches only the
+    private runtime artifact. The cancellation seal is the lifecycle
+    linearization point: requests accepted before it affect this run,
+    requests after it cannot reopen the committed terminal decision.
     """
 
     if type(record) is not RunRecord:
@@ -1810,33 +1772,6 @@ def finalize_run(
                 ),
             )
 
-    # A SIGINT/SIGTERM arriving during the postflight probe above -- the
-    # one externally-observable step this function takes -- would otherwise
-    # be silently absorbed: `interrupted` above is only what the caller
-    # already knew before calling this function (issue #111).
-    if late_cancellation_check is not None and late_cancellation_check():
-        interrupted = True
-
-    terminal_precedence = resolve_terminal_outcome(
-        trigger_outcome=trigger_outcome,
-        git_safety_status=effective_git_safety_status,
-        interrupted=interrupted,
-        persistence_status=record.persistence_status,
-    )
-    final_status = evaluate_final_gate(
-        review_status=review_status,
-        postflight_git_safety_status=effective_git_safety_status,
-        baseline_branch=record.git_baseline.branch if record.git_baseline else None,
-        baseline_head=record.git_baseline.head if record.git_baseline else None,
-        postflight_branch=postflight.state.branch if postflight is not None else None,
-        postflight_head=postflight.state.head if postflight is not None else None,
-        persistence_status=record.persistence_status,
-    )
-    expected_exit_code = resolve_exit_code(
-        final_status=final_status,
-        terminal_outcome=terminal_precedence.terminal_outcome,
-    )
-
     postflight_transition = transition(
         PipelineState(phase=PipelinePhase.POSTFLIGHT),
         TransitionEvent(kind=TransitionEventKind.POSTFLIGHT_COMPLETED),
@@ -1848,71 +1783,175 @@ def finalize_run(
         max_review_cycles=max_review_cycles,
     )
 
-    finished_at = clock.now()
-    duration_ns = max(
-        int((finished_at - record.started_at).total_seconds() * 1_000_000_000), 0
-    )
+    def _observe_cancellation() -> bool:
+        nonlocal interrupted
+        if (
+            not interrupted
+            and late_cancellation_check is not None
+            and late_cancellation_check()
+        ):
+            interrupted = True
+            return True
+        return False
 
-    final_record = replace(
-        record,
-        current_phase=finalization_transition.state.phase,
-        finished_at=finished_at,
-        duration_ns=duration_ns,
-        terminal_outcome=terminal_precedence.terminal_outcome,
-        git_postflight=postflight,
-        git_safety_status=effective_git_safety_status,
-        errors=errors,
-        trigger_outcome=terminal_precedence.terminal_outcome,
-        final_status=final_status,
-        expected_exit_code=expected_exit_code,
-        changes_preserved=True,
-        termination_confirmed=termination_confirmed,
-    )
-
-    persist_status = run_store.persist(final_record)
-
-    if lease is not None:
-        lease.__exit__(None, None, None)
-
-    if persist_status is PersistenceStatus.OK:
-        return IssueResult(
-            run_id=final_record.run_id,
-            artifact_path=final_record.artifact_path,
+    def _build_terminal_record() -> tuple[RunRecord, RunOutcome, FinalStatus, int]:
+        terminal_precedence = resolve_terminal_outcome(
+            trigger_outcome=trigger_outcome,
+            git_safety_status=effective_git_safety_status,
+            interrupted=interrupted,
+            persistence_status=record.persistence_status,
+        )
+        # Cancellation blocks approval without rewriting the reviewer's
+        # historical verdict preserved in the attempt timeline.
+        gate_review_status = None if interrupted else review_status
+        final_status = evaluate_final_gate(
+            review_status=gate_review_status,
+            postflight_git_safety_status=effective_git_safety_status,
+            baseline_branch=record.git_baseline.branch if record.git_baseline else None,
+            baseline_head=record.git_baseline.head if record.git_baseline else None,
+            postflight_branch=postflight.state.branch
+            if postflight is not None
+            else None,
+            postflight_head=postflight.state.head if postflight is not None else None,
+            persistence_status=record.persistence_status,
+        )
+        expected_exit_code = resolve_exit_code(
+            final_status=final_status,
+            terminal_outcome=terminal_precedence.terminal_outcome,
+        )
+        finished_at = clock.now()
+        duration_ns = max(
+            int((finished_at - record.started_at).total_seconds() * 1_000_000_000),
+            0,
+        )
+        terminal_record = replace(
+            record,
+            current_phase=finalization_transition.state.phase,
+            finished_at=finished_at,
+            duration_ns=duration_ns,
+            terminal_outcome=terminal_precedence.terminal_outcome,
+            git_postflight=postflight,
+            git_safety_status=effective_git_safety_status,
+            errors=errors,
+            trigger_outcome=terminal_precedence.terminal_outcome,
             final_status=final_status,
             expected_exit_code=expected_exit_code,
-            trigger_outcome=terminal_precedence.terminal_outcome,
+            changes_preserved=True,
+            termination_confirmed=termination_confirmed,
+        )
+        return (
+            terminal_record,
+            terminal_precedence.terminal_outcome,
+            final_status,
+            expected_exit_code,
+        )
+
+    def _fallback(persist_status: PersistenceStatus) -> IssueResult:
+        fallback_precedence = resolve_terminal_outcome(
+            trigger_outcome=trigger_outcome,
             git_safety_status=effective_git_safety_status,
-            # `record` may already have carried a non-`OK` persistence
-            # status into this call (an attempt whose own `AttemptRecord`
-            # or log never became durable, though `run.json` itself was
-            # still writable) -- that fact must not be erased just because
-            # *this* write of `run.json` succeeds; `_render_issue_result`'s
-            # incomplete-artifact warning depends on it surviving here.
-            persistence_status=final_record.persistence_status,
+            interrupted=interrupted,
+            persistence_status=persist_status,
+        )
+        return IssueResult(
+            run_id=record.run_id,
+            artifact_path=record.artifact_path,
+            final_status=FinalStatus.FAILED,
+            expected_exit_code=resolve_exit_code(
+                final_status=FinalStatus.FAILED,
+                terminal_outcome=fallback_precedence.terminal_outcome,
+            ),
+            trigger_outcome=fallback_precedence.terminal_outcome,
+            git_safety_status=effective_git_safety_status,
+            persistence_status=persist_status,
             changes_preserved=True,
             termination_confirmed=termination_confirmed,
         )
 
-    # The final write itself failed: `record` -- already durable when this
-    # function was called -- remains the last valid run.json (System Design
-    # SS15.4); an unpersisted APPROVED is never reported as genuine.
-    fallback_precedence = resolve_terminal_outcome(
-        trigger_outcome=trigger_outcome,
-        git_safety_status=effective_git_safety_status,
-        interrupted=interrupted,
-        persistence_status=persist_status,
+    lease_released = False
+
+    def _release_lease() -> None:
+        nonlocal lease_released
+        if lease is not None and not lease_released:
+            lease.__exit__(None, None, None)
+            lease_released = True
+
+    _observe_cancellation()
+    final_record, terminal_outcome, final_status, expected_exit_code = (
+        _build_terminal_record()
     )
+    stage_status = run_store.stage_final(final_record)
+    if stage_status is not PersistenceStatus.OK:
+        run_store.abort_final()
+        _release_lease()
+        if seal_cancellation is not None:
+            interrupted = interrupted or seal_cancellation()
+        else:
+            _observe_cancellation()
+        return _fallback(stage_status)
+
+    # Cancellation during serialization/write/fsync updates only the
+    # unpublished candidate, never canonical run.json.
+    if _observe_cancellation():
+        final_record, terminal_outcome, final_status, expected_exit_code = (
+            _build_terminal_record()
+        )
+        stage_status = run_store.stage_final(final_record)
+        if stage_status is not PersistenceStatus.OK:
+            run_store.abort_final()
+            _release_lease()
+            if seal_cancellation is not None:
+                interrupted = interrupted or seal_cancellation()
+            return _fallback(stage_status)
+
+    # All target-sensitive work is complete. Release now so a signal raised
+    # during lease cleanup can still change the unpublished terminal record.
+    _release_lease()
+
+    if _observe_cancellation():
+        final_record, terminal_outcome, final_status, expected_exit_code = (
+            _build_terminal_record()
+        )
+        stage_status = run_store.stage_final(final_record)
+        if stage_status is not PersistenceStatus.OK:
+            run_store.abort_final()
+            if seal_cancellation is not None:
+                interrupted = interrupted or seal_cancellation()
+            return _fallback(stage_status)
+
+    if seal_cancellation is not None:
+        sealed_interrupted = seal_cancellation()
+        if sealed_interrupted and not interrupted:
+            interrupted = True
+            final_record, terminal_outcome, final_status, expected_exit_code = (
+                _build_terminal_record()
+            )
+            stage_status = run_store.stage_final(final_record)
+            if stage_status is not PersistenceStatus.OK:
+                run_store.abort_final()
+                return _fallback(stage_status)
+    elif _observe_cancellation():
+        final_record, terminal_outcome, final_status, expected_exit_code = (
+            _build_terminal_record()
+        )
+        stage_status = run_store.stage_final(final_record)
+        if stage_status is not PersistenceStatus.OK:
+            run_store.abort_final()
+            return _fallback(stage_status)
+
+    commit_status = run_store.commit_final()
+    if commit_status is not PersistenceStatus.OK:
+        run_store.abort_final()
+        return _fallback(commit_status)
+
     return IssueResult(
-        run_id=record.run_id,
-        artifact_path=record.artifact_path,
-        final_status=FinalStatus.FAILED,
-        expected_exit_code=resolve_exit_code(
-            final_status=FinalStatus.FAILED,
-            terminal_outcome=fallback_precedence.terminal_outcome,
-        ),
-        trigger_outcome=fallback_precedence.terminal_outcome,
+        run_id=final_record.run_id,
+        artifact_path=final_record.artifact_path,
+        final_status=final_status,
+        expected_exit_code=expected_exit_code,
+        trigger_outcome=terminal_outcome,
         git_safety_status=effective_git_safety_status,
-        persistence_status=persist_status,
+        persistence_status=final_record.persistence_status,
         changes_preserved=True,
         termination_confirmed=termination_confirmed,
     )

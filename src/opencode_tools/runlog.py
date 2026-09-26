@@ -425,19 +425,17 @@ def write_private_file_atomically(path: Path, payload: bytes) -> None:
     """Atomically replace `path` with `payload` (System Design SS15.4;
     ADR-008; M10-03).
 
-    The same mechanism `persist_run_record` uses inline for `run.json`,
-    factored out so another artifact -- `locking.py`'s persistent
-    quarantine marker -- gets the identical atomicity and failure-cleanup
-    guarantee without duplicating it: a fresh, unpredictable, exclusive,
+    The same private-temp / flush / fsync / atomic-replace mechanism used
+    by the run-record prepare/commit primitives, factored out so another
+    artifact -- `locking.py`'s persistent quarantine marker -- gets the
+    identical atomicity and failure-cleanup guarantee without coupling its
+    error taxonomy to `RunRecord`: a fresh, unpredictable, exclusive,
     mode-`0600` temp file in the same directory (`open_private_exclusive`),
     `flush` and `fsync`, `os.replace()` onto `path`, then a best-effort
     directory `fsync`. A previously persisted file at `path` is left
     untouched on any failure -- only this call's own temp file is
     best-effort removed. Raises `OSError` unwrapped so each caller maps
-    it onto its own error taxonomy and code; `persist_run_record` keeps
-    its own inline sequence rather than calling this, to preserve its two
-    already-shipped, separately coded write-phase and replace-phase
-    failures unchanged.
+    it onto its own error taxonomy and code.
     """
 
     directory = path.parent
@@ -462,25 +460,15 @@ def write_private_file_atomically(path: Path, payload: bytes) -> None:
     _fsync_directory_best_effort(directory)
 
 
-def persist_run_record(record: RunRecord) -> None:
-    """Atomically replace `record.artifact_path` (`run.json`) on disk.
+def prepare_run_record(record: RunRecord) -> Path:
+    """Durably stage one `RunRecord` without replacing canonical `run.json`.
 
-    Follows System Design SS15.4 exactly: serialize fully in memory first
-    (`serialize_run_record`), write a fresh, unpredictable, exclusive
-    `0600` temp file in the same run directory (`open_private_exclusive`),
-    flush and `fsync` it, close it, `os.replace()` it onto `run.json` on the
-    same filesystem, then best-effort `fsync` the directory (a durability
-    refinement some filesystems do not support, so a failure there is never
-    fatal). A failure at any other step raises `LoggingError` and removes
-    only its own temp file -- a previously persisted, valid `run.json` is
-    never touched, recovered, or presented as a second source of truth
-    (ADR-008; FR-044, FR-052; AC-033).
-
-    Raising is the whole fail-closed contract here: this function does not
-    -- and, with no orchestrator yet built, cannot -- itself stop further
-    invocations; that a caller sees this exception and halts is exactly the
-    mechanism the design relies on instead of silently treating a failed
-    write as success.
+    This is the prepare half of the terminal commit boundary introduced for
+    issue #129. The complete JSON is serialized in memory, written to one
+    private same-directory temp file, flushed and fsynced, then returned to
+    the caller still unpublished. Until `commit_prepared_run_record` runs,
+    the existing `run.json` remains the only machine-readable source of
+    truth. A failed prepare removes only its own temp file.
     """
 
     if type(record) is not RunRecord:
@@ -512,6 +500,24 @@ def persist_run_record(record: RunRecord) -> None:
             technical_detail=type(error).__name__,
         ) from None
 
+    return temp_path
+
+
+def commit_prepared_run_record(record: RunRecord, temp_path: Path) -> None:
+    """Atomically publish a previously prepared terminal `RunRecord`.
+
+    `temp_path` must belong to the same run directory as `run.json`.
+    The only source-of-truth transition is the single `os.replace` here;
+    no second terminal overwrite is needed to honor cancellation.
+    """
+
+    if type(record) is not RunRecord:
+        raise TypeError("record must be RunRecord")
+    if not isinstance(temp_path, Path):
+        raise TypeError("temp_path must be Path")
+    if temp_path.parent != record.artifact_path.parent:
+        raise ValueError("temp_path must be in the run.json directory")
+
     try:
         os.replace(temp_path, record.artifact_path)
     except OSError as error:
@@ -522,7 +528,30 @@ def persist_run_record(record: RunRecord) -> None:
             technical_detail=type(error).__name__,
         ) from None
 
-    _fsync_directory_best_effort(run_directory)
+    _fsync_directory_best_effort(record.artifact_path.parent)
+
+
+def discard_prepared_run_record(temp_path: Path) -> None:
+    """Best-effort remove an unpublished prepared `RunRecord` candidate."""
+
+    if not isinstance(temp_path, Path):
+        raise TypeError("temp_path must be Path")
+    _best_effort_unlink(temp_path)
+
+
+def persist_run_record(record: RunRecord) -> None:
+    """Atomically replace `record.artifact_path` (`run.json`) on disk.
+
+    Ordinary material-event persistence keeps the original one-shot
+    semantics: prepare a private, fsynced same-directory temp file and
+    immediately publish it with one atomic replace. Finalization may split
+    those two halves through `RunStorePort.stage_final`/`commit_final`
+    so cancellation can still change the *unpublished* terminal candidate
+    without ever overwriting one terminal `run.json` with another.
+    """
+
+    temp_path = prepare_run_record(record)
+    commit_prepared_run_record(record, temp_path)
 
 
 def _format_timestamp(value: datetime) -> str:
@@ -650,11 +679,14 @@ __all__ = (
     "attempt_log_filename",
     "bootstrap_runtime_root",
     "check_platform_baseline",
+    "commit_prepared_run_record",
     "create_run_directory",
+    "discard_prepared_run_record",
     "format_run_id",
     "generate_run_id",
     "open_private_exclusive",
     "persist_run_record",
+    "prepare_run_record",
     "serialize_run_record",
     "write_private_file_atomically",
 )

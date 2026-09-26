@@ -358,6 +358,26 @@ class RecordingRunStorePort:
             return self._persist_results.pop(0)
         return PersistenceStatus.OK
 
+    def stage_final(self, record: RunRecord) -> PersistenceStatus:
+        # Keep the legacy `persist_calls` timeline used throughout this
+        # fault-injection suite: staging replaces the old final `persist`
+        # attempt but does not yet publish canonical run.json.
+        if self._order_log is not None:
+            self._order_log.append(f"stage_final:{record.current_phase.value}")
+        self.persist_calls.append(record)
+        if self._persist_results is not None:
+            return self._persist_results.pop(0)
+        return PersistenceStatus.OK
+
+    def commit_final(self) -> PersistenceStatus:
+        if self._order_log is not None:
+            self._order_log.append("commit_final")
+        return PersistenceStatus.OK
+
+    def abort_final(self) -> None:
+        if self._order_log is not None:
+            self._order_log.append("abort_final")
+
 
 class ScriptedAgentRunner:
     """An `AgentRunner` fake returning one scripted result per call."""

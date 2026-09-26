@@ -39,6 +39,7 @@ from opencode_tools.domain import (
     AttemptRecord,
     ConfigSource,
     ExecutionConfig,
+    FinalStatus,
     FrozenJsonValue,
     GitCheckRecord,
     GitSafetyStatus,
@@ -63,9 +64,12 @@ from opencode_tools.runlog import (
     AttemptLogFileSink,
     allocate_run_directory,
     attempt_log_filename,
+    commit_prepared_run_record,
     create_run_directory,
+    discard_prepared_run_record,
     open_private_exclusive,
     persist_run_record,
+    prepare_run_record,
     serialize_run_record,
 )
 
@@ -149,6 +153,50 @@ def _app_config(*, runtime_root: Path) -> AppConfig:
 
 def _leftover_temp_files(run_directory: Path) -> list[Path]:
     return [path for path in run_directory.iterdir() if path.name != "run.json"]
+
+
+def test_prepare_run_record_does_not_publish_until_commit(tmp_path: Path) -> None:
+    run_directory = tmp_path / "run"
+    run_directory.mkdir()
+    artifact_path = run_directory / "run.json"
+    original = _run_record(artifact_path=artifact_path)
+    persist_run_record(original)
+    original_payload = artifact_path.read_bytes()
+
+    terminal = replace(
+        original,
+        current_phase=PipelinePhase.FINISHED,
+        final_status=FinalStatus.FAILED,
+        expected_exit_code=20,
+    )
+    staged_path = prepare_run_record(terminal)
+
+    assert staged_path.exists()
+    assert artifact_path.read_bytes() == original_payload
+
+    commit_prepared_run_record(terminal, staged_path)
+
+    assert not staged_path.exists()
+    assert artifact_path.read_bytes() == serialize_run_record(terminal)
+
+
+def test_discard_prepared_run_record_leaves_canonical_run_json_untouched(
+    tmp_path: Path,
+) -> None:
+    run_directory = tmp_path / "run"
+    run_directory.mkdir()
+    artifact_path = run_directory / "run.json"
+    original = _run_record(artifact_path=artifact_path)
+    persist_run_record(original)
+    original_payload = artifact_path.read_bytes()
+
+    staged_path = prepare_run_record(
+        replace(original, current_phase=PipelinePhase.FINISHED)
+    )
+    discard_prepared_run_record(staged_path)
+
+    assert not staged_path.exists()
+    assert artifact_path.read_bytes() == original_payload
 
 
 def test_create_run_directory_creates_runs_and_the_run_directory_privately(

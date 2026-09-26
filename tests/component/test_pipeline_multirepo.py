@@ -363,6 +363,15 @@ class RecordingRunStorePort:
         self.persist_calls.append(record)
         return PersistenceStatus.OK
 
+    def stage_final(self, record: RunRecord) -> PersistenceStatus:
+        raise AssertionError("finalization is not exercised by these tests")
+
+    def commit_final(self) -> PersistenceStatus:
+        raise AssertionError("finalization is not exercised by these tests")
+
+    def abort_final(self) -> None:
+        return None
+
 
 def _multirepo_workspace(
     tmp_path: Path,

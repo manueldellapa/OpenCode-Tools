@@ -223,6 +223,15 @@ class SequencedRunStorePort:
             return self._persist_results.pop(0)
         return PersistenceStatus.OK
 
+    def stage_final(self, record: RunRecord) -> PersistenceStatus:
+        raise AssertionError("finalization is not exercised by these tests")
+
+    def commit_final(self) -> PersistenceStatus:
+        raise AssertionError("finalization is not exercised by these tests")
+
+    def abort_final(self) -> None:
+        return None
+
 
 class SequencedAgentRunner:
     """An `AgentRunner` fake returning one scripted result per call, in order."""
