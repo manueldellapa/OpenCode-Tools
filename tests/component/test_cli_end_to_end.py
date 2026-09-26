@@ -267,9 +267,7 @@ def test_runner_record_write_faults_finalize_as_logging_error(
     )
     monkeypatch.setenv("FAKE_OPENCODE_EXPORT_FILE", str(export_file))
 
-    def _raise_write_failure(
-        sink: AttemptLogFileSink, **kwargs: object
-    ) -> None:
+    def _raise_write_failure(sink: AttemptLogFileSink, **kwargs: object) -> None:
         del sink, kwargs
         raise OSError("simulated runner-record write failure")
 
