@@ -799,22 +799,6 @@ class _CliAgentRunner:
             process_result = self._process_runner.run(
                 spec, sink=_TeeSink(sink, capture)
             )
-            if (
-                isinstance(sink, runlog.AttemptLogFileSink)
-                and process_result.outcome is not RunOutcome.LOGGING_ERROR
-            ):
-                try:
-                    sink.write_footer(
-                        outcome=process_result.outcome,
-                        duration_ns=process_result.duration_ns,
-                    )
-                except OSError as error:
-                    raise _AttemptLogFooterError(
-                        path=sink.path,
-                        technical_detail=type(error).__name__,
-                        termination_confirmed=process_result.termination_confirmed,
-                    ) from None
-
             stdout_bytes = capture.bytes_for("stdout")
             stdout_text = _decode_utf8_lenient(stdout_bytes)
             provider_diagnostic = (
@@ -875,6 +859,22 @@ class _CliAgentRunner:
                         self._clock.now(),
                     )
                     terminal_response = None
+
+            if (
+                isinstance(sink, runlog.AttemptLogFileSink)
+                and process_result.outcome is not RunOutcome.LOGGING_ERROR
+            ):
+                try:
+                    sink.write_footer(
+                        outcome=process_result.outcome,
+                        duration_ns=process_result.duration_ns,
+                    )
+                except OSError as error:
+                    raise _AttemptLogFooterError(
+                        path=sink.path,
+                        technical_detail=type(error).__name__,
+                        termination_confirmed=process_result.termination_confirmed,
+                    ) from None
 
             timed_out = process_result.timed_out
             provider_error = provider_diagnostic is not None

@@ -5,7 +5,9 @@ job)."""
 
 from __future__ import annotations
 
+import base64
 import hashlib
+import json
 import os
 import signal
 import subprocess
@@ -19,6 +21,7 @@ from typing import Final, Self, cast
 
 import pytest
 
+from opencode_tools import coder_sandbox
 from opencode_tools.cli import (
     _CaptureSink,
     _CliAgentRunner,
@@ -70,6 +73,7 @@ from opencode_tools.errors import (
     ProtocolError,
 )
 from opencode_tools.opencode import classify_provider_signal, open_run_capture_sink
+from opencode_tools.runlog import AttemptLogFileSink
 from opencode_tools.ports import (
     AgentRunner,
     AttemptLogSink,
@@ -1668,6 +1672,22 @@ _ARCHITECT_EXPORT_JSON = (
     / "export"
     / "architect-correct-agent.json"
 ).read_bytes()
+_CODER_COMPLETED_NDJSON = (
+    Path(__file__).resolve().parents[1]
+    / "fixtures"
+    / "opencode"
+    / "1.17.18"
+    / "run"
+    / "coder-completed-success.ndjson"
+).read_bytes()
+_CODER_EXPORT_JSON = (
+    Path(__file__).resolve().parents[1]
+    / "fixtures"
+    / "opencode"
+    / "1.17.18"
+    / "export"
+    / "coder-correct-agent.json"
+).read_bytes()
 
 
 def _agent_runner(
@@ -1820,6 +1840,102 @@ def test_agent_runner_preserves_identity_verification_failure_code(
     assert result.provider_diagnostic is None
     assert result.identity_verification_error_code == expected_code
     assert len(process_runner.specs) == 2
+
+
+def test_coder_promotion_failure_diagnostic_precedes_runner_footer(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Codex P2 on #133: promotion diagnostics are attempt-log writes too,
+    so the runner footer must be emitted only after a blocked promotion has
+    written its diagnostic and must remain the final record."""
+
+    workspace, target = _workspace_and_target(tmp_path)
+    sandbox_root = tmp_path / "sandbox"
+    sandbox_root.mkdir()
+    clock = _SteppingClock()
+    process_runner = _ScriptedProcessRunner(
+        [
+            (
+                _CODER_COMPLETED_NDJSON,
+                _process_result(
+                    stdout_bytes=_CODER_COMPLETED_NDJSON,
+                    outcome=RunOutcome.SUCCEEDED,
+                ),
+            ),
+            (
+                _CODER_EXPORT_JSON,
+                _process_result(
+                    stdout_bytes=_CODER_EXPORT_JSON,
+                    outcome=RunOutcome.SUCCEEDED,
+                ),
+            ),
+        ]
+    )
+
+    class _Sandbox:
+        root = sandbox_root
+
+    sandbox = cast("coder_sandbox.CoderSandbox", _Sandbox())
+
+    def _prepare(*args: object, **kwargs: object) -> coder_sandbox.CoderSandbox:
+        del args, kwargs
+        return sandbox
+
+    def _promote(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+        raise coder_sandbox.CoderSandboxError("simulated promotion failure")
+
+    def _cleanup(value: coder_sandbox.CoderSandbox) -> None:
+        assert value is sandbox
+
+    monkeypatch.setattr(coder_sandbox, "prepare_coder_sandbox", _prepare)
+    monkeypatch.setattr(coder_sandbox, "promote_coder_changes", _promote)
+    monkeypatch.setattr(coder_sandbox, "cleanup_coder_sandbox", _cleanup)
+
+    runner = _CliAgentRunner(
+        cast("ProcessRunner", process_runner),
+        executable=Path("/usr/bin/opencode"),
+        target_root=target.root,
+        opencode_timeout_seconds=30,
+        utility_timeout_seconds=10,
+        termination_grace_seconds=2,
+        git_executable=Path("/usr/bin/git"),
+        clock=clock,
+        sandbox_coder=True,
+    )
+    runner.bind_issue_locator(_issue_locator())
+    runner.bind_target(target)
+
+    sink = AttemptLogFileSink(tmp_path, "coder.log", clock)
+    result = runner.run(
+        AgentRole.CODER,
+        "prompt",
+        workspace,
+        review_cycle=1,
+        provider_attempt=1,
+        sink=sink,
+    )
+    sink.close()
+
+    assert result.outcome is RunOutcome.PROTOCOL_ERROR
+    records = [
+        json.loads(line)
+        for line in (tmp_path / "coder.log").read_text(encoding="utf-8").splitlines()
+    ]
+    assert records[-1]["channel"] == "runner"
+    assert (
+        json.loads(base64.b64decode(records[-1]["payload_base64"]))["event"] == "footer"
+    )
+    stderr_payloads = [
+        base64.b64decode(record["payload_base64"])
+        for record in records[:-1]
+        if record["channel"] == "stderr"
+    ]
+    assert any(
+        payload.startswith(b"coder sandbox promotion blocked: simulated promotion failure")
+        for payload in stderr_payloads
+    )
 
 
 def test_agent_runner_builds_direct_coder_spec_when_sandbox_is_disabled(
