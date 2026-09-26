@@ -28,7 +28,8 @@ from pathlib import Path
 import pytest
 
 from opencode_tools.cli import main
-from opencode_tools.domain import ProcessSpec, RunOutcome
+from opencode_tools.domain import ProcessResult, ProcessSpec, RunOutcome
+from opencode_tools.ports import AttemptLogSink
 from opencode_tools.process import SubprocessRunner
 from opencode_tools.runlog import AttemptLogFileSink
 
@@ -333,12 +334,11 @@ def test_footer_failure_preserves_unconfirmed_termination_for_quarantine(
     original_run = SubprocessRunner.run
 
     def _run_with_unconfirmed_agent(
-        runner: SubprocessRunner, spec: object, *, sink: object
-    ) -> object:
+        runner: SubprocessRunner, spec: ProcessSpec, *, sink: AttemptLogSink
+    ) -> ProcessResult:
         result = original_run(runner, spec, sink=sink)
         if (
-            isinstance(spec, ProcessSpec)
-            and Path(spec.argv[0]).name == "opencode"
+            Path(spec.argv[0]).name == "opencode"
             and len(spec.argv) > 1
             and spec.argv[1] == "run"
         ):
