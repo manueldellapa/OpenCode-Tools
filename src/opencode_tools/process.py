@@ -30,7 +30,7 @@ from typing import IO, cast
 from opencode_tools.domain import ProcessResult, ProcessSpec, RunOutcome
 from opencode_tools.ports import AttemptLogSink, Clock, LogChannel
 
-_CREDENTIAL_IN_URL = re.compile(r"://[^/@\s]+@")
+_CREDENTIAL_IN_URL = re.compile(r"://[^/?#\s]+@")
 _EMPTY_SHA256 = hashlib.sha256(b"").hexdigest()
 _CHUNK_SIZE = 65536
 _POLL_INTERVAL_SECONDS = 0.01
