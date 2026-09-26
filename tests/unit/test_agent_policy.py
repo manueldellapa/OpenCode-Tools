@@ -372,6 +372,12 @@ def test_coder_body_forbids_branch_creation() -> None:
     assert "branch" in body.lower(), "coder.md must forbid branch creation"
 
 
+def test_coder_body_forbids_direct_ref_mutation_commands() -> None:
+    lowered = _load_agent_definition("coder")[1].lower()
+    for command in ("git update-ref", "git symbolic-ref"):
+        assert command in lowered, f"coder.md must forbid {command}"
+
+
 def test_coder_body_forbids_push() -> None:
     _, body = _load_agent_definition("coder")
     assert "push" in body.lower(), "coder.md must forbid push"
@@ -586,6 +592,8 @@ def _synthetic_effective_bash_action(token: str, command: str) -> str | None:
         "git commit -m x",
         "git tag -d v1.0.0",
         "git branch -D temporary",
+        "git update-ref refs/heads/main deadbeef",
+        "git symbolic-ref HEAD refs/heads/other",
         "git push origin HEAD",
         "git merge main",
         "git rebase main",
