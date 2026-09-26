@@ -390,9 +390,7 @@ def test_serialize_run_record_preserves_multiple_ordered_errors() -> None:
 
 def test_serialize_run_record_never_leaks_a_credential_or_full_environment() -> None:
     secret = "ghp_run_schema_literal_secret_0123456789"
-    credential_url = (
-        f"https://oauth2:{secret}@github.com/example/backend.git"
-    )
+    credential_url = f"https://oauth2:{secret}@github.com/example/backend.git"
     raw_environment = {
         "GH_TOKEN": secret,
         "OPENCODE_TOOLS_FULL_ENV_SENTINEL": "full-environment-value-118",
@@ -423,12 +421,10 @@ def test_serialize_run_record_never_leaks_a_credential_or_full_environment() -> 
         "github_targets",
     }
 
-    sanitized_command = sanitize_command(
-        ("/usr/bin/git", "ls-remote", credential_url)
-    )
-    sanitized_detail = sanitize_command(
-        (f"remote probe failed for {credential_url}",)
-    )[0]
+    sanitized_command = sanitize_command(("/usr/bin/git", "ls-remote", credential_url))
+    sanitized_detail = sanitize_command((f"remote probe failed for {credential_url}",))[
+        0
+    ]
 
     process_result = replace(
         _process_result(log_path=Path("credential-bearing-command.log")),
