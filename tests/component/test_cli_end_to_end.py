@@ -27,7 +27,6 @@ from pathlib import Path
 
 import pytest
 
-from opencode_tools import orchestrator as orchestrator_module
 from opencode_tools.cli import main
 from opencode_tools.domain import (
     GitSafetyStatus,
@@ -39,7 +38,7 @@ from opencode_tools.domain import (
 from opencode_tools.ports import AttemptLogSink
 from opencode_tools.process import SubprocessRunner
 from opencode_tools.runlog import AttemptLogFileSink
-from opencode_tools.state_machine import TerminalPrecedence
+from opencode_tools.state_machine import TerminalPrecedence, resolve_terminal_outcome
 
 HELPERS = Path(__file__).resolve().parent / "helpers"
 FAKE_GH = HELPERS / "fake_gh.py"
@@ -409,7 +408,7 @@ def test_footer_failure_preserves_interruption_for_finalization(
     )
 
     original_run = SubprocessRunner.run
-    original_resolve = orchestrator_module.resolve_terminal_outcome
+    original_resolve = resolve_terminal_outcome
     observed_interrupted: list[bool] = []
 
     def _run_with_interrupted_agent(
@@ -446,8 +445,7 @@ def test_footer_failure_preserves_interruption_for_finalization(
     monkeypatch.setattr(SubprocessRunner, "run", _run_with_interrupted_agent)
     monkeypatch.setattr(AttemptLogFileSink, "write_footer", _fail_footer)
     monkeypatch.setattr(
-        orchestrator_module,
-        "resolve_terminal_outcome",
+        "opencode_tools.orchestrator.resolve_terminal_outcome",
         _capture_terminal_precedence,
     )
 
