@@ -13,8 +13,10 @@ timeout, and interrupted paths (AC-014, AC-015, AC-032).
 
 from __future__ import annotations
 
+import base64
 import dataclasses
 import hashlib
+import json
 import os
 import signal
 import subprocess
@@ -28,6 +30,7 @@ import pytest
 
 from opencode_tools.domain import ProcessSpec, RunOutcome
 from opencode_tools.process import SubprocessRunner
+from opencode_tools.runlog import AttemptLogFileSink
 
 HELPER = Path(__file__).resolve().parent / "helpers" / "echo_process.py"
 
@@ -679,6 +682,58 @@ def test_run_reports_unconfirmed_termination_when_a_descendant_escapes_the_group
     assert elapsed < 3.0
     assert result.outcome is RunOutcome.TIMEOUT
     assert result.termination_confirmed is False
+
+
+def test_footer_stays_last_when_a_descendant_keeps_the_pipe_open(
+    tmp_path: Path,
+) -> None:
+    """Codex P2 on #133: a detached descendant can outlive the direct child
+    and keep stdout/stderr open beyond the bounded reader joins. Once
+    `run()` returns, surviving readers must be drain-only so the caller's
+    runner footer is guaranteed to remain the final attempt-log record."""
+
+    runner = SubprocessRunner(RealClock())
+    sink = AttemptLogFileSink(tmp_path, "attempt.log", RealClock())
+    late_payload = b"late descendant output\n"
+    child_script = (
+        "import os,time;"
+        "pid=os.fork();"
+        "exec("
+        "'os.setsid();time.sleep(0.35);"
+        "os.write(1," + repr(late_payload) + ");os._exit(0)'"
+        ") if pid==0 else os._exit(0)"
+    )
+    spec = ProcessSpec(
+        argv=(sys.executable, "-c", child_script),
+        cwd=tmp_path,
+        stdin=None,
+        timeout_seconds=30.0,
+        termination_grace_seconds=0.05,
+    )
+
+    sink.write_header(command=spec.argv, cwd=spec.cwd)
+    result = runner.run(spec, sink=sink)
+
+    assert result.return_code == 0
+    assert result.termination_confirmed is False
+    assert result.outcome is RunOutcome.PROCESS_ERROR
+
+    sink.write_footer(outcome=result.outcome, duration_ns=result.duration_ns)
+    time.sleep(0.5)
+    sink.close()
+
+    records = [
+        json.loads(line)
+        for line in (tmp_path / "attempt.log").read_text(encoding="utf-8").splitlines()
+    ]
+    last_record = records[-1]
+    assert last_record["channel"] == "runner"
+    assert json.loads(base64.b64decode(last_record["payload_base64"]))["event"] == "footer"
+    assert all(
+        base64.b64decode(record["payload_base64"]) != late_payload
+        for record in records
+        if record["channel"] == "stdout"
+    )
 
 
 def test_run_applies_the_same_escalation_on_sigint_cancellation(

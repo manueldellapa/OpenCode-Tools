@@ -290,6 +290,7 @@ class _StreamReader(threading.Thread):
         sink: AttemptLogSink,
         sink_lock: threading.Lock,
         sink_fault: threading.Event,
+        sink_writes_closed: threading.Event,
         clock: Clock,
     ) -> None:
         super().__init__(daemon=True)
@@ -298,6 +299,7 @@ class _StreamReader(threading.Thread):
         self._sink = sink
         self._sink_lock = sink_lock
         self._sink_fault = sink_fault
+        self._sink_writes_closed = sink_writes_closed
         self._clock = clock
         self._state_lock = threading.Lock()
         self._byte_count = 0
@@ -319,11 +321,13 @@ class _StreamReader(threading.Thread):
                     # data once the sink itself has failed.
                     continue
                 timestamp = self._clock.now()
-                with self._state_lock:
-                    self._byte_count += len(chunk)
-                    self._digest.update(chunk)
                 try:
                     with self._sink_lock:
+                        if self._sink_writes_closed.is_set():
+                            continue
+                        with self._state_lock:
+                            self._byte_count += len(chunk)
+                            self._digest.update(chunk)
                         self._sink.write(self._channel, chunk, timestamp)
                 except OSError:
                     self._sink_fault.set()
@@ -440,6 +444,7 @@ class SubprocessRunner:
 
             sink_lock = threading.Lock()
             sink_fault = threading.Event()
+            sink_writes_closed = threading.Event()
             stdin_writer = _StdinWriter(stream=process.stdin, payload=stdin_payload)
             stdout_reader = _StreamReader(
                 channel="stdout",
@@ -447,6 +452,7 @@ class SubprocessRunner:
                 sink=sink,
                 sink_lock=sink_lock,
                 sink_fault=sink_fault,
+                sink_writes_closed=sink_writes_closed,
                 clock=self._clock,
             )
             stderr_reader = _StreamReader(
@@ -455,6 +461,7 @@ class SubprocessRunner:
                 sink=sink,
                 sink_lock=sink_lock,
                 sink_fault=sink_fault,
+                sink_writes_closed=sink_writes_closed,
                 clock=self._clock,
             )
 
@@ -491,6 +498,15 @@ class SubprocessRunner:
             or stderr_reader.is_alive()
         ):
             termination_confirmed = False
+
+        # A reader may legitimately survive the bounded joins when a
+        # descendant keeps stdout/stderr open. Seal reader forwarding under
+        # the same lock used by every sink write before returning: this waits
+        # for any in-flight write and makes every later chunk drain-only, so a
+        # caller can append a terminal runner record after run() and know no
+        # reader can race with it or write after it.
+        with sink_lock:
+            sink_writes_closed.set()
 
         finished_at = self._clock.now()
         duration_ns = self._clock.monotonic_ns() - start_ns
