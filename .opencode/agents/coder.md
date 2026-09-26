@@ -16,6 +16,10 @@
       "git tag *": "deny",
       "git branch": "deny",
       "git branch *": "deny",
+      "git update-ref": "deny",
+      "git update-ref *": "deny",
+      "git symbolic-ref": "deny",
+      "git symbolic-ref *": "deny",
       "git push": "deny",
       "git push *": "deny",
       "git merge": "deny",
@@ -90,6 +94,8 @@ directly or indirectly:
 - no tag mutation with `git tag`;
 - no branch creation, rename, or deletion with `git branch`,
   `git checkout -b`, `git switch -c`, or equivalents;
+- no direct ref or HEAD mutation with `git update-ref` or
+  `git symbolic-ref`;
 - no `git push`, including force push;
 - no `git merge`, `git rebase`, `git cherry-pick`, `git revert`, `git am`,
   or `git reset`;

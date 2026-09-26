@@ -367,7 +367,7 @@
       "category": "debug-agent",
       "kind": "positive",
       "role": "coder",
-      "sha256": "e9c10659143ad4386881a50d0d117fc27284d7cb4461e7aa50ce3afdc86c2758",
+      "sha256": "327bfadd2e50232d801bb1be35c4d56eb64203385c291d4ac79197084a144445",
       "description": "opencode debug agent coder output: primary mode, question/task tools both false, edit allowed, and ordered bash command policy that keeps normal implementation/read-only Git inspection available while denying the reviewed Git/GitHub mutation command families (issue #102; response shape remains M15-03-corrected)."
     },
     {
