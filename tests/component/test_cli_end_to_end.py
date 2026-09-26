@@ -337,11 +337,7 @@ def test_footer_failure_preserves_unconfirmed_termination_for_quarantine(
         runner: SubprocessRunner, spec: ProcessSpec, *, sink: AttemptLogSink
     ) -> ProcessResult:
         result = original_run(runner, spec, sink=sink)
-        if (
-            Path(spec.argv[0]).name == "opencode"
-            and len(spec.argv) > 1
-            and spec.argv[1] == "run"
-        ):
+        if len(spec.argv) > 1 and spec.argv[1] == "run" and "--agent" in spec.argv:
             return replace(
                 result,
                 termination_confirmed=False,
