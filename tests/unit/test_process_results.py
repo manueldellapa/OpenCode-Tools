@@ -298,6 +298,24 @@ def test_sanitize_command_redacts_credentials_when_secret_contains_at_sign() -> 
     assert "ssw0rd" not in sanitized[2]
 
 
+def test_sanitize_command_preserves_query_and_fragment_after_authority() -> None:
+    cases = (
+        (
+            "https://user:pass@host?email=a@b",
+            "https://REDACTED@host?email=a@b",
+        ),
+        (
+            "https://user:pass@host#contact=a@b",
+            "https://REDACTED@host#contact=a@b",
+        ),
+    )
+
+    for url, expected in cases:
+        sanitized = sanitize_command(("/usr/bin/git", "clone", url))
+
+        assert sanitized[2] == expected
+
+
 def test_sanitize_command_redacts_every_credential_bearing_argument() -> None:
     argv = (
         "/usr/bin/curl",
