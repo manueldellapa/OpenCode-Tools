@@ -356,6 +356,15 @@ class RecordingRunStorePort:
             return self._persist_results.pop(0)
         return PersistenceStatus.OK
 
+    def stage_final(self, record: RunRecord) -> PersistenceStatus:
+        raise AssertionError("finalization is not exercised by these tests")
+
+    def commit_final(self) -> PersistenceStatus:
+        raise AssertionError("finalization is not exercised by these tests")
+
+    def abort_final(self) -> None:
+        return None
+
 
 class ScriptedAgentRunner:
     """An `AgentRunner` fake that appends to a shared cross-port call log."""
