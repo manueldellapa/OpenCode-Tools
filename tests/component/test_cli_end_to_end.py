@@ -27,6 +27,7 @@ from pathlib import Path
 import pytest
 
 from opencode_tools.cli import main
+from opencode_tools.runlog import AttemptLogFileSink
 
 HELPERS = Path(__file__).resolve().parent / "helpers"
 FAKE_GH = HELPERS / "fake_gh.py"
@@ -235,6 +236,75 @@ def test_architect_reported_failure_writes_a_failed_run_via_real_git_and_faked_g
     assert str(run_json_paths[0]) in captured.err
     assert "changes preserved: yes" in captured.err
     assert "staged=0 unstaged=0 untracked=0" in captured.err
+
+
+@pytest.mark.parametrize("failing_method", ["write_header", "write_footer"])
+def test_runner_record_write_faults_finalize_as_logging_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    failing_method: str,
+) -> None:
+    """Issue #117/Codex P1: runner-record writes happen outside
+    `SubprocessRunner`'s stream sink-fault handling, so their plain
+    `OSError` must be translated into the initialized run's canonical
+    `LOGGING_ERROR` lifecycle rather than escaping `main()`."""
+
+    workspace = tmp_path / "workspace"
+    _clean_repo(workspace)
+    runtime_root = tmp_path / "runtime"
+    config_path = tmp_path / "opencode-tools.toml"
+    _config_file(config_path, runtime_root=runtime_root)
+
+    monkeypatch.setenv("PATH", _shim_path(tmp_path / "bin"))
+    _set_opencode_debug_fixtures(monkeypatch)
+    monkeypatch.setenv(
+        "FAKE_OPENCODE_RUN_OUTPUT_FILE", str(RUN_FIXTURES / "architect-failed.ndjson")
+    )
+    export_file = tmp_path / "export-architect-failed.json"
+    _write_export_fixture(
+        export_file, session_id="ses_architect_failed", agent="architect"
+    )
+    monkeypatch.setenv("FAKE_OPENCODE_EXPORT_FILE", str(export_file))
+
+    def _raise_write_failure(
+        sink: AttemptLogFileSink, **kwargs: object
+    ) -> None:
+        del sink, kwargs
+        raise OSError("simulated runner-record write failure")
+
+    monkeypatch.setattr(AttemptLogFileSink, failing_method, _raise_write_failure)
+
+    exit_code = main(
+        [
+            "run",
+            "--workspace",
+            str(workspace),
+            "--target",
+            ".",
+            "--issue",
+            "42",
+            "--config",
+            str(config_path),
+        ]
+    )
+
+    assert exit_code == 40
+    run_json_paths = list(runtime_root.rglob("run.json"))
+    assert len(run_json_paths) == 1
+    record = json.loads(run_json_paths[0].read_text(encoding="utf-8"))
+    assert record["final_status"] == "FAILED"
+    assert record["trigger_outcome"] == "LOGGING_ERROR"
+    assert record["persistence_status"] == "INCOMPLETE"
+    assert record["artifact_incomplete"] is True
+    assert record["attempts"] == []
+    assert record["errors"][-1]["outcome"] == "LOGGING_ERROR"
+    assert record["errors"][-1]["code"] == "runlog.attempt_log_write_failed"
+
+    captured = capsys.readouterr()
+    assert captured.out == "FINAL_STATUS: FAILED\n"
+    assert "terminal outcome: LOGGING_ERROR" in captured.err
+    assert "artifact is incomplete" in captured.err
 
 
 def test_a_dirty_target_fails_before_any_run_directory_or_artifact_exists(

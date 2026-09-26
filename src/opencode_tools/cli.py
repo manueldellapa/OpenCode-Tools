@@ -767,10 +767,17 @@ class _CliAgentRunner:
                 f"{role.value.lower()}-{cycle_component}-{provider_attempt}-capture"
             )
             if isinstance(sink, runlog.AttemptLogFileSink):
-                sink.write_header(
-                    command=opencode_adapter.redact_command_for_display(spec),
-                    cwd=spec.cwd,
-                )
+                try:
+                    sink.write_header(
+                        command=opencode_adapter.redact_command_for_display(spec),
+                        cwd=spec.cwd,
+                    )
+                except OSError as error:
+                    raise LoggingError(
+                        "runlog.attempt_log_write_failed",
+                        f"failed to write attempt log runner header: {sink.path}",
+                        technical_detail=type(error).__name__,
+                    ) from None
             process_result = self._process_runner.run(
                 spec, sink=_TeeSink(sink, capture)
             )
@@ -778,10 +785,17 @@ class _CliAgentRunner:
                 isinstance(sink, runlog.AttemptLogFileSink)
                 and process_result.outcome is not RunOutcome.LOGGING_ERROR
             ):
-                sink.write_footer(
-                    outcome=process_result.outcome,
-                    duration_ns=process_result.duration_ns,
-                )
+                try:
+                    sink.write_footer(
+                        outcome=process_result.outcome,
+                        duration_ns=process_result.duration_ns,
+                    )
+                except OSError as error:
+                    raise LoggingError(
+                        "runlog.attempt_log_write_failed",
+                        f"failed to write attempt log runner footer: {sink.path}",
+                        technical_detail=type(error).__name__,
+                    ) from None
 
             stdout_bytes = capture.bytes_for("stdout")
             stdout_text = _decode_utf8_lenient(stdout_bytes)
