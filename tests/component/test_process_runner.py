@@ -730,7 +730,9 @@ def test_footer_stays_last_when_a_descendant_keeps_the_pipe_open(
     ]
     last_record = records[-1]
     assert last_record["channel"] == "runner"
-    assert json.loads(base64.b64decode(last_record["payload_base64"]))["event"] == "footer"
+    assert (
+        json.loads(base64.b64decode(last_record["payload_base64"]))["event"] == "footer"
+    )
     assert all(
         base64.b64decode(record["payload_base64"]) != late_payload
         for record in records
