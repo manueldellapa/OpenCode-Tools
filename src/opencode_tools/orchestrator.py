@@ -1809,7 +1809,9 @@ def finalize_run(
             postflight_git_safety_status=effective_git_safety_status,
             baseline_branch=record.git_baseline.branch if record.git_baseline else None,
             baseline_head=record.git_baseline.head if record.git_baseline else None,
-            postflight_branch=postflight.state.branch if postflight is not None else None,
+            postflight_branch=postflight.state.branch
+            if postflight is not None
+            else None,
             postflight_head=postflight.state.head if postflight is not None else None,
             persistence_status=record.persistence_status,
         )
