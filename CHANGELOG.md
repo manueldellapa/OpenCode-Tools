@@ -5,77 +5,48 @@ loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
-### Fixed
-
-- Closed an unsupervised-child window in `SubprocessRunner.run()` (issue
-  #112): the SIGTERM/SIGINT handlers are now installed *before*
-  `subprocess.Popen()` is called, rather than after the child was spawned
-  and its reader/writer threads were already started. Previously, a signal
-  arriving in that window hit Python's default SIGTERM disposition
-  (terminating the parent with zero cleanup) or an uncaught `SIGINT`
-  `KeyboardInterrupt` (unwinding past `run()` without ever signaling the
-  child), either way orphaning the already-spawned child instead of
-  triggering the documented `SIGTERM -> grace -> SIGKILL -> grace`
-  escalation across its whole process group (System Design SS10.2, SH-001).
-  This affected every child spawned through this adapter, including
-  `opencode` itself and every Git invocation from `git_safety.py`,
-  `coder_sandbox.py`, `locking.py`, and `github.py`.
+## [0.1.3] - 2026-09-27
 
 ### Security
 
-- Closed a Git clean-filter/textconv remote command execution path in coder
-  sandbox promotion (issue #110): a coder-writable `.gitattributes`,
-  `.git/config`, or `.git/info/attributes` could previously make the
-  orchestrator's own trusted `git add`/`git diff` invocations run an
-  arbitrary command as the operator's user, before the coder's changes were
-  even promoted. `promote_coder_changes` now refuses to stage or diff
-  anything unless those three files are still byte-identical to the state
-  captured right after the sandbox was created, and passes
-  `--no-ext-diff --no-textconv` to the diff itself as defense in depth.
+- Hardened coder-sandbox promotion against Git clean-filter/textconv execution
+  (issue #110, PR #124): promotion now uses a baseline-seeded throwaway index,
+  hashes changed content without filters, handles symlink/path-type/gitlink edge
+  cases fail-closed, and forces hooks/fsmonitor off for its Git subprocesses.
+- Extended the CODER command policy to deny direct ref mutation through
+  `git update-ref` and `git symbolic-ref`, with effective-policy regression
+  coverage (issue #114, PR #132).
+- Corrected URL credential redaction when credentials contain `@`, while
+  respecting `?` and `#` authority delimiters (issue #113, PR #131).
+- Strengthened run-artifact credential-leak regression coverage through the
+  real `_environment_snapshot()` boundary and populated process, Git-check,
+  attempt, and error records (issue #118, PR #134).
 
 ### Fixed
 
-- Stopped a mid-pipeline `LoggingError` from escaping `run_composed_pipeline`
-  uncaught (issue #109): once bootstrap has already persisted `run.json`, a
-  later persistence failure (e.g. `open_attempt_sink`/`persist` failing on a
-  full disk or a permissions change) is now caught and converged through
-  `finalize_run`, exactly like `bootstrap_run`'s own late-stage failures.
-  Previously it escaped to `main`'s pre-init handler, which wrongly reported
-  "artifact: none", printed no `FINAL_STATUS` line, and left the target
-  lease held forever since `finalize_run` was never reached. The caught
-  error is also folded into `RunRecord.errors` before finalization, so the
-  persisted artifact and stderr summary keep the actual diagnosis instead
-  of only the bare `LOGGING_ERROR` terminal outcome. `IssueOrchestrator`
-  now also exposes the last observed `termination_confirmed` independently
-  of `record` (which stops advancing once persistence is blocked), so a
-  `persist` failure right after an attempt with a possibly still-live
-  child no longer loses that fact -- `finalize_run` still forces postflight
-  `INDETERMINATE` and quarantines the target lease instead of releasing it
-  for another run to acquire. `IssueOrchestrator` likewise exposes
-  `cancellation_requested` and `last_attempted_phase` independently of
-  `record`: an interruption already observed on the failing attempt is no
-  longer lost behind an unrelated secondary `OpenCodeToolsError` (it still
-  outranks that error in `resolve_terminal_outcome`'s precedence), and the
-  preserved `ErrorRecord` is tagged with the role actually failing (e.g.
-  `CODER`) rather than the last role that happened to persist (e.g.
-  `ARCHITECT`). A caught `LoggingError` specifically also marks the
-  converged record `persistence_status=INCOMPLETE`/`artifact_incomplete=
-  True`, and `finalize_run`'s own success path no longer overwrites an
-  incoming non-`OK` `persistence_status` back to `OK` just because *its
-  own* later write of `run.json` succeeds -- so a transient fault (e.g. the
-  attempt-log sink) that clears before `finalize_run` runs still leaves
-  `_render_issue_result`'s incomplete-artifact warning intact instead of
-  reporting the run as a clean success -- rendered as its own, distinct
-  warning ("the run artifact is incomplete"), never the "final persistence
-  failed" wording reserved for `PersistenceStatus.FAILED`, since `run.json`
-  itself was genuinely written. `IssueOrchestrator` also exposes its own
-  live `last_accepted_git_state`, independent of `record`: a coder's
-  permitted edit is accepted (`after` check `SAFE`) before that same
-  attempt's own `persist` can fail, and `finalize_run` now takes this
-  checkpoint explicitly instead of only ever reconstructing it from
-  `record.attempts` -- which would compare postflight against the
-  *pre-coder* state and falsely report an already-accepted edit as
-  `UNSAFE`.
+- Converged mid-pipeline `LoggingError` failures through `finalize_run`
+  (issue #109, PR #126), preserving artifact diagnostics, terminal outcome,
+  cancellation/termination evidence, accepted Git state, and lease cleanup.
+- Installed `SIGINT`/`SIGTERM` handlers before child spawn in
+  `SubprocessRunner.run()` (issue #112, PR #127), closing the window where a
+  signal could bypass the documented process-group termination path.
+- Wired run-level `SIGINT`/`SIGTERM` cancellation to `IssueOrchestrator`
+  outside a live subprocess (issue #111, PR #128), so signals during retry
+  backoff or other idle windows converge through normal finalization.
+- Closed the finalization cancellation race (issue #129, PR #130) with staged
+  terminal persistence, post-stage/post-lease cancellation checks, a
+  cancellation seal, and exactly-once canonical `run.json` publication.
+- Wired attempt-log runner header/footer records around the real OpenCode
+  process execution and hardened footer ordering/error handling
+  (issue #117, PR #133): the footer remains the final record, sink quiescence
+  stays bounded, logging failures converge to `LOGGING_ERROR`, and interruption
+  plus termination evidence is preserved.
+
+### Changed
+
+- Kept the repository `.gitignore` project-specific (PR #125), leaving
+  machine- and local-tool-specific ignores to user/global or repository-local
+  exclude configuration.
 
 ## [0.1.2] - 2026-09-22
 
